@@ -26,31 +26,36 @@ through Claude in Chrome. Everything here was confirmed in a real session.
    screen instead. Do not improvise around a mismatch — a stray click on the
    chart creates phantom blocks in the workout.
 
+## Why the FTP has to come first
+
+A `.zwo` stores power only as **fractions of FTP**. The watts actually ridden
+are `fraction × the FTP MyWhoosh has`. So if the session is "3 x 10 min at
+232 W" and you render against 255 W but MyWhoosh is set to 200 W, every target
+is ridden at 182 W — about 22% too easy — and **nothing anywhere reports a
+problem**. The file is valid; it is just scaled to a different athlete.
+
+`get_cycling_ftp` reads **Garmin's** profile, which is a different number and
+frequently stale. It is a starting point, not the answer.
+
+Since you are opening the browser anyway, **read MyWhoosh's own FTP out of the
+builder and render against that** (Step 3). That makes the fractions correct by
+construction, rather than correct by assumption.
+
+Consequence for ordering: draft the session first, but **do not render until
+after Step 3**. If the athlete gave targets in watts, those watts are the fixed
+intent, and the FTP is what converts them.
+
 ## Before touching the browser
 
-1. Get the FTP. Call `get_cycling_ftp` from the Garmin MCP; if it reports
-   `is_stale`, confirm the number with the athlete. Never assume one.
-
-   **That tool reads Garmin's profile, not MyWhoosh's.** MyWhoosh keeps its own
-   FTP and there is no API to read it. This matters here more than it does on
-   the Garmin side: a `.zwo` stores only *fractions* of FTP, so the watts
-   actually ridden are `fraction × the FTP in the athlete's MyWhoosh profile`.
-   If `spec.ftp` is 255 and MyWhoosh's profile says 200, every target is ridden
-   ~22% too easy and nothing anywhere reports a problem.
-
-   So confirm with the athlete that `spec.ftp` matches **what MyWhoosh has**,
-   not just what Garmin thinks. If the two disagree, say so and let them decide
-   which is right before rendering.
-2. Write the spec and call `describe_spec`. **Show the block table to the
-   user** and get agreement on the session before automating anything.
-3. Call `render_zwo` with `out_path` set — for example
-   `~/workouts/<filename>.zwo`. **Always keep the file on disk.** If the export
-   fails, or the session needs re-uploading later, the file should already be
-   there.
-4. Note the returned `filename`. **MyWhoosh takes the workout's library name
-   from the uploaded filename, not from the `<name>` tag inside the file.** The
-   filename is what the athlete will see. Set the spec's `filename` field to
-   control it.
+1. Draft the session with the athlete and agree the structure — durations, and
+   targets in whatever unit they think in. If they gave absolute watts, keep
+   them as watts (`power_w`); that is the intent to preserve.
+2. Get a provisional FTP from `get_cycling_ftp` (Garmin MCP). Note whether it
+   reports `is_stale`. Treat it as a cross-check for Step 3, not as the value
+   to render against.
+3. Decide the library name. **MyWhoosh takes the workout's name from the
+   uploaded filename, not from the `<name>` tag inside the file.** The filename
+   is what the athlete will see, so set the spec's `filename` field.
 
 ## Sessions
 
@@ -87,7 +92,57 @@ workout chart is visible.
 *If a label has changed:* report which of the three you could not find. These
 are located by their visible text, so a renamed button is the likely cause.
 
-## Step 3 — Import the .zwo
+## Step 3 — Read MyWhoosh's FTP, then render against it
+
+You are in the editor and have not imported anything yet. The FTP and weight
+fields on this page are what MyWhoosh is currently working from — read them
+**before** importing, because import overwrites them with defaults.
+
+Read the values directly rather than from rendered text, which is easier to
+misparse:
+
+```javascript
+[...document.querySelectorAll('input')]
+  .map(i => ({name: i.name || i.id || i.getAttribute('placeholder'), value: i.value}))
+  .filter(x => x.value !== '');
+```
+
+*Expect:* an FTP in watts and a weight in kg.
+
+**Then judge what you got, out loud:**
+
+- **A plausible athlete FTP** (not 200) → render against it.
+- **Exactly 200 W / 62 kg** → these are MyWhoosh's defaults. That is not
+  evidence of the athlete's FTP, it is evidence the field was never set. Do not
+  render against 200 just because it was on screen. Say so and ask.
+- **It disagrees with Garmin's `get_cycling_ftp`** → report both numbers and ask
+  which is current. Do not silently prefer either. A stale Garmin value and a
+  stale MyWhoosh value are both plausible.
+
+**Known limitation, worth stating rather than papering over:** this reads the
+*builder's* FTP field. Whether that field is populated from the athlete's
+MyWhoosh profile, or is a local preview knob that merely defaults to 200, has
+not been verified against the game app. So treat it as strong evidence, not
+proof — and when the number matters and anything looks off, ask the athlete
+what their MyWhoosh FTP is. They know, and it costs one question.
+
+Now render:
+
+1. Set `spec.ftp` to the FTP you settled on. Keep the athlete's watt targets as
+   watts — the renderer converts them to fractions against this FTP, which is
+   exactly the conversion that has to be right.
+2. Call `describe_spec` and **show the block table to the user.** The watts in
+   that table are what they will ride. This is the moment a wrong FTP is
+   visible and cheap to fix.
+3. Call `render_zwo` with `out_path` set — for example
+   `~/workouts/<filename>.zwo`. **Always keep the file on disk**, so a failed
+   export or a later re-upload does not need re-rendering.
+
+*Sanity check before importing:* pick one block and confirm
+`watts ÷ spec.ftp` equals the fraction in the rendered file. If the session
+says 232 W at FTP 255, the file should read `Power="0.9098"`.
+
+## Step 4 — Import the .zwo
 
 **Do not build the workout by hand in the graphical editor.** The per-block
 tooltip is clipped by the chart container and resizing blocks needs
@@ -118,16 +173,24 @@ the workout's blocks.
 Report that the change event fired but no navigation followed, and stop — do not
 retry blindly, and do not fall back to building blocks by hand.
 
-## Step 4 — Re-enter FTP and weight
+## Step 5 — Restore FTP and weight
 
-**Import resets FTP and weight to defaults (200 W / 62 kg).** If you skip this,
-the displayed watts and Training Load are wrong. The power fractions inside the
-file stay correct regardless — this field is a preview setting, so it changes
-what the athlete reads off the screen, not what is stored.
+**Import resets FTP and weight to defaults (200 W / 62 kg).** Put back the
+values you read in Step 3 — you already have them, so this is restoring a known
+state, not guessing at one. If the FTP you settled on differs from what Step 3
+read (because it was the 200 W default, or the athlete corrected it), set the
+settled value.
 
-It still matters: the duration, TSS and IF you check in Step 5 and report in
-Step 6 are computed against this number, so leaving it at 200 W means
-sanity-checking the session against the wrong athlete.
+The power fractions inside the file stay correct regardless — this field is a
+preview setting, so it changes what the athlete reads off the screen, not what
+is stored.
+
+It still matters: the duration, TSS and IF you check in Step 6 and report in
+Step 7 are computed against this number, so leaving it at 200 W means
+sanity-checking the session against the wrong athlete. The watts shown here
+should now agree with the `describe_spec` table from Step 3; if they don't, the
+FTP in the field and the FTP you rendered against have diverged — stop and
+resolve that before exporting.
 
 Set both with `form_input`. **Do not use `triple_click` + `type`** — typing does
 not stick on these number fields.
@@ -138,7 +201,7 @@ live one.** Use it.
 *Expect:* the fields show the FTP you set and the athlete's weight, and the
 displayed watts update to match.
 
-## Step 5 — Verify the import actually worked
+## Step 6 — Verify the import actually worked
 
 Check the header: it shows **`Workout Time`** and **`Training Load`**.
 
@@ -149,7 +212,7 @@ Check the header: it shows **`Workout Time`** and **`Training Load`**.
 Cross-check `Workout Time` against the total from `describe_spec`. If they
 disagree, something was dropped on import; stop and report both numbers.
 
-## Step 6 — Stop and confirm before exporting
+## Step 7 — Stop and confirm before exporting
 
 **`EXPORT TO MYWHOOSH` spends a slot credit. Credits are limited and the counter
 is top-right. Do not click it without explicit confirmation.**
@@ -163,10 +226,10 @@ user:
 - any open question about the session
 
 Then ask directly whether to export. **Wait for a clear yes.** If they want
-changes, edit the spec, re-render, and start again from Step 3 — do not patch
+changes, edit the spec, re-render, and start again from Step 4 — do not patch
 blocks in the graphical editor.
 
-## Step 7 — Export and confirm it landed
+## Step 8 — Export and confirm it landed
 
 Click `EXPORT TO MYWHOOSH` via `find` → `ref`.
 

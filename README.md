@@ -163,8 +163,9 @@ January 2025 flagged stale. Confirm the number before rendering; everything
 downstream is wrong if it's wrong.
 
 `get_cycling_ftp` reads **Garmin's** profile. MyWhoosh keeps its own FTP and
-there is no API to read it — so `spec.ftp` has to be reconciled with MyWhoosh by
-hand.
+there is no API to read it — but the `mywhoosh-upload` skill is in the browser
+anyway, so it reads the FTP out of the builder and renders against *that*,
+rather than assuming Garmin's number applies.
 
 That matters because the two platforms consume FTP at different times:
 
@@ -180,7 +181,9 @@ For MyWhoosh it is sharper. The `.zwo` stores only ratios, so the watts ridden
 are `fraction × the FTP in your MyWhoosh profile`. **If `spec.ftp` is 255 and
 MyWhoosh's profile says 200, a 232 W block is ridden at 182 W, and nothing warns
 you** — the file is still "correct", it is just scaled to a different athlete.
-Keep `spec.ftp` equal to MyWhoosh's FTP.
+Keep `spec.ftp` equal to MyWhoosh's FTP. The skill does this by reading the
+FTP from the builder *before* rendering, so the fractions are right by
+construction.
 
 The FTP field in the MyWhoosh *builder* is a third, separate thing: a preview
 setting driving the displayed watts and Training Load. It resets to 200 W on
