@@ -1,0 +1,50 @@
+{
+  "name": "Sweet Spot 3x10",
+  "author": "ClaudeCyclingMCP",
+  "description": "70 min sweet spot. Three 10 min efforts at 91% FTP with 5 min recoveries between them.",
+  "ftp": 255,
+  "filename": "sweetspot-3x10",
+  "blocks": [
+    {
+      "type": "ramp",
+      "duration": "20:00",
+      "from_w": 130,
+      "to_w": 180,
+      "role": "warmup"
+    },
+    {
+      "type": "steady",
+      "duration": "10:00",
+      "power_w": 232
+    },
+    {
+      "type": "steady",
+      "duration": "05:00",
+      "power_w": 145,
+      "role": "recovery"
+    },
+    {
+      "type": "steady",
+      "duration": "10:00",
+      "power_w": 232
+    },
+    {
+      "type": "steady",
+      "duration": "05:00",
+      "power_w": 145,
+      "role": "recovery"
+    },
+    {
+      "type": "steady",
+      "duration": "10:00",
+      "power_w": 232
+    },
+    {
+      "type": "ramp",
+      "duration": "10:00",
+      "from_w": 140,
+      "to_w": 130,
+      "role": "cooldown"
+    }
+  ]
+}
