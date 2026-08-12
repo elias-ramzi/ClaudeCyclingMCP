@@ -12,7 +12,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+try:  # mcp SDK 2.x
+    from mcp.server import MCPServer as _Server
+except ImportError:  # mcp SDK 1.x, where the same class is called FastMCP
+    from mcp.server.fastmcp import FastMCP as _Server
 
 from .metrics import compute_metrics, describe
 from .render_garmin import render_garmin as _render_garmin
@@ -21,7 +24,7 @@ from .render_zwo import zwo_filename
 from .spec import SpecError, load_spec, validate_spec as _validate_spec
 from .verify import compare_upload, total_step_seconds
 
-app = FastMCP("claude-cycling-mcp")
+app = _Server("claude-cycling-mcp")
 
 SPEC_SCHEMA: dict[str, Any] = {
     "type": "object",

@@ -1,0 +1,19 @@
+{
+  "name": "Sweet Spot 3x10",
+  "ftp": 255,
+  "filename": "sweetspot-3x10",
+  "description": "70 min sweet spot",
+  "blocks": [
+    {"type": "ramp",   "duration": "20:00", "from_w": 130, "to_w": 180, "role": "warmup",
+     "message": "Easy spin, let the legs open up"},
+
+    {"type": "steady", "duration": "10:00", "power_w": 232, "cadence": 90,
+     "message": "Sweet spot 1 of 3", "hr_note": "expect 145-155 bpm"},
+    {"type": "steady", "duration": "05:00", "power_w": 145, "role": "recovery"},
+    {"type": "steady", "duration": "10:00", "power_w": 232, "cadence": 90},
+    {"type": "steady", "duration": "05:00", "power_w": 145, "role": "recovery"},
+    {"type": "steady", "duration": "10:00", "power_w": 232, "cadence": 90},
+
+    {"type": "ramp",   "duration": "10:00", "from_w": 140, "to_w": 130, "role": "cooldown"}
+  ]
+}
