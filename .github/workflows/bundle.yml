@@ -1,0 +1,50 @@
+name: Bundle
+
+# Build the one-click Claude Desktop Extension (.mcpb) and attach it to the GitHub Release when a
+# version tag is pushed — the same trigger as the PyPI publish. Users then download
+# `claude-cycling-mcp.mcpb` from Releases and drag it into Claude Desktop.
+#
+# The bundle is small: the server itself is fetched by `uvx` at run time (see manifest.json), so the
+# .mcpb carries the manifest, the skills, and the docs rather than a vendored Python environment.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  bundle:
+    name: Build and attach .mcpb
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create/attach the release asset
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: git config --global core.autocrlf false
+
+      # Keep the bundle's version in step with the release tag so the two never drift.
+      - name: Sync the manifest version to the tag
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          python3 - "$TAG" <<'PY'
+          import json, pathlib, sys
+          path = pathlib.Path('manifest.json')
+          manifest = json.loads(path.read_text())
+          manifest['version'] = sys.argv[1]
+          path.write_text(json.dumps(manifest, indent=2) + '\n')
+          print(f"manifest.json version set to {sys.argv[1]}")
+          PY
+
+      - name: Validate the manifest
+        run: npx --yes @anthropic-ai/mcpb@latest validate manifest.json
+
+      - name: Pack the extension
+        run: npx --yes @anthropic-ai/mcpb@latest pack . claude-cycling-mcp.mcpb
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: claude-cycling-mcp.mcpb

@@ -3,7 +3,7 @@
 Every tool here is pure and deterministic. Nothing in this server makes a
 network call, reads credentials, or uploads anything. Uploading needs auth and
 a human in the loop, so it lives in the bundled skills instead — see
-`skills/garmin-upload` and `skills/mywhoosh-upload`.
+`.claude/skills/garmin-upload` and `.claude/skills/mywhoosh-upload`.
 """
 
 from __future__ import annotations
@@ -22,7 +22,8 @@ from .render_garmin import render_garmin as _render_garmin
 from .render_zwo import render_zwo as _render_zwo
 from .render_zwo import zwo_filename
 from .skills import Skill, build_skill_message, load_skills
-from .spec import SpecError, load_spec, validate_spec as _validate_spec
+from .spec import SpecError, load_spec
+from .spec import validate_spec as _validate_spec
 from .verify import compare_upload, total_step_seconds
 
 app = _Server("claude-cycling-mcp")

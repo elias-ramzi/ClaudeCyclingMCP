@@ -9,8 +9,9 @@ Nothing here touches the network or the filesystem.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Literal
+from typing import Any, Literal
 
 # A block's power, as a fraction of FTP, must land inside this range. Anything
 # outside is far more likely to be a unit mistake (watts written into a _pct
@@ -146,7 +147,7 @@ def parse_duration(raw: Any) -> int:
     Raises ValueError with a message suitable for showing to the author.
     """
     if isinstance(raw, bool):
-        raise ValueError("duration must be seconds or \"MM:SS\", not a boolean")
+        raise ValueError('duration must be seconds or "MM:SS", not a boolean')
     if isinstance(raw, (int, float)):
         seconds = float(raw)
     elif isinstance(raw, str):
@@ -160,7 +161,7 @@ def parse_duration(raw: Any) -> int:
             values = [float(p) for p in parts]
         except ValueError:
             raise ValueError(
-                f"{raw!r} is not a duration; use seconds (600) or \"MM:SS\" (\"10:00\")"
+                f'{raw!r} is not a duration; use seconds (600) or "MM:SS" ("10:00")'
             ) from None
         if len(values) == 1:
             seconds = values[0]

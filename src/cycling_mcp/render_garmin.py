@@ -70,7 +70,9 @@ def _description(block: Block) -> str | None:
     return " | ".join(parts) if parts else None
 
 
-def _watt_bounds(block: Block, workout: Workout, warnings: list[str], where: str) -> tuple[int, int]:
+def _watt_bounds(
+    block: Block, workout: Workout, warnings: list[str], where: str
+) -> tuple[int, int]:
     """The low/high watt pair for a steady block.
 
     A single number gets a band around it, because Garmin power targets are
@@ -165,9 +167,7 @@ def _render_block(
             high_w = workout.watts(max(start_fraction, end_fraction))
             if low_w == high_w:
                 high_w = low_w + 1
-            steps.append(
-                _executable(block, counter.next(), seconds, TARGET_POWER, low_w, high_w)
-            )
+            steps.append(_executable(block, counter.next(), seconds, TARGET_POWER, low_w, high_w))
         return steps
 
     low, high = _watt_bounds(block, workout, warnings, where)

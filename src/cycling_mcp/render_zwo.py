@@ -63,9 +63,7 @@ def _text_events(block: Block, warnings: list[str], where: str) -> list[str]:
         folded, warning = fold_with_warning(raw, f"{where} {label}")
         if warning:
             warnings.append(warning)
-        events.append(
-            f'<textevent timeoffset="{min(offset, limit)}" message={quoteattr(folded)}/>'
-        )
+        events.append(f'<textevent timeoffset="{min(offset, limit)}" message={quoteattr(folded)}/>')
     return events
 
 

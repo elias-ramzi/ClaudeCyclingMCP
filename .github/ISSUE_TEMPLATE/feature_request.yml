@@ -1,0 +1,45 @@
+name: Feature request
+description: A new block type, spec field, tool, or platform behaviour.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What session can't you write today?
+      description: >-
+        Describe the training you are trying to express, not just the field you think is missing —
+        there may already be a way to write it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would the spec look like?
+      description: Sketch the JSON you would want to write.
+      render: json
+    validations:
+      required: false
+
+  - type: dropdown
+    id: platforms
+    attributes:
+      label: Which platforms need it
+      multiple: true
+      options:
+        - MyWhoosh (.zwo)
+        - Garmin Connect
+        - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: platform-support
+    attributes:
+      label: Does the target platform actually support it?
+      description: >-
+        Optional, but it saves a round trip. The two formats differ in what they can express — a
+        `.zwo` has ramps and free rides, Garmin has neither as a native primitive but does have real
+        repeat groups. If a feature only works on one side, say what the other should do.
+    validations:
+      required: false

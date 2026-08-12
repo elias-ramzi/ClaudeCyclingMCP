@@ -1,0 +1,46 @@
+# Files excluded from the packed .mcpb bundle.
+#
+# The server itself is NOT bundled: manifest.json runs it via `uvx --from git+...`, which fetches
+# and caches it on first launch. So the bundle only needs the manifest, the skills, and the
+# top-level docs — everything else is weight a user would download for nothing.
+
+.git/
+.github/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# The package source: fetched by uvx at run time, not shipped here.
+src/
+tests/
+examples/
+
+# Dev tooling and build inputs
+pyproject.toml
+uv.lock
+.gitignore
+.gitattributes
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Repo furniture that is not useful inside an installed extension
+CONTRIBUTING.md
+SECURITY.md
+CLAUDE.md
+docs/
+
+# Local, machine-specific Claude settings. Git-ignored, so a CI build never sees them — but
+# `mcpb pack` reads the working tree, so exclude them explicitly or a local build ships them.
+.claude/settings.json
+.claude/settings.local.json
+*.local.json
+
+# Never nest a previous bundle inside a new one
+*.mcpb
+.mcpbignore
+
+.DS_Store

@@ -142,7 +142,7 @@ _COMPARED_FIELDS = (
 
 # Only the raw API response carries targetValueUnit, so only a raw comparison
 # can tell a watt target from a %FTP one.
-_RAW_COMPARED_FIELDS = _COMPARED_FIELDS + ("target_unit",)
+_RAW_COMPARED_FIELDS = (*_COMPARED_FIELDS, "target_unit")
 
 
 def _compare_steps(
@@ -153,21 +153,17 @@ def _compare_steps(
     fields: tuple[str, ...] = _COMPARED_FIELDS,
 ) -> None:
     if len(sent) != len(fetched):
-        problems.append(
-            f"{path}: sent {len(sent)} steps, Garmin returned {len(fetched)}"
-        )
+        problems.append(f"{path}: sent {len(sent)} steps, Garmin returned {len(fetched)}")
         return
 
-    for index, (want, got) in enumerate(zip(sent, fetched)):
+    for index, (want, got) in enumerate(zip(sent, fetched, strict=True)):
         here = f"{path}[{index}]"
         if want["kind"] != got["kind"]:
             problems.append(f"{here}: sent a {want['kind']}, Garmin returned a {got['kind']}")
             continue
 
         if want["order"] != got["order"]:
-            problems.append(
-                f"{here}: stepOrder {want['order']} came back as {got['order']}"
-            )
+            problems.append(f"{here}: stepOrder {want['order']} came back as {got['order']}")
 
         if want["kind"] == "repeat":
             if want["repeat_count"] != got["repeat_count"]:
@@ -205,12 +201,12 @@ def compare_upload(payload: dict, fetched: dict) -> list[str]:
     sent_segments = payload.get("workoutSegments") or []
     got_segments = fetched.get("segments") or []
     if len(sent_segments) != len(got_segments):
-        problems.append(
-            f"sent {len(sent_segments)} segments, Garmin returned {len(got_segments)}"
-        )
+        problems.append(f"sent {len(sent_segments)} segments, Garmin returned {len(got_segments)}")
         return problems
 
-    for index, (sent_segment, got_segment) in enumerate(zip(sent_segments, got_segments)):
+    for index, (sent_segment, got_segment) in enumerate(
+        zip(sent_segments, got_segments, strict=True)
+    ):
         _compare_steps(
             _normalise_sent(sent_segment.get("workoutSteps", [])),
             _normalise_fetched(got_segment.get("steps", [])),
@@ -247,7 +243,9 @@ def compare_upload_raw(payload: dict, raw: dict) -> list[str]:
         problems.append(f"sent {len(sent_segments)} segments, Garmin returned {len(got_segments)}")
         return problems
 
-    for index, (sent_segment, got_segment) in enumerate(zip(sent_segments, got_segments)):
+    for index, (sent_segment, got_segment) in enumerate(
+        zip(sent_segments, got_segments, strict=True)
+    ):
         _compare_steps(
             _normalise_sent(sent_segment.get("workoutSteps", [])),
             _normalise_sent(got_segment.get("workoutSteps", [])),

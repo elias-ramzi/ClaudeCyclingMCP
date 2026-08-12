@@ -71,9 +71,7 @@ def test_watts_and_percent_agree_for_the_same_target():
 
 
 def test_explicit_range_is_preserved():
-    workout = load_spec(
-        base(blocks=[{"type": "steady", "duration": 600, "power_pct": [88, 94]}])
-    )
+    workout = load_spec(base(blocks=[{"type": "steady", "duration": 600, "power_pct": [88, 94]}]))
     block = workout.nodes[0]
     assert (block.p_low, block.p_high) == pytest.approx((0.88, 0.94))
     assert not block.is_scalar_target

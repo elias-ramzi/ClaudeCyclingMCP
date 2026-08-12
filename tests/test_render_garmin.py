@@ -266,7 +266,10 @@ def test_cadence_becomes_a_secondary_target_keeping_its_range():
         }
     )
     step = steps(built)[0]
-    assert step["secondaryTargetType"] == {"workoutTargetTypeId": 3, "workoutTargetTypeKey": "cadence"}
+    assert step["secondaryTargetType"] == {
+        "workoutTargetTypeId": 3,
+        "workoutTargetTypeKey": "cadence",
+    }
     assert (step["secondaryTargetValueOne"], step["secondaryTargetValueTwo"]) == (85.0, 95.0)
 
 

@@ -1,0 +1,83 @@
+name: Bug report
+description: Something rendered, validated, or uploaded wrongly.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Please do not paste Garmin tokens, session cookies, or the contents
+        of `~/.garminconnect`.** None of them are needed to diagnose a rendering problem.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: spec
+    attributes:
+      label: The workout spec
+      description: >-
+        The spec JSON that reproduces it, trimmed to the smallest version that still shows the
+        problem. This is almost always enough to reproduce a rendering bug.
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: output
+    attributes:
+      label: What was rendered
+      description: The `.zwo` or the Garmin payload, and what you expected instead.
+      render: text
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where
+      multiple: true
+      options:
+        - .zwo renderer (MyWhoosh)
+        - Garmin payload renderer
+        - Spec validation
+        - describe_spec / metrics (IF, TSS)
+        - garmin-upload skill
+        - mywhoosh-upload skill (browser flow)
+        - Install / packaging
+        - Something else
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The package version, or the commit you are on.
+      placeholder: '0.1.0'
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: OS, Python, and client
+      placeholder: 'macOS 15, Python 3.12, Claude Desktop'
+    validations:
+      required: true
+
+  - type: textarea
+    id: mywhoosh-step
+    attributes:
+      label: If this is the MyWhoosh browser flow — which step failed?
+      description: >-
+        Each step in the skill states what it expects to see. Naming the step and what was on screen
+        instead is the fastest possible fix, because the flow breaks when MyWhoosh redesigns
+        something and the label or path has moved.
+      placeholder: 'Step 2: no element matching "Create New"; the page showed ...'
+    validations:
+      required: false

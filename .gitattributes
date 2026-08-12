@@ -1,0 +1,17 @@
+# Normalize line endings: store text as LF in the repo and check out as LF on every OS
+# (including Windows), so ruff format and the golden-file comparisons stay deterministic.
+* text=auto eol=lf
+
+# Golden fixtures are compared byte-for-byte — never let a platform rewrite them.
+*.zwo text eol=lf
+tests/golden/** text eol=lf
+
+# Binary assets — never normalize line endings or treat as text (SVG is XML, so it stays text).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.fit binary
+*.mcpb binary

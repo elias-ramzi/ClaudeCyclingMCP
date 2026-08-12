@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    name: Lint, format, test (${{ matrix.os }}, ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.12']
+        include:
+          # Guard the floor and the ceiling of the supported range on one OS,
+          # rather than paying for a full 3-by-3 matrix.
+          - os: ubuntu-latest
+            python: '3.10'
+          - os: ubuntu-latest
+            python: '3.13'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      # The .zwo golden files are compared byte-for-byte; a CRLF checkout on
+      # Windows would fail them for reasons that have nothing to do with the code.
+      - name: Configure git
+        run: git config --global core.autocrlf false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Set up Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+      - name: Install
+        run: uv sync --extra dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      # Offline only. The live Garmin round-trip is deselected by default and
+      # needs credentials CI does not have.
+      - run: uv run pytest -q
+
+  package:
+    name: Build and smoke-test the wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      # The skills are force-included into the wheel so a uvx install can serve
+      # them as MCP prompts. Install the built wheel somewhere with no repo
+      # around it and confirm the server still finds them.
+      - name: Install the wheel into a clean environment
+        run: |
+          uv venv /tmp/smoke
+          VIRTUAL_ENV=/tmp/smoke uv pip install dist/*.whl
+      - name: Server starts, tools and skills are served
+        run: |
+          cd /tmp
+          /tmp/smoke/bin/python - <<'PY'
+          import asyncio
+          from cycling_mcp.skills import load_skills
+          from cycling_mcp.server import app, _register_skill_prompts
+
+          skills = [s.name for s in load_skills()]
+          assert skills == ['garmin-upload', 'mywhoosh-upload'], skills
+          assert _register_skill_prompts() == skills
+
+          async def main():
+              tools = await app.list_tools()
+              prompts = await app.list_prompts()
+              assert len(tools) == 6, [t.name for t in tools]
+              assert len(prompts) == 2, [p.name for p in prompts]
+              print(f"ok: {len(tools)} tools, {len(prompts)} prompts, skills {skills}")
+
+          asyncio.run(main())
+          PY
+
+  manifests:
+    name: Validate plugin and bundle manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Manifests are valid JSON and reference real paths
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, sys
+          for name in ('.claude-plugin/plugin.json', '.claude-plugin/marketplace.json', 'manifest.json'):
+              json.loads(pathlib.Path(name).read_text())
+              print(f'{name}: valid JSON')
+          plugin = json.loads(pathlib.Path('.claude-plugin/plugin.json').read_text())
+          skills = pathlib.Path(plugin['skills'])
+          if not skills.is_dir():
+              sys.exit(f'plugin.json skills path does not exist: {skills}')
+          found = sorted(p.name for p in skills.iterdir() if p.is_dir())
+          print(f'skills: {found}')
+          PY
+      - name: Validate the Claude Desktop extension manifest
+        run: npx --yes @anthropic-ai/mcpb@latest validate manifest.json

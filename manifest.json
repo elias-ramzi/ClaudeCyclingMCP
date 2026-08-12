@@ -1,0 +1,80 @@
+{
+  "manifest_version": "0.3",
+  "name": "claude-cycling-mcp",
+  "display_name": "ClaudeCyclingMCP",
+  "version": "0.1.0",
+  "description": "Describe a structured cycling session once; render it to a MyWhoosh .zwo and a Garmin Connect workout.",
+  "long_description": "Writing a structured bike session means either clicking blocks around in a graphical editor or hand-writing XML — and the two platforms want different formats, so the same session gets built twice.\n\nThis server takes one flat, hand-editable workout spec and emits both files. Power is written in watts or % FTP; steady blocks, ramps, free rides and repeated sets are all supported, along with per-block cadence and on-screen messages.\n\n**Pure and offline.** Every tool is deterministic: no network calls, no credentials, no uploads. `describe_spec` returns a block table with computed watts and estimated IF/TSS so a session can be checked before it is rendered, and `verify_garmin_upload` compares an uploaded workout against what was actually sent.\n\n**Uploading lives in the bundled skills**, because it needs auth, a browser, and a human in the loop — a MyWhoosh export spends a finite slot credit. The skills ship as MCP prompts, so they are available from the prompt menu as soon as the server is connected.",
+  "author": {
+    "name": "Elias Ramzi",
+    "url": "https://github.com/elias-ramzi"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/elias-ramzi/ClaudeCyclingMCP"
+  },
+  "homepage": "https://github.com/elias-ramzi/ClaudeCyclingMCP",
+  "documentation": "https://github.com/elias-ramzi/ClaudeCyclingMCP#readme",
+  "support": "https://github.com/elias-ramzi/ClaudeCyclingMCP/issues",
+  "license": "MIT",
+  "keywords": ["cycling", "workout", "zwo", "mywhoosh", "garmin", "ftp", "training"],
+  "server": {
+    "type": "python",
+    "entry_point": "cycling_mcp",
+    "mcp_config": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/elias-ramzi/ClaudeCyclingMCP",
+        "claude-cycling-mcp"
+      ]
+    }
+  },
+  "tools": [
+    {
+      "name": "validate_spec",
+      "description": "Check a workout spec and report every problem found"
+    },
+    {
+      "name": "describe_spec",
+      "description": "Show the session as a block table with computed watts, duration, IF and TSS"
+    },
+    {
+      "name": "render_zwo",
+      "description": "Render the spec to a MyWhoosh-compatible .zwo file"
+    },
+    {
+      "name": "render_garmin",
+      "description": "Render the spec to a Garmin Connect workout payload"
+    },
+    {
+      "name": "verify_garmin_upload",
+      "description": "Compare an uploaded Garmin workout against the payload that was sent"
+    },
+    {
+      "name": "spec_schema",
+      "description": "Return the workout spec's JSON schema and authoring notes"
+    }
+  ],
+  "prompts": [
+    {
+      "name": "garmin-upload",
+      "description": "Build a cycling workout and put it on Garmin Connect, verifying the result",
+      "arguments": ["session"],
+      "text": "Follow the \"garmin-upload\" procedure, using this server's tools. The full instructions are served by the server at run time; the session to build is ${arguments.session}."
+    },
+    {
+      "name": "mywhoosh-upload",
+      "description": "Build a cycling workout and import it into MyWhoosh through the browser",
+      "arguments": ["session"],
+      "text": "Follow the \"mywhoosh-upload\" procedure, using this server's tools. The full instructions are served by the server at run time; the session to build is ${arguments.session}."
+    }
+  ],
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  }
+}

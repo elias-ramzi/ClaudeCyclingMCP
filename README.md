@@ -69,6 +69,16 @@ prompt menu at the version the server shipped with:
 
 Or from a clone: `pip install -e . && python -m cycling_mcp`.
 
+### Claude Desktop — the one-click extension
+
+Download `claude-cycling-mcp.mcpb` from the
+[latest release](https://github.com/elias-ramzi/ClaudeCyclingMCP/releases) and drag it into Claude
+Desktop. It carries the manifest and the skills; the server itself is fetched by `uvx` on first run,
+so you need `uv` and Python 3.10+ on the machine.
+
+This registers the server and its prompts. For the model to reach for the skills on its own, also do
+the step below.
+
 ### Claude Desktop and claude.ai — upload the skills
 
 The prompts above already work once the server is connected. To also get the
@@ -431,6 +441,21 @@ pip install -e ".[live]" && pytest -m live
 It needs the Garmin tokens the Garmin MCP already stores (`GARMINTOKENS`, or
 `~/.garminconnect`). It creates a workout named `ClaudeCyclingMCP_test_*` and
 deletes it afterwards, including on failure. No credentials live in this repo.
+
+## Development
+
+```bash
+uv venv && uv sync --extra dev
+ruff check . && ruff format --check . && pytest
+```
+
+| | |
+|---|---|
+| [CONTRIBUTING.md](CONTRIBUTING.md) | how to propose a change, and the two project-specific rules |
+| [CLAUDE.md](CLAUDE.md) | architecture, and the platform quirks that are load-bearing |
+| [docs/versioning.md](docs/versioning.md) | SemVer policy, the release process, publishing setup |
+| [CHANGELOG.md](CHANGELOG.md) | what changed, and what was verified against the live API |
+| [SECURITY.md](SECURITY.md) | why the server holds no credentials, and where they do live |
 
 ## License
 

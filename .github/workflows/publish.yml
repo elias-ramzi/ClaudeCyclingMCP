@@ -1,0 +1,66 @@
+name: Publish
+
+# Publish to PyPI when a version tag is pushed (e.g. `git tag v0.1.0 && git push --tags`).
+# Publishing stays a deliberate, human-initiated act — tagging — rather than firing on every push.
+#
+# Auth is PyPI Trusted Publishing (OIDC): no long-lived token in repository secrets. See
+# docs/versioning.md for the one-time PyPI setup.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write # trusted publishing
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure git
+        run: git config --global core.autocrlf false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --extra dev
+
+      # Never publish a red build: run the same gate CI enforces.
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest -q
+
+      # Guard against a tag/version mismatch — `v0.1.0` must match pyproject's 0.1.0.
+      # The lock-step test already ties pyproject to the plugin manifests and __version__,
+      # so this one check covers all four.
+      - name: Verify the tag matches the package version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(uv run python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag does not match pyproject.toml version $version"
+            exit 1
+          fi
+          echo "OK: tag v$tag matches pyproject.toml"
+
+      - run: uv build
+
+      # Confirm the skills actually made it into the artifact before publishing it —
+      # a wheel without them would install a server whose prompts silently vanish.
+      - name: Verify the skills are in the wheel
+        run: |
+          set -euo pipefail
+          for skill in garmin-upload mywhoosh-upload; do
+            if ! unzip -l dist/*.whl | grep -q "cycling_mcp/_skills/$skill/SKILL.md"; then
+              echo "::error::$skill is missing from the built wheel"
+              exit 1
+            fi
+          done
+          echo "OK: both skills are packaged"
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1

@@ -19,7 +19,7 @@ classifiers = [
 dependencies = ["mcp>=1.2.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
 live = ["garminconnect>=0.2.25"]  # only for the live Garmin round-trip test
 
 [project.scripts]
@@ -37,6 +37,33 @@ packages = ["src/cycling_mcp"]
 # them directly and where the Desktop zip step expects them.
 [tool.hatch.build.targets.wheel.force-include]
 ".claude/skills" = "cycling_mcp/_skills"
+
+[tool.ruff]
+# Matches the 100-column style used across the author's other MCP repos.
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # import sorting
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "SIM", # simplify
+    "RUF",
+]
+ignore = [
+    "E501",   # line length is enforced by the formatter, not the linter
+    "RUF001", # ambiguous unicode: prose in docstrings legitimately uses en dashes
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+line-ending = "lf"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
