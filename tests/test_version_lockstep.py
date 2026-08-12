@@ -14,8 +14,11 @@ import pytest
 
 if sys.version_info >= (3, 11):
     import tomllib
-else:  # 3.10 has no tomllib
-    tomllib = pytest.importorskip("tomli", reason="pip install tomli on Python 3.10")
+else:
+    # 3.10 has no stdlib tomllib. `tomli` is a declared 3.10-only dev dependency,
+    # so its absence is a broken environment rather than an expected condition —
+    # fail loudly here instead of skipping and quietly losing the check.
+    import tomli as tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 

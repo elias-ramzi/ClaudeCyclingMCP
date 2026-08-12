@@ -19,7 +19,13 @@ classifiers = [
 dependencies = ["mcp>=1.2.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    # 3.10 has no stdlib tomllib; without this the version lock-step test would
+    # skip there rather than run.
+    "tomli>=2.0; python_version < '3.11'",
+]
 live = ["garminconnect>=0.2.25"]  # only for the live Garmin round-trip test
 
 [project.scripts]
