@@ -19,6 +19,7 @@ from .render_garmin import render_garmin as _render_garmin
 from .render_zwo import render_zwo as _render_zwo
 from .render_zwo import zwo_filename
 from .spec import SpecError, load_spec, validate_spec as _validate_spec
+from .verify import compare_upload, total_step_seconds
 
 app = FastMCP("claude-cycling-mcp")
 
@@ -275,6 +276,40 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
     if out_path:
         result["written_to"] = _write(out_path, _dump(payload))
     return _dump(result)
+
+
+@app.tool()
+def verify_garmin_upload(payload: dict, fetched: dict) -> str:
+    """Check that Garmin stored the workout that was actually sent.
+
+    Pass the payload given to upload_workout, and the response from
+    get_workout_by_id for the workout it created. Returns the list of
+    differences; an empty list means Garmin kept what was sent.
+
+    This compares against the sent payload, not against an assumed read shape —
+    the difference matters, because get_workout_by_id returns a lossy
+    projection that will happily agree with a wrong-units payload. It also
+    catches a repeat count silently corrupted by a missing conditionTypeId.
+
+    Two things it cannot prove: whether a power target was stored as watts or
+    as %FTP (the curated read drops the targetValueUnit field that distinguishes
+    them), and whether the workout displays correctly on a head unit. Confirm
+    those by opening the workout in Garmin Connect once.
+
+    Pure comparison, no network access.
+    """
+    problems = compare_upload(payload, fetched)
+    return _dump(
+        {
+            "match": not problems,
+            "differences": problems,
+            "sent_step_seconds": total_step_seconds(payload),
+            "note": (
+                "Garmin's estimated_duration_seconds follows its own rules and can "
+                "disagree with the sum of the steps; it is not used for this check."
+            ),
+        }
+    )
 
 
 @app.tool()
