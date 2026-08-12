@@ -30,6 +30,17 @@ through Claude in Chrome. Everything here was confirmed in a real session.
 
 1. Get the FTP. Call `get_cycling_ftp` from the Garmin MCP; if it reports
    `is_stale`, confirm the number with the athlete. Never assume one.
+
+   **That tool reads Garmin's profile, not MyWhoosh's.** MyWhoosh keeps its own
+   FTP and there is no API to read it. This matters here more than it does on
+   the Garmin side: a `.zwo` stores only *fractions* of FTP, so the watts
+   actually ridden are `fraction × the FTP in the athlete's MyWhoosh profile`.
+   If `spec.ftp` is 255 and MyWhoosh's profile says 200, every target is ridden
+   ~22% too easy and nothing anywhere reports a problem.
+
+   So confirm with the athlete that `spec.ftp` matches **what MyWhoosh has**,
+   not just what Garmin thinks. If the two disagree, say so and let them decide
+   which is right before rendering.
 2. Write the spec and call `describe_spec`. **Show the block table to the
    user** and get agreement on the session before automating anything.
 3. Call `render_zwo` with `out_path` set — for example
@@ -111,8 +122,12 @@ retry blindly, and do not fall back to building blocks by hand.
 
 **Import resets FTP and weight to defaults (200 W / 62 kg).** If you skip this,
 the displayed watts and Training Load are wrong. The power fractions inside the
-file stay correct regardless — this only affects what's shown, and what the
-athlete will read off the screen.
+file stay correct regardless — this field is a preview setting, so it changes
+what the athlete reads off the screen, not what is stored.
+
+It still matters: the duration, TSS and IF you check in Step 5 and report in
+Step 6 are computed against this number, so leaving it at 200 W means
+sanity-checking the session against the wrong athlete.
 
 Set both with `form_input`. **Do not use `triple_click` + `type`** — typing does
 not stick on these number fields.
