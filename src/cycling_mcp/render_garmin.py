@@ -7,14 +7,20 @@ Schema notes, all of them load-bearing (see README "Garmin schema provenance"):
 * A `RepeatGroupDTO` must carry a complete `endCondition`, including the numeric
   `conditionTypeId: 7`. Omitting the id makes the API silently corrupt the
   repeat count — no error, wrong workout.
-* Power targets are emitted as absolute watts via `power.between`
-  (workoutTargetTypeId 6). Target type id 2 is `power.zone` and takes a zone
-  number, not watts; pairing id 2 with the key "power.between" is a silent
-  Garmin bug that stores the step as a zone target and loses the intent.
+* Power targets use workoutTargetTypeId 2 (key "power.zone") with an absolute
+  watt range in targetValueOne/targetValueTwo, and no zoneNumber.
+
+  This contradicts the Garmin MCP's own `upload_workout` docstring, which says
+  cycling watt ranges take workoutTargetTypeId 6 / "power.between". Against the
+  live API that is wrong, and wrong silently: id 6 uploads without error and
+  Garmin normalises it to the key "pace.zone" on a cycling workout — a pace
+  target, not a power one. Id 2 round-trips as "power.zone" with the watts
+  intact, byte-for-byte the shape Garmin's own web UI produces for a watt
+  target. Verified by upload/fetch probe, 2026-08-12; see README.
 * Percentages from the spec are resolved to watts here using the spec's FTP.
-  Garmin's own UI accepts a %FTP target, but its write encoding is not part of
-  the documented schema and was not established for this project. Watts are
-  unambiguous, so watts are what this renderer emits.
+  Garmin's UI also accepts a %FTP target, which the API stores in this same
+  shape — the curated read cannot tell the two apart (README, "the conflation").
+  Watts are unambiguous, so watts are what this renderer emits.
 * Target values live on the step, next to `targetType`, never inside it.
 """
 
@@ -37,7 +43,9 @@ END_CONDITION_TIME = {"conditionTypeId": 2, "conditionTypeKey": "time"}
 END_CONDITION_ITERATIONS = {"conditionTypeId": 7, "conditionTypeKey": "iterations"}
 
 TARGET_NO_TARGET = {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}
-TARGET_POWER_BETWEEN = {"workoutTargetTypeId": 6, "workoutTargetTypeKey": "power.between"}
+# Absolute watt range. Id 2 despite the "zone" in the key — see the module
+# docstring; id 6 silently becomes a pace target on a cycling workout.
+TARGET_POWER = {"workoutTargetTypeId": 2, "workoutTargetTypeKey": "power.zone"}
 TARGET_CADENCE = {"workoutTargetTypeId": 3, "workoutTargetTypeKey": "cadence"}
 
 
@@ -158,12 +166,12 @@ def _render_block(
             if low_w == high_w:
                 high_w = low_w + 1
             steps.append(
-                _executable(block, counter.next(), seconds, TARGET_POWER_BETWEEN, low_w, high_w)
+                _executable(block, counter.next(), seconds, TARGET_POWER, low_w, high_w)
             )
         return steps
 
     low, high = _watt_bounds(block, workout, warnings, where)
-    return [_executable(block, counter.next(), block.duration_s, TARGET_POWER_BETWEEN, low, high)]
+    return [_executable(block, counter.next(), block.duration_s, TARGET_POWER, low, high)]
 
 
 def render_garmin(workout: Workout) -> tuple[dict, list[str]]:

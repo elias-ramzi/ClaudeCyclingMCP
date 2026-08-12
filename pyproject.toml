@@ -20,6 +20,7 @@ dependencies = ["mcp>=1.2.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+live = ["garminconnect>=0.2.25"]  # only for the live Garmin round-trip test
 
 [project.scripts]
 claude-cycling-mcp = "cycling_mcp.server:main"

@@ -1,0 +1,147 @@
+{
+  "_comment": [
+    "A real upload/fetch exchange with Garmin Connect, captured 2026-08-12.",
+    "'sent' is the payload handed to upload_workout; 'fetched' is what",
+    "get_workout_by_id returned for the workout it created (id 1662671772,",
+    "deleted after capture). This pins the observed API behaviour so the",
+    "round-trip comparison can be tested without touching the network.",
+    "Note what it records: targetType id 2 was sent with key 'power.zone' and",
+    "came back as 'power.zone' with the watts intact. The same structure sent",
+    "with id 6 / 'power.between' came back as 'pace.zone' — see README."
+  ],
+  "sent": {
+    "workoutName": "ClaudeCyclingMCP_test_id2",
+    "sportType": { "sportTypeId": 2, "sportTypeKey": "cycling" },
+    "description": "Schema probe id2. Safe to delete.",
+    "workoutSegments": [
+      {
+        "segmentOrder": 1,
+        "sportType": { "sportTypeId": 2, "sportTypeKey": "cycling" },
+        "workoutSteps": [
+          {
+            "type": "ExecutableStepDTO",
+            "stepOrder": 1,
+            "stepType": { "stepTypeId": 1, "stepTypeKey": "warmup" },
+            "endCondition": { "conditionTypeId": 2, "conditionTypeKey": "time" },
+            "endConditionValue": 600,
+            "targetType": { "workoutTargetTypeId": 2, "workoutTargetTypeKey": "power.zone" },
+            "targetValueOne": 120,
+            "targetValueTwo": 200,
+            "secondaryTargetType": { "workoutTargetTypeId": 3, "workoutTargetTypeKey": "cadence" },
+            "secondaryTargetValueOne": 85,
+            "secondaryTargetValueTwo": 95
+          },
+          {
+            "type": "RepeatGroupDTO",
+            "stepOrder": 2,
+            "stepType": { "stepTypeId": 6, "stepTypeKey": "repeat" },
+            "numberOfIterations": 3,
+            "endCondition": { "conditionTypeId": 7, "conditionTypeKey": "iterations" },
+            "endConditionValue": 3,
+            "smartRepeat": false,
+            "workoutSteps": [
+              {
+                "type": "ExecutableStepDTO",
+                "stepOrder": 3,
+                "stepType": { "stepTypeId": 3, "stepTypeKey": "interval" },
+                "endCondition": { "conditionTypeId": 2, "conditionTypeKey": "time" },
+                "endConditionValue": 240,
+                "targetType": { "workoutTargetTypeId": 2, "workoutTargetTypeKey": "power.zone" },
+                "targetValueOne": 242,
+                "targetValueTwo": 268
+              },
+              {
+                "type": "ExecutableStepDTO",
+                "stepOrder": 4,
+                "stepType": { "stepTypeId": 4, "stepTypeKey": "recovery" },
+                "endCondition": { "conditionTypeId": 2, "conditionTypeKey": "time" },
+                "endConditionValue": 120,
+                "targetType": { "workoutTargetTypeId": 2, "workoutTargetTypeKey": "power.zone" },
+                "targetValueOne": 137,
+                "targetValueTwo": 143
+              }
+            ]
+          },
+          {
+            "type": "ExecutableStepDTO",
+            "stepOrder": 5,
+            "stepType": { "stepTypeId": 2, "stepTypeKey": "cooldown" },
+            "endCondition": { "conditionTypeId": 2, "conditionTypeKey": "time" },
+            "endConditionValue": 300,
+            "targetType": { "workoutTargetTypeId": 2, "workoutTargetTypeKey": "power.zone" },
+            "targetValueOne": 110,
+            "targetValueTwo": 150
+          }
+        ]
+      }
+    ]
+  },
+  "fetched": {
+    "id": 1662671772,
+    "name": "ClaudeCyclingMCP_test_id2",
+    "sport": "cycling",
+    "created_date": "2026-08-12T15:10:37.0",
+    "updated_date": "2026-08-12T15:10:37.0",
+    "description": "Schema probe id2. Safe to delete.",
+    "estimated_duration_seconds": 1980,
+    "segments": [
+      {
+        "order": 1,
+        "sport": "cycling",
+        "steps": [
+          {
+            "order": 1,
+            "type": "warmup",
+            "end_condition": "time",
+            "end_condition_value": 600.0,
+            "target_type": "power.zone",
+            "target_value_low": 120.0,
+            "target_value_high": 200.0,
+            "secondary_target_type": "cadence",
+            "secondary_target_value_low": 85.0,
+            "secondary_target_value_high": 95.0
+          },
+          {
+            "order": 2,
+            "type": "repeat",
+            "end_condition": "iterations",
+            "end_condition_value": 3.0,
+            "repeat_count": 3,
+            "steps": [
+              {
+                "order": 3,
+                "type": "interval",
+                "end_condition": "time",
+                "end_condition_value": 240.0,
+                "target_type": "power.zone",
+                "target_value_low": 242.0,
+                "target_value_high": 268.0
+              },
+              {
+                "order": 4,
+                "type": "recovery",
+                "end_condition": "time",
+                "end_condition_value": 120.0,
+                "target_type": "power.zone",
+                "target_value_low": 137.0,
+                "target_value_high": 143.0
+              }
+            ],
+            "step_count": 2
+          },
+          {
+            "order": 5,
+            "type": "cooldown",
+            "end_condition": "time",
+            "end_condition_value": 300.0,
+            "target_type": "power.zone",
+            "target_value_low": 110.0,
+            "target_value_high": 150.0
+          }
+        ],
+        "step_count": 3
+      }
+    ],
+    "segment_count": 1
+  }
+}

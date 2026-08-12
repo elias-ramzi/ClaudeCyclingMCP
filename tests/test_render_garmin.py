@@ -1,0 +1,296 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from cycling_mcp.render_garmin import render_garmin
+from cycling_mcp.spec import load_spec
+from cycling_mcp.verify import total_step_seconds
+
+GOLDEN = Path(__file__).parent / "golden"
+
+
+@pytest.fixture
+def sweetspot():
+    return load_spec(json.loads((GOLDEN / "sweetspot-3x10.json").read_text()))
+
+
+def payload(spec: dict) -> dict:
+    return render_garmin(load_spec(spec))[0]
+
+
+def steps(built: dict) -> list[dict]:
+    return built["workoutSegments"][0]["workoutSteps"]
+
+
+def walk(step_list):
+    for step in step_list:
+        yield step
+        yield from walk(step.get("workoutSteps", []))
+
+
+def test_matches_the_golden_payload(sweetspot):
+    expected = json.loads((GOLDEN / "sweetspot-3x10.garmin.json").read_text())
+    assert render_garmin(sweetspot)[0] == expected
+
+
+def test_sport_is_cycling(sweetspot):
+    built = render_garmin(sweetspot)[0]
+    assert built["sportType"] == {"sportTypeId": 2, "sportTypeKey": "cycling"}
+    assert built["workoutSegments"][0]["sportType"]["sportTypeId"] == 2
+
+
+def test_step_durations_survive_the_render(sweetspot):
+    assert total_step_seconds(render_garmin(sweetspot)[0]) == sweetspot.total_seconds
+
+
+# --------------------------------------------------------------------------
+# the schema details that fail silently when wrong
+# --------------------------------------------------------------------------
+
+
+def test_power_targets_use_id_2_with_absolute_watts(sweetspot):
+    """Id 6 uploads fine and is stored as a *pace* target on a cycling workout."""
+    built = render_garmin(sweetspot)[0]
+    power_steps = [
+        s for s in walk(steps(built)) if s.get("targetType", {}).get("workoutTargetTypeId") == 2
+    ]
+    assert len(power_steps) == 7
+    for step in power_steps:
+        assert step["targetType"]["workoutTargetTypeKey"] == "power.zone"
+        assert "zoneNumber" not in step
+        assert step["targetValueOne"] < step["targetValueTwo"]
+
+
+def test_no_step_uses_target_type_id_6(sweetspot):
+    for step in walk(steps(render_garmin(sweetspot)[0])):
+        assert step.get("targetType", {}).get("workoutTargetTypeId") != 6
+
+
+def test_percent_targets_are_resolved_to_watts():
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 200,
+            "blocks": [{"type": "steady", "duration": 600, "power_pct": [95, 105]}],
+        }
+    )
+    step = steps(built)[0]
+    assert (step["targetValueOne"], step["targetValueTwo"]) == (190.0, 210.0)
+
+
+def test_repeat_group_carries_the_numeric_condition_type_id():
+    """Omitting conditionTypeId makes Garmin silently corrupt the repeat count."""
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 250,
+            "blocks": [
+                {
+                    "type": "repeat",
+                    "count": 3,
+                    "blocks": [{"type": "steady", "duration": 240, "power_pct": 100}],
+                }
+            ],
+        }
+    )
+    group = steps(built)[0]
+    assert group["type"] == "RepeatGroupDTO"
+    assert group["endCondition"] == {"conditionTypeId": 7, "conditionTypeKey": "iterations"}
+    assert group["numberOfIterations"] == 3
+    assert group["endConditionValue"] == 3.0
+
+
+def test_repeats_stay_native_rather_than_being_flattened():
+    """Unlike the .zwo, Garmin has a real repeat construct — use it."""
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 250,
+            "blocks": [
+                {
+                    "type": "repeat",
+                    "count": 5,
+                    "blocks": [
+                        {"type": "steady", "duration": 240, "power_pct": 105},
+                        {"type": "steady", "duration": 120, "power_pct": 55},
+                    ],
+                }
+            ],
+        }
+    )
+    assert len(steps(built)) == 1
+    assert len(steps(built)[0]["workoutSteps"]) == 2
+
+
+def test_step_order_is_global_and_continues_through_repeats():
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 250,
+            "blocks": [
+                {"type": "steady", "duration": 600, "power_pct": 60},
+                {
+                    "type": "repeat",
+                    "count": 3,
+                    "blocks": [
+                        {"type": "steady", "duration": 240, "power_pct": 105},
+                        {"type": "steady", "duration": 120, "power_pct": 55},
+                    ],
+                },
+                {"type": "steady", "duration": 600, "power_pct": 55},
+            ],
+        }
+    )
+    assert [s["stepOrder"] for s in walk(steps(built))] == [1, 2, 3, 4, 5]
+
+
+def test_end_conditions_are_time_with_the_numeric_id(sweetspot):
+    for step in walk(steps(render_garmin(sweetspot)[0])):
+        if step["type"] == "ExecutableStepDTO":
+            assert step["endCondition"] == {"conditionTypeId": 2, "conditionTypeKey": "time"}
+
+
+def test_target_values_sit_on_the_step_not_inside_the_target_type(sweetspot):
+    for step in walk(steps(render_garmin(sweetspot)[0])):
+        assert "targetValueOne" not in step.get("targetType", {})
+        assert "zoneNumber" not in step.get("targetType", {})
+
+
+def test_step_types_map_to_their_ids(sweetspot):
+    built = render_garmin(sweetspot)[0]
+    pairs = [(s["stepType"]["stepTypeId"], s["stepType"]["stepTypeKey"]) for s in steps(built)]
+    assert pairs[0] == (1, "warmup")
+    assert pairs[1] == (3, "interval")
+    assert pairs[2] == (4, "recovery")
+    assert pairs[-1] == (2, "cooldown")
+
+
+# --------------------------------------------------------------------------
+# targets
+# --------------------------------------------------------------------------
+
+
+def test_scalar_target_gets_a_band_because_garmin_needs_a_range():
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 255,
+            "blocks": [{"type": "steady", "duration": 600, "power_w": 232}],
+        }
+    )
+    step = steps(built)[0]
+    assert (step["targetValueOne"], step["targetValueTwo"]) == (227.0, 237.0)
+
+
+def test_band_width_is_configurable():
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 200,
+            "blocks": [{"type": "steady", "duration": 600, "power_w": 200}],
+            "garmin_target_band_pct": 5,
+        }
+    )
+    step = steps(built)[0]
+    assert (step["targetValueOne"], step["targetValueTwo"]) == (190.0, 210.0)
+
+
+def test_explicit_range_is_not_widened():
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 200,
+            "blocks": [{"type": "steady", "duration": 600, "power_w": [180, 220]}],
+        }
+    )
+    step = steps(built)[0]
+    assert (step["targetValueOne"], step["targetValueTwo"]) == (180.0, 220.0)
+
+
+def test_ramp_becomes_one_step_spanning_the_range():
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 255,
+            "blocks": [{"type": "ramp", "duration": 600, "from_w": 130, "to_w": 180}],
+        }
+    )
+    assert len(steps(built)) == 1
+    step = steps(built)[0]
+    assert (step["targetValueOne"], step["targetValueTwo"]) == (130.0, 180.0)
+
+
+def test_descending_ramp_still_reports_low_then_high():
+    """targetValueOne must be the lower watt figure regardless of direction."""
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 255,
+            "blocks": [{"type": "ramp", "duration": 600, "from_w": 180, "to_w": 130}],
+        }
+    )
+    step = steps(built)[0]
+    assert (step["targetValueOne"], step["targetValueTwo"]) == (130.0, 180.0)
+
+
+def test_ramp_steps_stair_step_the_ramp():
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 200,
+            "blocks": [
+                {"type": "ramp", "duration": 600, "from_w": 100, "to_w": 200, "ramp_steps": 4}
+            ],
+        }
+    )
+    assert len(steps(built)) == 4
+    assert sum(s["endConditionValue"] for s in steps(built)) == 600.0
+    assert steps(built)[0]["targetValueOne"] == 100.0
+    assert steps(built)[-1]["targetValueTwo"] == 200.0
+
+
+def test_free_ride_has_no_target():
+    built = payload({"name": "T", "ftp": 250, "blocks": [{"type": "free", "duration": 600}]})
+    step = steps(built)[0]
+    assert step["targetType"] == {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}
+    assert "targetValueOne" not in step
+
+
+def test_cadence_becomes_a_secondary_target_keeping_its_range():
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 250,
+            "blocks": [{"type": "steady", "duration": 600, "power_pct": 90, "cadence": [85, 95]}],
+        }
+    )
+    step = steps(built)[0]
+    assert step["secondaryTargetType"] == {"workoutTargetTypeId": 3, "workoutTargetTypeKey": "cadence"}
+    assert (step["secondaryTargetValueOne"], step["secondaryTargetValueTwo"]) == (85.0, 95.0)
+
+
+def test_hr_note_becomes_a_description_never_a_heart_rate_target():
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 250,
+            "blocks": [
+                {
+                    "type": "steady",
+                    "duration": 600,
+                    "power_pct": 90,
+                    "message": "Tempo",
+                    "hr_note": "expect 145-155 bpm",
+                }
+            ],
+        }
+    )
+    step = steps(built)[0]
+    assert step["description"] == "Tempo | expect 145-155 bpm"
+    for value in json.dumps(built).split():
+        assert "heart.rate" not in value
+
+
+def test_no_heart_rate_target_is_ever_emitted(sweetspot):
+    assert "heart.rate" not in json.dumps(render_garmin(sweetspot)[0])
