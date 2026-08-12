@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "claude-cycling-mcp",
+  "displayName": "ClaudeCyclingMCP",
+  "version": "0.1.0",
+  "description": "Author a structured cycling workout once and render it for both MyWhoosh (.zwo) and Garmin Connect — the MCP server plus its upload skills in one install.",
+  "author": {
+    "name": "Elias Ramzi",
+    "email": "elias.ramzi@gmail.com"
+  },
+  "homepage": "https://github.com/elias-ramzi/ClaudeCyclingMCP",
+  "repository": "https://github.com/elias-ramzi/ClaudeCyclingMCP",
+  "license": "MIT",
+  "keywords": ["cycling", "workout", "zwo", "mywhoosh", "garmin", "mcp", "ftp"],
+  "skills": "./.claude/skills",
+  "mcpServers": {
+    "cycling": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/elias-ramzi/ClaudeCyclingMCP",
+        "claude-cycling-mcp"
+      ]
+    }
+  }
+}

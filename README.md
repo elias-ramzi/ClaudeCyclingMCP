@@ -34,17 +34,27 @@ loop. They ship as [skills](#skills) instead.
 
 Requires Python 3.10+.
 
-```bash
-uvx --from git+https://github.com/elias-ramzi/ClaudeCyclingMCP claude-cycling-mcp
-```
+### Claude Code — the plugin
 
-Or from a clone:
+Installs the server **and** the skills, in every session, from any directory:
 
 ```bash
-pip install -e . && python -m cycling_mcp
+/plugin marketplace add elias-ramzi/ClaudeCyclingMCP
 ```
 
-Register it as an MCP server (`claude mcp add`, or your client's config):
+```bash
+/plugin install claude-cycling-mcp@cycling-tools
+```
+
+Running Claude Code from a clone works too — `.claude/skills` is picked up from
+the working directory.
+
+### Any MCP client — nothing extra to install
+
+The server registers each bundled skill as an [MCP
+prompt](https://modelcontextprotocol.io/specification/server/prompts), so the
+procedures travel with it. Register the server and they appear in the client's
+prompt menu at the version the server shipped with:
 
 ```json
 {
@@ -56,6 +66,22 @@ Register it as an MCP server (`claude mcp add`, or your client's config):
   }
 }
 ```
+
+Or from a clone: `pip install -e . && python -m cycling_mcp`.
+
+### Claude Desktop and claude.ai — upload the skills
+
+The prompts above already work once the server is connected. To also get the
+**model-invoked** behaviour — so "put this session on my Garmin" reaches for the
+skill on its own — upload the skills to your Claude account:
+
+```bash
+cd .claude/skills && for s in */; do zip -r "${s%/}.zip" "$s"; done
+```
+
+Then in Claude, **Customize → Skills → +**, and upload one `.zip` per skill.
+They are per-account and sync to Desktop, claude.ai and Cowork. Requires code
+execution enabled on your plan.
 
 ## The spec format
 
@@ -325,17 +351,54 @@ the API can accept and echo a structure that still displays oddly.
 
 ## Skills
 
-Two bundled skills in [`skills/`](skills), each triggering on descriptions of a
-session — "create", "add", "send", "put it on" — not only on "upload".
+Two bundled skills in [`.claude/skills/`](.claude/skills), each triggering on
+descriptions of a session — "create", "add", "send", "put it on" — not only on
+"upload".
 
-- **[`garmin-upload`](skills/garmin-upload/SKILL.md)** — renders, uploads via
-  the Garmin MCP's `upload_workout`, then verifies by fetching the workout back
-  and comparing it against what was sent, rather than trusting that the call
-  returned success. Offers to schedule it.
-- **[`mywhoosh-upload`](skills/mywhoosh-upload/SKILL.md)** — drives the MyWhoosh
-  builder through Claude in Chrome, because there is no API. Each step states
-  what it expects to see, so a run that breaks after a MyWhoosh redesign reports
-  which assumption failed instead of silently producing nothing.
+- **[`garmin-upload`](.claude/skills/garmin-upload/SKILL.md)** — renders, uploads
+  via the Garmin MCP's `upload_workout`, then verifies by fetching the workout
+  back and comparing it against what was sent, rather than trusting that the
+  call returned success. Offers to schedule it.
+- **[`mywhoosh-upload`](.claude/skills/mywhoosh-upload/SKILL.md)** — drives the
+  MyWhoosh builder through Claude in Chrome, because there is no API. It reads
+  MyWhoosh's FTP out of the builder before rendering, so the fractions in the
+  `.zwo` are right by construction. Each step states what it expects to see, so
+  a run that breaks after a MyWhoosh redesign reports which assumption failed
+  instead of silently producing nothing.
+
+### Two ways a skill runs
+
+The same `SKILL.md` reaches a client through one of two mechanisms, and they
+differ in **who decides to run it**.
+
+**As a skill — model-invoked.** The client reads the skill's `description` and
+reaches for it when your request matches: "put this on my Garmin" pulls in
+`garmin-upload` without you naming it. This is what Claude Code does with
+`.claude/skills`, and what an uploaded skill does in Claude Desktop and
+claude.ai.
+
+**As an MCP prompt — user-invoked.** The server registers every bundled skill as
+a prompt of the same name, carrying the same instructions, so clients that don't
+read `.claude/skills` can still run them. You pick it from the client's prompt
+menu; the model will not reach for it on its own. Each takes an optional
+`session` argument, so you can describe the workout up front instead of being
+asked.
+
+The two coexist: prompts always work because they travel with the server, and
+installing the skills properly on top adds the model-invoked trigger.
+
+**What each skill needs to actually run.** A skill triggers on description alone,
+but it can only finish if its dependencies are present:
+
+| Skill | Needs |
+|---|---|
+| `garmin-upload` | this server + the Garmin Connect MCP |
+| `mywhoosh-upload` | this server + browser control (Claude in Chrome) |
+
+So the Garmin path is portable to any client with both MCP servers connected,
+while the MyWhoosh path only works where a browser is drivable. In a client
+without browser tools the MyWhoosh skill will trigger and then have no way to
+drive the page.
 
 **The MyWhoosh export spends a finite slot credit**, so that skill stops and
 asks for explicit confirmation before exporting, and uses the pause to settle
@@ -349,9 +412,10 @@ between "clicked the button" and "the workout exists".
 pip install -e ".[dev]" && pytest
 ```
 
-106 offline tests: watt↔fraction conversion in both directions, duration totals,
-NP/IF/TSS, both renderers against golden files, XML that actually parses, and
-the round-trip comparison against a recorded real API exchange.
+126 offline tests: watt↔fraction conversion in both directions, duration totals,
+NP/IF/TSS, both renderers against golden files, XML that actually parses, the
+round-trip comparison against a recorded real API exchange, and the skill
+frontmatter that decides whether a skill is ever reached for.
 
 The golden fixture is the 70-minute sweet-spot session in the spec example
 above. Imported into MyWhoosh it reported **70:00 / 70 TSS / 0.78 IF**; the

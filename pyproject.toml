@@ -32,6 +32,12 @@ Repository = "https://github.com/elias-ramzi/ClaudeCyclingMCP"
 [tool.hatch.build.targets.wheel]
 packages = ["src/cycling_mcp"]
 
+# Ship the skills inside the wheel so a `uvx` install can serve them as MCP
+# prompts. They stay at .claude/skills in the repo, where Claude Code reads
+# them directly and where the Desktop zip step expects them.
+[tool.hatch.build.targets.wheel.force-include]
+".claude/skills" = "cycling_mcp/_skills"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["live: touches the real Garmin Connect API (deselect with -m 'not live')"]

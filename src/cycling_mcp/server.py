@@ -21,6 +21,7 @@ from .metrics import compute_metrics, describe
 from .render_garmin import render_garmin as _render_garmin
 from .render_zwo import render_zwo as _render_zwo
 from .render_zwo import zwo_filename
+from .skills import Skill, build_skill_message, load_skills
 from .spec import SpecError, load_spec, validate_spec as _validate_spec
 from .verify import compare_upload, total_step_seconds
 
@@ -324,7 +325,33 @@ def spec_schema() -> str:
     return _dump({"schema": SPEC_SCHEMA, "authoring_notes": _AUTHORING_NOTES})
 
 
+def _register_skill_prompts() -> list[str]:
+    """Offer each bundled skill as an MCP prompt.
+
+    `.claude/skills` is a Claude Code mechanism, so this is how the same
+    procedures reach Claude Desktop and other MCP clients — shipped with the
+    server rather than uploaded per user. Unlike a real skill these are
+    user-invoked: the client lists them and the human picks one.
+
+    The prompt name matches the skill slug so it reads the same everywhere.
+    """
+    registered: list[str] = []
+    for skill in load_skills():
+
+        def make(bound: Skill):
+            def run(session: str | None = None) -> str:
+                return build_skill_message(bound, session)
+
+            run.__doc__ = bound.description
+            return run
+
+        app.prompt(name=skill.name, description=skill.description)(make(skill))
+        registered.append(skill.name)
+    return registered
+
+
 def main() -> None:
+    _register_skill_prompts()
     app.run()
 
 
