@@ -59,7 +59,7 @@ prompt menu at the version the server shipped with:
 ```json
 {
   "mcpServers": {
-    "cycling": {
+    "claude-cycling": {
       "command": "uvx",
       "args": ["--from", "git+https://github.com/elias-ramzi/ClaudeCyclingMCP", "claude-cycling-mcp"]
     }

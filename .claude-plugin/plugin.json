@@ -14,7 +14,7 @@
   "keywords": ["cycling", "workout", "zwo", "mywhoosh", "garmin", "mcp", "ftp"],
   "skills": "./.claude/skills",
   "mcpServers": {
-    "cycling": {
+    "claude-cycling": {
       "command": "uvx",
       "args": [
         "--from",
