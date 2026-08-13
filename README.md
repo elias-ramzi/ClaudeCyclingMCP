@@ -73,11 +73,13 @@ Or from a clone: `pip install -e . && python -m cycling_mcp`.
 
 Download `claude-cycling-mcp.mcpb` from the
 [latest release](https://github.com/elias-ramzi/ClaudeCyclingMCP/releases) and drag it into Claude
-Desktop. It carries the manifest and the skills; the server itself is fetched by `uvx` on first run,
-so you need `uv` and Python 3.10+ on the machine.
+Desktop. The server itself is fetched by `uvx` on first run, so you need `uv` and Python 3.10+ on
+the machine.
 
-This registers the server and its prompts. For the model to reach for the skills on its own, also do
-the step below.
+**This registers the server, its tools, and its prompts — it does not install the skills.** An
+`.mcpb` packages an MCP server and has no skills mechanism at all: the manifest schema rejects a
+`skills` key outright. The `SKILL.md` files travel inside the bundle only so you have them to hand;
+nothing reads them from there. For the model to reach for a skill on its own, do the step below.
 
 ### Claude Desktop and claude.ai — upload the skills
 
