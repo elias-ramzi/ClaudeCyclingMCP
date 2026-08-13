@@ -68,6 +68,21 @@ def test_mcpb_manifest_is_valid_json_and_named_consistently():
     assert manifest["server"]["type"] == "python"
 
 
+def test_server_advertises_the_version_in_the_handshake(version):
+    """The version is the contract a client sees, so it belongs in serverInfo.
+
+    Older MCP SDKs take no `version` argument and the server falls back to an
+    unversioned handshake; skip rather than fail there, since the fallback is
+    deliberate.
+    """
+    from cycling_mcp.server import app
+
+    advertised = getattr(app, "version", None)
+    if not advertised:
+        pytest.skip("installed MCP SDK does not carry a server version")
+    assert advertised == version
+
+
 def test_plugin_skills_path_resolves():
     plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     skills = (ROOT / plugin["skills"]).resolve()

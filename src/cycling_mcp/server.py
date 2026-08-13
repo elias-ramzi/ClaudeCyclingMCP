@@ -17,6 +17,7 @@ try:  # mcp SDK 2.x
 except ImportError:  # mcp SDK 1.x, where the same class is called FastMCP
     from mcp.server.fastmcp import FastMCP as _Server
 
+from . import __version__
 from .metrics import compute_metrics, describe
 from .render_garmin import render_garmin as _render_garmin
 from .render_zwo import render_zwo as _render_zwo
@@ -26,7 +27,22 @@ from .spec import SpecError, load_spec
 from .spec import validate_spec as _validate_spec
 from .verify import compare_upload, total_step_seconds
 
-app = _Server("claude-cycling-mcp")
+
+def _build_server():
+    """Construct the server, advertising the package version in the handshake.
+
+    The version is the contract an MCP client sees, so it belongs in
+    `serverInfo`. Older SDKs do not accept a `version` argument, and passing an
+    unknown keyword there would take the server down entirely — so fall back to
+    an unversioned handshake rather than failing to start.
+    """
+    try:
+        return _Server("claude-cycling-mcp", version=__version__)
+    except TypeError:
+        return _Server("claude-cycling-mcp")
+
+
+app = _build_server()
 
 SPEC_SCHEMA: dict[str, Any] = {
     "type": "object",
