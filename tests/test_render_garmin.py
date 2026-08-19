@@ -297,3 +297,44 @@ def test_hr_note_becomes_a_description_never_a_heart_rate_target():
 
 def test_no_heart_rate_target_is_ever_emitted(sweetspot):
     assert "heart.rate" not in json.dumps(render_garmin(sweetspot)[0])
+
+
+# --------------------------------------------------------------------------
+# the tool surface must agree with what the renderer emits
+# --------------------------------------------------------------------------
+
+
+def test_tool_docstring_does_not_contradict_the_renderer():
+    """A stale docstring is worse than no docstring.
+
+    It said "power.between (workoutTargetTypeId 6)" long after the renderer
+    moved to id 2, and a downstream client duly flagged the payload as wrong
+    and refused to upload it. The documentation and the output have to move
+    together.
+    """
+    from cycling_mcp.server import render_garmin as tool
+
+    doc = tool.__doc__ or ""
+    assert "power.between" not in doc or "wrong" in doc
+    assert "workoutTargetTypeId 2" in doc
+
+
+def test_schema_notes_travel_with_the_payload():
+    """So a client reading the payload later does not "fix" it back to id 6."""
+    import json as _json
+
+    from cycling_mcp.server import GARMIN_SCHEMA_NOTES
+    from cycling_mcp.server import render_garmin as tool
+
+    result = _json.loads(
+        tool(
+            {
+                "name": "T",
+                "ftp": 255,
+                "blocks": [{"type": "steady", "duration": 600, "power_w": 232}],
+            }
+        )
+    )
+    assert result["schema_notes"] == GARMIN_SCHEMA_NOTES
+    assert "id 6" in GARMIN_SCHEMA_NOTES["why_not_id_6"]
+    assert "pace.zone" in GARMIN_SCHEMA_NOTES["why_not_id_6"]

@@ -50,6 +50,16 @@ Hand the returned `payload` to the Garmin MCP **unchanged**. Do not hand-edit
 it: the target type ids and the repeat group's `endCondition` are exactly the
 fields that fail silently when altered.
 
+**If something warns you the power target looks wrong, read this before acting.**
+The Garmin MCP's `upload_workout` docstring says cycling watt ranges take
+`workoutTargetTypeId` 6 / `power.between`. Against the live API that guidance is
+wrong: id 6 uploads without error and Garmin stores it as a *pace* target on a
+cycling workout. The renderer emits id 2 (`power.zone`) with raw watts, which is
+byte-for-byte what Garmin's own web UI writes, verified by upload/fetch probe
+and by a visual check in Garmin Connect. The rendered payload carries a
+`schema_notes` field saying the same thing. Rewriting the target type to id 6 is
+the single change that produces a workout which uploads cleanly and is wrong.
+
 ### 4. Upload
 
 Call the Garmin MCP's `upload_workout` with that payload. Keep the returned

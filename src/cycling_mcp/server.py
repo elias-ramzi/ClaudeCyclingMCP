@@ -160,6 +160,38 @@ SPEC_SCHEMA: dict[str, Any] = {
     },
 }
 
+GARMIN_SCHEMA_NOTES = {
+    "power_target": (
+        "Power targets use workoutTargetTypeId 2 ('power.zone') with an absolute watt range "
+        "in targetValueOne/targetValueTwo and no zoneNumber. This is deliberate and verified "
+        "against the live API on 2026-08-12. Do NOT rewrite it to id 6 / 'power.between'."
+    ),
+    "why_not_id_6": (
+        "The Garmin MCP's upload_workout docstring says cycling watt ranges take id 6. Against "
+        "the live API that is wrong and fails silently: id 6 uploads without error and Garmin "
+        "normalises it to 'pace.zone' on a cycling workout — a pace target, not a power one."
+    ),
+    "evidence": (
+        "Garmin's own web UI writes a watt target as id 2 with raw watts (confirmed by reading "
+        "the raw DTO of reference workout 1662651131, entered by hand as 200-220 W); an "
+        "upload/fetch probe of both encodings; and a visual check in Garmin Connect showing "
+        "watts, not percentages."
+    ),
+    "not_zone_numbers": (
+        "Watt values are never read as zone numbers. Zones are 1-7, and the Garmin MCP only "
+        "coerces targetValueOne to a zone when it is between 1 and 5."
+    ),
+    "percent_ftp": (
+        "A %FTP target would be the same id-2 shape plus targetValueUnit "
+        "{'unitId': 253, 'unitKey': 'percent'}. This renderer emits watts, so it sends no unit "
+        "object at all — that absence is what makes the numbers watts."
+    ),
+    "repeat_groups": (
+        "RepeatGroupDTO carries endCondition with the numeric conditionTypeId 7. Omitting the "
+        "id makes the API silently corrupt the repeat count."
+    ),
+}
+
 _AUTHORING_NOTES = """\
 Design rules worth knowing before writing a spec:
 
@@ -270,11 +302,28 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
     """Render a workout spec to a Garmin Connect workout payload.
 
     The returned "payload" is ready to hand to the Garmin MCP's upload_workout
-    tool unchanged. Power targets are absolute watts via power.between
-    (workoutTargetTypeId 6); percentages in the spec are resolved against the
+    tool UNCHANGED. Percentages in the spec are resolved to watts against the
     spec's FTP. Repeats become RepeatGroupDTO groups carrying a complete
     endCondition, including the numeric conditionTypeId that Garmin needs to
     avoid silently corrupting the repeat count.
+
+    Read this before "correcting" the payload: power targets are emitted as
+    workoutTargetTypeId 2 ("power.zone") carrying an absolute watt range in
+    targetValueOne/targetValueTwo, with no zoneNumber. This contradicts the
+    Garmin MCP's own upload_workout docstring, which says cycling watt ranges
+    take id 6 / "power.between". Against the live API that guidance is wrong,
+    and wrong silently: id 6 uploads without error and Garmin normalises it to
+    "pace.zone" on a cycling workout — a pace target, not a power one.
+
+    Id 2 with raw watts is byte-for-byte what Garmin's own web UI writes for a
+    watt target, confirmed by reading the raw DTO of a workout built by hand in
+    Garmin Connect, by an upload/fetch probe of both encodings, and by opening
+    the result in Garmin Connect and seeing watts. Watt values are never read as
+    zone numbers: zones are 1-7, and the Garmin MCP only coerces targetValueOne
+    to a zone when it is between 1 and 5.
+
+    So do not rewrite the targetType to id 6. Doing so is the one change that
+    produces a workout which uploads cleanly and is wrong.
 
     This server does not upload. Use the bundled garmin-upload skill, which
     uploads and then verifies by fetching the workout back and comparing it
@@ -293,6 +342,9 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
         "payload": payload,
         "warnings": workout.warnings + warnings,
         "summary": compute_metrics(workout).as_dict(),
+        # Travels with the payload so a client reading it later does not
+        # "fix" the target type back into the silently-broken form.
+        "schema_notes": GARMIN_SCHEMA_NOTES,
     }
     if out_path:
         result["written_to"] = _write(out_path, _dump(payload))
