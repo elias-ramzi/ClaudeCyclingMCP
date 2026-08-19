@@ -126,12 +126,18 @@ def render_zwo(workout: Workout) -> tuple[str, list[str]]:
         "    <workout>",
     ]
 
-    for index, node in enumerate(workout.nodes, start=1):
+    for index, node in enumerate(workout.nodes):
         if isinstance(node, Repeat):
             for iteration in range(node.count):
-                for child_index, child in enumerate(node.blocks, start=1):
-                    where = f"blocks[{index}] rep {iteration + 1}/{node.count} block {child_index}"
-                    lines.extend(f"        {line}" for line in _element(child, warnings, where))
+                for child_index, child in enumerate(node.blocks):
+                    # Repeats are flattened for MyWhoosh, so each child is
+                    # emitted `count` times — but it was authored once, and a
+                    # warning about its content is one fact, not `count` facts.
+                    # Collect only on the first pass, and name where the author
+                    # can find it rather than which repetition produced it.
+                    sink = warnings if iteration == 0 else []
+                    where = f"blocks[{index}].blocks[{child_index}]"
+                    lines.extend(f"        {line}" for line in _element(child, sink, where))
         else:
             lines.extend(f"        {line}" for line in _element(node, warnings, f"blocks[{index}]"))
 

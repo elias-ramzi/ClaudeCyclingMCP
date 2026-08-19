@@ -283,3 +283,48 @@ def test_the_name_tag_is_spelled_name(sweetspot):
     xml, _ = render_zwo(sweetspot)
     assert "<name>Sweet Spot 3x10</name>" in xml
     assert "<n>" not in xml
+
+
+def test_a_repeated_block_warns_once_not_once_per_repetition():
+    """Repeats are flattened for MyWhoosh, so a child is emitted `count` times.
+
+    It was authored once, though, so a warning about its content is one fact.
+    Three identical lines in the warnings list is noise in the artifact people
+    actually read.
+    """
+    workout = load_spec(
+        {
+            "name": "T",
+            "ftp": 255,
+            "blocks": [
+                {
+                    "type": "repeat",
+                    "count": 3,
+                    "blocks": [
+                        {"type": "steady", "duration": 60, "power_pct": 90, "message": "Hold — it"}
+                    ],
+                }
+            ],
+        }
+    )
+    warnings = render_zwo(workout)[1]
+    assert len(warnings) == 1, warnings
+    assert "blocks[0].blocks[0]" in warnings[0]
+
+
+def test_the_flattened_output_is_unchanged_by_that():
+    """Suppressing the duplicate warning must not suppress the duplicate block."""
+    workout = load_spec(
+        {
+            "name": "T",
+            "ftp": 255,
+            "blocks": [
+                {
+                    "type": "repeat",
+                    "count": 3,
+                    "blocks": [{"type": "steady", "duration": 60, "power_pct": 90}],
+                }
+            ],
+        }
+    )
+    assert render_zwo(workout)[0].count("<SteadyState") == 3

@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from cycling_mcp.render_garmin import render_garmin
-from cycling_mcp.spec import load_spec
+from cycling_mcp.spec import load_spec, validate_spec
 from cycling_mcp.verify import total_step_seconds
 
 GOLDEN = Path(__file__).parent / "golden"
@@ -378,3 +378,30 @@ def test_schema_notes_travel_with_the_payload():
     assert result["schema_notes"] == GARMIN_SCHEMA_NOTES
     assert "id 6" in GARMIN_SCHEMA_NOTES["why_not_id_6"]
     assert "pace.zone" in GARMIN_SCHEMA_NOTES["why_not_id_6"]
+
+
+def test_warning_paths_agree_with_the_validator():
+    """One warnings list used to carry two 'blocks[1]' labels meaning two
+    different blocks: the validator counted from 0 and the renderers from 1.
+    Both now match the JSON array the author wrote."""
+    spec = {
+        "name": "T",
+        "ftp": 255,
+        "blocks": [
+            {"type": "ramp", "duration": "12:00", "from_pct": 50, "to_pct": 70},
+            {
+                "type": "repeat",
+                "count": 2,
+                "duration": "0:00",
+                "blocks": [{"type": "steady", "duration": 60, "power_pct": 90}],
+            },
+        ],
+    }
+    _, _, spec_warnings = validate_spec(spec)
+    render_warnings = render_garmin(load_spec(spec))[1]
+
+    # The validator's complaint is about the repeat, the second block.
+    assert any(w.startswith("blocks[1]:") for w in spec_warnings)
+    # The renderer's is about the ramp, the first — and must not collide.
+    assert any(w.startswith("blocks[0]:") and "ramp" in w for w in render_warnings)
+    assert not any(w.startswith("blocks[1]:") and "ramp" in w for w in render_warnings)

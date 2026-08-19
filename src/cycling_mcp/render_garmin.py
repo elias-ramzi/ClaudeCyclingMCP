@@ -245,7 +245,10 @@ def render_garmin(workout: Workout) -> tuple[dict, list[str]]:
     counter = _Counter()
     steps: list[dict] = []
 
-    for index, node in enumerate(workout.nodes, start=1):
+    # 0-based, matching both spec.py's warning paths and the JSON array the
+    # author actually wrote. They disagreed until 2026-08-20, so one warning
+    # list could carry two "blocks[1]" labels meaning two different blocks.
+    for index, node in enumerate(workout.nodes):
         where = f"blocks[{index}]"
         if isinstance(node, Repeat):
             group: dict = {
@@ -258,7 +261,7 @@ def render_garmin(workout: Workout) -> tuple[dict, list[str]]:
                 "smartRepeat": False,
                 "workoutSteps": [],
             }
-            for child_index, child in enumerate(node.blocks, start=1):
+            for child_index, child in enumerate(node.blocks):
                 group["workoutSteps"].extend(
                     _render_block(
                         child, workout, counter, warnings, f"{where}.blocks[{child_index}]"

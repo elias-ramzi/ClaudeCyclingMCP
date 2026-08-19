@@ -91,6 +91,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checked in one command.
 - **Guidance for a timed-out browser call**, which the skill had none of. A timeout says nothing
   about whether the action applied, and it is the case most likely to tempt a destructive retry.
+- **A repeated block warns once, not once per repetition.** Repeats are flattened for MyWhoosh, so
+  a child is emitted `count` times — but it was authored once, and three identical lines is noise
+  in the artifact people read. The path now names where the author can find the block
+  (`blocks[0].blocks[0]`) rather than which repetition produced it.
+- **Warning paths agree between the validator and the renderers.** The validator counted blocks
+  from 0 and both renderers from 1, so one warnings list could carry two `blocks[1]` labels meaning
+  two different blocks. Everything is now 0-based, matching the JSON array the author wrote.
 - **`describe_spec` shows the watt band that will actually ship to Garmin.** A scalar target is
   displayed as `293 W (115%)` but uploads as `287-299 W`, and the block table is where the skills
   say a wrong number is cheap to catch. The column appears only when something would fill it.
