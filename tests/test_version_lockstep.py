@@ -14,8 +14,11 @@ import pytest
 
 if sys.version_info >= (3, 11):
     import tomllib
-else:  # 3.10 has no tomllib
-    tomllib = pytest.importorskip("tomli", reason="pip install tomli on Python 3.10")
+else:
+    # 3.10 has no stdlib tomllib. `tomli` is a declared 3.10-only dev dependency,
+    # so its absence is a broken environment rather than an expected condition —
+    # fail loudly here instead of skipping and quietly losing the check.
+    import tomli as tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -63,6 +66,21 @@ def test_mcpb_manifest_is_valid_json_and_named_consistently():
     plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     assert manifest["name"] == plugin["name"]
     assert manifest["server"]["type"] == "python"
+
+
+def test_server_advertises_the_version_in_the_handshake(version):
+    """The version is the contract a client sees, so it belongs in serverInfo.
+
+    Older MCP SDKs take no `version` argument and the server falls back to an
+    unversioned handshake; skip rather than fail there, since the fallback is
+    deliberate.
+    """
+    from cycling_mcp.server import app
+
+    advertised = getattr(app, "version", None)
+    if not advertised:
+        pytest.skip("installed MCP SDK does not carry a server version")
+    assert advertised == version
 
 
 def test_plugin_skills_path_resolves():
