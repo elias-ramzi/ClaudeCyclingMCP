@@ -53,7 +53,9 @@ That spec is in [`examples/sweetspot-3x10.json`](../examples/sweetspot-3x10.json
 | `blocks` | yes | At least one. |
 | `filename` | no | Filename stem for the `.zwo`. **This becomes the MyWhoosh library name** — see below. Defaults to a slug of `name`. |
 | `author`, `description` | no | Copied into the `.zwo` and the Garmin payload. |
-| `garmin_target_band_pct` | no | Half-width of the watt band put around a single-number target for Garmin, which needs ranges. Default 2. |
+| `garmin_target_band_pct` | no | Half-width of the watt band put around a single-number target for Garmin, which needs ranges. A percentage **of the resolved target**, not of FTP: at 2, a 293 W target becomes 287–299 W and a 128 W target becomes 125–131 W. Omit it and the width is chosen by role — 2% for interval and rest, 5% for recovery, warmup and cooldown, because ±2% of an easy spin is a window that alarms continuously. Setting it applies one number everywhere. |
+| `ftp_source` | no | Where the FTP came from: `athlete_stated`, `garmin_profile` or `test_result`. A workout on a head unit is raw watts and a `.zwo` stores only fractions, so neither file records which number produced it. |
+| `ftp_date` | no | When that FTP was established, e.g. `2026-08-19`. Shown beside the FTP in `describe_spec` and in the `.zwo` description. |
 
 ## Blocks
 
@@ -72,7 +74,8 @@ Either form takes a single number or a `[low, high]` pair:
 
 `duration` is whole seconds (`600`) or a clock string (`"10:00"`, `"1:05:00"`).
 
-Repeated sets nest one level:
+Repeated sets nest one level, and take `count` and `blocks` **instead of**
+`duration` — a repeat's duration is the sum of its contents:
 
 ```json
 {"type": "repeat", "count": 3, "blocks": [
