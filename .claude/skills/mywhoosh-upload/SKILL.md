@@ -86,8 +86,21 @@ lands on the chart and creates a phantom block.
 - `find` "Explore button" → click its ref.
 - `find` "Create New button" → click its ref.
 
-*Expect:* the URL becomes `workout.mywhoosh.com/editor/<id>` and an empty
-workout chart is visible.
+*Expect:* the URL becomes `workout.mywhoosh.com/editor/<id>`.
+
+**The first click may not navigate.** Observed: clicking Explore left the page
+on the landing view, and re-running `find` and clicking the returned ref worked.
+Re-locate and retry once before treating it as a failure.
+
+**Do not expect an empty chart.** "Create New" has been observed opening an
+editor that already holds a previously edited workout, blocks drawn and header
+populated. That is not a failure and not a reason to stop.
+
+**Before importing, write down what is already there:** the workout name, and
+the header's `Workout Time` and `Training Load`. Step 6 compares against that
+snapshot. Without it, an import that silently does nothing looks identical to
+one that worked — and if the loaded workout happens to have the same duration
+as the session you are building, the duration check proves nothing at all.
 
 *If a label has changed:* report which of the three you could not find. These
 are located by their visible text, so a renamed button is the likely cause.
@@ -209,7 +222,13 @@ Check the header: it shows **`Workout Time`** and **`Training Load`**.
 - **`NaN` or `00:00` means the import silently failed.** Stop and report it. Do
   not proceed to export — that would spend a credit on a broken workout.
 
-Cross-check `Workout Time` against the total from `describe_spec`. If they
+**Compare against the Step 2 snapshot first.** If the name, `Workout Time` and
+`Training Load` are all unchanged from what was loaded before the import, the
+import did nothing — report that, regardless of whether the numbers happen to
+match your session. This check, not the duration, is what distinguishes a
+successful import from a silent no-op.
+
+Then cross-check `Workout Time` against the total from `describe_spec`. If they
 disagree, something was dropped on import; stop and report both numbers.
 
 ## Step 7 — Stop and confirm before exporting

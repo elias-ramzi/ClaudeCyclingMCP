@@ -80,6 +80,12 @@ or before relying on the flow for a session that matters.
 The session is written in **% of FTP** on purpose. Duration, IF and TSS are then identical whatever
 FTP the builder holds, so the expected values below hold without knowing it in advance.
 
+Its durations are also deliberately odd — 18 / 11 / 4 / 9 minutes, totalling 1:08:00. An earlier
+version used the same 1:10:00 / TSS 70 as the golden sweet-spot session, and a real run opened an
+editor already holding that very workout: the header read 70:00 / TL 70, so the "does Workout Time
+match?" check could not tell a successful import from one that did nothing. Odd numbers make the
+header diagnostic.
+
 ### The prompt
 
 ```text
@@ -91,22 +97,25 @@ Build this session, named "ZZ Test Session", filename "zz-test-session".
 It is written in % of FTP deliberately — read the FTP from the MyWhoosh
 builder rather than assuming one:
 
-- 20 min ramp from 51% to 71%
-- 10 min at 91%
-- 5 min at 57%
-- 10 min at 91%
-- 5 min at 57%
-- 10 min at 91%
-- 10 min ramp down from 55% to 51%
+- 18 min ramp from 51% to 71%
+- 11 min at 91%
+- 4 min at 57%
+- 11 min at 91%
+- 4 min at 57%
+- 11 min at 91%
+- 9 min ramp down from 55% to 51%
 
 Work through the skill and report, step by step:
 1. Which page you landed on, and whether you needed me to log in.
 2. The /editor/<id> URL you reached.
 3. The FTP and weight you read from the builder BEFORE importing, and
    whether they look like real values or the 200 W / 62 kg defaults.
-4. Whether the import navigated to a NEW /editor/<id>, and that URL.
-5. The Workout Time and Training Load shown in the header.
-6. The slot counter value.
+4. Whether the editor already held a workout before you imported, and if so
+   its name, Workout Time and Training Load.
+5. Whether the import navigated to a NEW /editor/<id>, and that URL.
+6. The Workout Time and Training Load AFTER importing, and whether they
+   changed from what you recorded in step 4.
+7. The slot counter value.
 
 Then STOP. Show me the describe_spec table and say whether the header
 Workout Time matches it. Do not export.
@@ -116,16 +125,20 @@ Workout Time matches it. Do not export.
 
 | Check | Expected |
 |---|---|
-| `describe_spec` | `1:10:00 total · IF 0.77 · TSS 70` |
+| `describe_spec` | `1:08:00 total · NP 202 W · IF 0.79 · TSS 71` |
 | `.zwo` first `SteadyState` | `Power="0.91"` |
-| Header **Workout Time** | `1:10:00` |
-| Header **Training Load** | approximately 70 |
+| Header **Workout Time** after import | `68:00` |
+| Header **Training Load** after import | approximately 71 |
+| Header **changed** from the pre-import snapshot | yes — this is the real check |
 | Slot counter | **unchanged** — nothing was exported |
 
 ### Failure signals
 
 - **`NaN` or `00:00` in the header.** The import silently failed. This is the most important check
   in the flow: everything downstream looks fine while the workout is empty.
+- **The header is unchanged from before the import.** The import did nothing. This matters more
+  than the absolute numbers: if the editor was already holding a workout of similar length, an
+  unchanged header is the only signal that anything went wrong.
 - **Workout Time does not match `describe_spec`.** Blocks were dropped on import.
 - **Step 3 reads exactly 200 W / 62 kg.** Those are MyWhoosh's defaults, not the athlete's FTP. The
   skill should say so and ask rather than render against them.
