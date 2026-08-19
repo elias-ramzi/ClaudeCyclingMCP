@@ -18,6 +18,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The MyWhoosh skill no longer assumes "Create New" opens a blank editor.** A real run found it
+  opening an editor that already held a previously edited workout, which the skill treated as a
+  mismatch and stopped on. It now records the loaded workout's name and header before importing.
+- **Import verification compares against that pre-import snapshot.** Checking only that
+  `Workout Time` matches the session is blind when the editor already holds a workout of the same
+  length — exactly what happened, since the loaded workout read 70:00 / TL 70 against a test session
+  computing to the same. An unchanged header now reports the import as a no-op.
+- **The dry run's expected `IF` was wrong** (0.77, copied from the watts variant; the %FTP variant
+  computes 0.775 and displays 0.78) and its durations have been made deliberately odd so the header
+  cannot coincide with an existing workout.
 - **`back-merge.yml` pushes to `dev` instead of opening a pull request.** It failed on first use:
   opening a PR from a workflow needs a repository setting that is off by default.
 
