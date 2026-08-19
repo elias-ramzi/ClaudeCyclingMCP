@@ -81,8 +81,11 @@ SPEC_SCHEMA: dict[str, Any] = {
             "type": "number",
             "description": (
                 "Half-width of the watt band placed around a scalar power target when "
-                "rendering for Garmin, which needs ranges. Ignored where the spec already "
-                "gives an explicit [low, high]. Omit it and the width is chosen by role: "
+                "rendering for Garmin, which needs ranges. It is a percentage OF THE "
+                "RESOLVED TARGET, not of FTP: at 2.0, a 293 W target becomes 287-299 W "
+                "(+/-5.9 W) while a 128 W target becomes 125-131 W (+/-2.6 W). Ignored "
+                "where the spec already gives an explicit [low, high]. Omit it and the "
+                "width is chosen by role: "
                 "2% for interval and rest, 5% for recovery, warmup and cooldown — because "
                 "2% of a 140 W easy spin is a 6 W window that alarms continuously, while "
                 "2% of a 250 W interval is right. Setting it applies that one number "
@@ -118,7 +121,21 @@ SPEC_SCHEMA: dict[str, Any] = {
         },
         "block": {
             "type": "object",
-            "required": ["type", "duration"],
+            # A repeat has no duration of its own — it is the sum of its
+            # contents — so requiring one of every block told an author to add
+            # a key the server then reported as a probable typo. Branch on the
+            # type rather than requiring the union of both shapes.
+            "required": ["type"],
+            "allOf": [
+                {
+                    "if": {"properties": {"type": {"const": "repeat"}}},
+                    "then": {
+                        "required": ["count", "blocks"],
+                        "not": {"required": ["duration"]},
+                    },
+                    "else": {"required": ["duration"]},
+                }
+            ],
             "properties": {
                 "type": {"enum": ["steady", "ramp", "free", "repeat"]},
                 "duration": {"$ref": "#/$defs/duration"},
@@ -446,6 +463,15 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
         result["written_to"] = written
         if error:
             result["write_error"] = error
+        else:
+            # A digest beside the file answers, in a later session with none of
+            # this context, whether the JSON on disk is still the JSON that was
+            # rendered. Without it a re-upload months later is an act of faith.
+            sidecar, sidecar_error = _write(f"{out_path}.sha256", result["payload_digest"] + "\n")
+            if sidecar:
+                result["digest_written_to"] = sidecar
+            else:
+                result["write_error"] = sidecar_error
     return _dump(result)
 
 

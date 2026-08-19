@@ -11,6 +11,7 @@ from cycling_mcp.server import (
     describe_spec,
     render_garmin,
     render_zwo,
+    spec_schema,
     verify_garmin_upload,
     verify_mywhoosh_import,
 )
@@ -293,3 +294,70 @@ def test_describe_spec_says_a_ramp_flattens_on_garmin(spec):
 def test_render_garmin_gives_the_visual_check_a_criterion(rendered):
     assert "W'" in rendered["expected_display"]
     assert "percentage" in rendered["expected_display"]
+
+
+def test_a_repeat_block_must_not_carry_a_duration(spec):
+    """The schema used to require `duration` on every block, so an author
+    following it put one on a repeat and was then told it looked like a typo.
+    The schema now says what the server actually accepts."""
+    import jsonschema
+
+    schema = json.loads(spec_schema())["schema"]
+    good = {
+        "name": "T",
+        "ftp": 255,
+        "blocks": [{"type": "repeat", "count": 2, "blocks": [{"type": "steady", "duration": 60}]}],
+    }
+    jsonschema.validate(good, schema)
+
+    bad = json.loads(json.dumps(good))
+    bad["blocks"][0]["duration"] = "0:00"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bad, schema)
+
+
+def test_the_repeat_duration_warning_says_what_is_wrong(spec):
+    bad = {
+        "name": "T",
+        "ftp": 255,
+        "blocks": [
+            {
+                "type": "repeat",
+                "count": 2,
+                "duration": "0:00",
+                "blocks": [{"type": "steady", "duration": 60, "power_pct": 90}],
+            }
+        ],
+    }
+    warnings = json.loads(render_garmin(bad))["warnings"]
+    assert any("computed from its contents" in w for w in warnings)
+    assert not any("typo?" in w for w in warnings)
+
+
+def test_the_block_table_shows_the_band_that_will_ship(spec):
+    """The table is where the skills say a wrong number is cheap to catch, and
+    band width is consequential on a head unit but was invisible here."""
+    table = describe_spec(spec)
+    assert "Garmin" in table
+    assert "227-237 W" in table
+
+
+def test_no_band_column_when_nothing_would_fill_it():
+    table = describe_spec(
+        {
+            "name": "R",
+            "ftp": 255,
+            "blocks": [{"type": "steady", "duration": 600, "power_pct": [85, 95]}],
+        }
+    )
+    assert "Garmin" not in table
+
+
+def test_out_path_writes_a_digest_beside_the_payload(spec, tmp_path):
+    """A later session has none of this context; the sidecar is how it knows
+    the file on disk is still the file that was rendered."""
+    target = tmp_path / "t.garmin.json"
+    result = json.loads(render_garmin(spec, out_path=str(target)))
+    sidecar = Path(result["digest_written_to"])
+    assert sidecar.read_text().strip() == result["payload_digest"]
+    assert sidecar.name == "t.garmin.json.sha256"

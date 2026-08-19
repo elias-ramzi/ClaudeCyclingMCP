@@ -25,6 +25,10 @@ dev = [
     # 3.10 has no stdlib tomllib; without this the version lock-step test would
     # skip there rather than run.
     "tomli>=2.0; python_version < '3.11'",
+    # The spec schema is published to callers, so a test validates real specs
+    # against it. mcp happens to pull this in today; depending on that would
+    # make the check vanish silently if it ever stopped.
+    "jsonschema>=4.0",
 ]
 live = ["garminconnect>=0.2.25"]  # only for the live Garmin round-trip test
 

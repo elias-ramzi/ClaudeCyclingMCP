@@ -77,6 +77,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checked in one command.
 - **Guidance for a timed-out browser call**, which the skill had none of. A timeout says nothing
   about whether the action applied, and it is the case most likely to tempt a destructive retry.
+- **`describe_spec` shows the watt band that will actually ship to Garmin.** A scalar target is
+  displayed as `293 W (115%)` but uploads as `287-299 W`, and the block table is where the skills
+  say a wrong number is cheap to catch. The column appears only when something would fill it.
+- **The schema no longer requires `duration` on a repeat block.** It required it on every block, so
+  an author following the schema added one and the server then reported it as a probable typo. The
+  warning now says what is actually wrong: a repeat's duration is computed from its contents.
+- **`garmin_target_band_pct` is documented as a percentage of the resolved target**, not of FTP,
+  with a worked example. It was ambiguous enough that a caller resolved it by experiment.
+- **`render_garmin` writes a `.sha256` beside `out_path`.** A later session with none of the
+  original context can then tell whether the JSON on disk is still what was rendered.
 - **Target bands are chosen by role.** 2% for interval and rest, 5% for recovery, warmup and
   cooldown. ±2% of a 250 W interval is ±5 W, which is right; ±2% of a 140 W recovery is a 6 W
   window that alarms continuously on an easy spin. An explicit `garmin_target_band_pct` still

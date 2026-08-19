@@ -414,7 +414,17 @@ def _text(raw: Any, path: str, key: str, out: _Collector) -> str | None:
 def _resolve_repeat(raw: dict, path: str, ftp: float | None, out: _Collector) -> Repeat | None:
     for key in raw:
         if key not in _ALLOWED_KEYS["repeat"]:
-            out.warn(path, f"unknown key {key!r} on a repeat block — ignored (typo?)")
+            # "duration" here is usually not a typo but a reasonable reading of
+            # a schema that used to require it on every block. Say what is
+            # actually wrong instead of implying a slip of the fingers.
+            if key == "duration":
+                out.warn(
+                    path,
+                    "'duration' is not valid on a repeat block — its duration is computed "
+                    "from its contents. Ignored.",
+                )
+            else:
+                out.warn(path, f"unknown key {key!r} on a repeat block — ignored (typo?)")
 
     count = raw.get("count")
     if not isinstance(count, int) or isinstance(count, bool):

@@ -127,6 +127,19 @@ def _watt_bounds(
     return low, high
 
 
+def target_band_watts(block: Block, workout: Workout) -> tuple[int, int] | None:
+    """The watt band this block will carry on Garmin, or None if it has none.
+
+    Exposed so `describe_spec` can show the band that actually ships. The
+    block table is where the skills say a wrong number is cheap to catch, and
+    band width is both invisible there and consequential on a head unit —
+    a tight corridor at VO2 power alarms continuously outdoors.
+    """
+    if block.kind != "steady" or not block.is_scalar_target:
+        return None
+    return _watt_bounds(block, workout, [], "")
+
+
 def _apply_cadence(step: dict, block: Block) -> None:
     if block.cadence_low is None:
         return
