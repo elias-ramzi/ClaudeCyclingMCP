@@ -14,6 +14,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   install, and links out. The reference material it used to carry moved verbatim into
   `docs/spec-format.md`, `docs/tools.md`, `docs/garmin-schema.md`, `docs/install.md`,
   `docs/skills.md` and `docs/testing.md`. No behaviour, no rules, and no numbers changed.
+- **README links are absolute GitHub URLs.** `pyproject.toml` publishes the README as the PyPI long
+  description, and PyPI does not resolve repo-relative paths — now that the reference lives in
+  `docs/`, relative links would have rendered dead on the package page.
+- **The `_comment` in `tests/golden/recorded_roundtrip.json`** points at `docs/garmin-schema.md`
+  instead of the README for the id-6/`pace.zone` finding, which moved. Comment text only: no
+  recorded request, response, or asserted value changed.
 
 ### Added
 
