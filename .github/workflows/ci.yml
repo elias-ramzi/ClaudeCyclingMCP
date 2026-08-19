@@ -65,12 +65,22 @@ jobs:
           assert skills == ['garmin-upload', 'mywhoosh-upload'], skills
           assert _register_skill_prompts() == skills
 
+          # Check the invariants this job exists for — that a wheel installed
+          # outside the repo still finds its packaged skills and serves them —
+          # not a tool count, which breaks on every legitimate addition while
+          # telling you nothing about whether packaging worked.
+          REQUIRED = {'validate_spec', 'describe_spec', 'render_zwo', 'render_garmin',
+                      'verify_garmin_upload', 'spec_schema', 'get_skill'}
+
           async def main():
-              tools = await app.list_tools()
-              prompts = await app.list_prompts()
-              assert len(tools) == 6, [t.name for t in tools]
-              assert len(prompts) == 2, [p.name for p in prompts]
-              print(f"ok: {len(tools)} tools, {len(prompts)} prompts, skills {skills}")
+              names = {t.name for t in await app.list_tools()}
+              missing = REQUIRED - names
+              assert not missing, f"tools missing from the wheel: {sorted(missing)}"
+
+              prompts = {p.name for p in await app.list_prompts()}
+              assert prompts == set(skills), f"prompts {sorted(prompts)} != skills {skills}"
+
+              print(f"ok: {len(names)} tools, prompts {sorted(prompts)}, skills {skills}")
 
           asyncio.run(main())
           PY
