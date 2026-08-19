@@ -235,6 +235,7 @@ import and must be re-entered, but it does not change the stored fractions.
 | `describe_spec` | The block table above — computed watts, durations, IF, TSS. |
 | `render_zwo` | `.zwo` XML plus the filename to upload it under. Optional `out_path`. |
 | `render_garmin` | A payload ready for the Garmin MCP's `upload_workout`. Optional `out_path`. |
+| `check_garmin_payload` | Checks the payload you composed against the digest the renderer issued, before uploading. Also returns a UI checklist for verifying by eye. Pure. |
 | `verify_garmin_upload` | Compares a sent payload against what `get_workout_by_id` returns. Pure. |
 | `verify_mywhoosh_import` | Compares a scraped MyWhoosh builder header against the rendered session, including the pre-import snapshot that catches a silent no-op. Pure. |
 | `get_skill` | Fetch a bundled upload procedure by name, so a model asked to "use the mywhoosh-upload skill" can retrieve it. |

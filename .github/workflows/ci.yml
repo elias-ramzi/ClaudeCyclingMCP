@@ -70,8 +70,8 @@ jobs:
           # not a tool count, which breaks on every legitimate addition while
           # telling you nothing about whether packaging worked.
           REQUIRED = {'validate_spec', 'describe_spec', 'render_zwo', 'render_garmin',
-                      'verify_garmin_upload', 'verify_mywhoosh_import', 'spec_schema',
-                      'get_skill'}
+                      'check_garmin_payload', 'verify_garmin_upload',
+                      'verify_mywhoosh_import', 'spec_schema', 'get_skill'}
 
           async def main():
               names = {t.name for t in await app.list_tools()}

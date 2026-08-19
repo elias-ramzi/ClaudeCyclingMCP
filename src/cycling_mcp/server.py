@@ -26,7 +26,13 @@ from .render_zwo import zwo_filename
 from .skills import Skill, build_skill_message, load_skills
 from .spec import SpecError, load_spec
 from .spec import validate_spec as _validate_spec
-from .verify import compare_mywhoosh_import, compare_upload, total_step_seconds
+from .verify import (
+    compare_mywhoosh_import,
+    compare_upload,
+    payload_digest,
+    total_step_seconds,
+    ui_checklist,
+)
 
 
 def _build_server():
@@ -312,6 +318,7 @@ def render_zwo(spec: dict, out_path: str | None = None) -> str:
     result: dict[str, Any] = {
         "ok": True,
         "filename": zwo_filename(workout),
+        "next_step": "Call get_skill('mywhoosh-upload') and follow it.",
         "xml": xml,
         # The MyWhoosh flow injects this XML into a page as JavaScript. A
         # backtick or a "${" in an athlete's workout name or message text
@@ -359,7 +366,12 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
 
     This server does not upload. Use the bundled garmin-upload skill, which
     uploads and then verifies by fetching the workout back and comparing it
-    against what was sent.
+    against what was sent — call get_skill("garmin-upload") to read it.
+
+    "payload_digest" is a digest of the payload as rendered. You will retype
+    this payload into another tool's arguments, and a single wrong digit gives
+    a workout that uploads cleanly and is wrong. Pass what you composed to
+    check_garmin_payload with this digest BEFORE uploading.
 
     Pass out_path to also write the payload as JSON to disk. That path is
     resolved on the machine running this server; a failed write says so.
@@ -373,6 +385,15 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
     result: dict[str, Any] = {
         "ok": True,
         "payload": payload,
+        # Read at the moment of composing the upload call, which the docstring
+        # may not be. A model that never found the skill improvises the upload
+        # and skips verification entirely — reported 2026-08-19, where the
+        # skill only surfaced on a second, lucky tool search.
+        "next_step": (
+            "Call get_skill('garmin-upload') and follow it. Before uploading, pass the "
+            "payload you composed to check_garmin_payload with payload_digest."
+        ),
+        "payload_digest": payload_digest(payload),
         "warnings": workout.warnings + warnings,
         "summary": compute_metrics(workout).as_dict(),
         # Travels with the payload so a client reading it later does not
@@ -388,7 +409,53 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
 
 
 @app.tool()
-def verify_garmin_upload(payload: dict, fetched: dict) -> str:
+def check_garmin_payload(payload: dict, expected_digest: str | None = None) -> str:
+    """Check a payload you composed against the one the renderer produced.
+
+    Call this BEFORE upload_workout, every time. render_garmin returns the
+    payload as text into your context, and upload_workout takes an object you
+    compose — so "hand it over unchanged" really means retyping ~90 lines of
+    nested JSON. A single wrong digit in targetValueOne produces a workout that
+    uploads without error, passes verify_garmin_upload (which compares Garmin
+    against what you *sent*, not against what was rendered), and is wrong.
+
+    Pass the payload you are about to upload and the "payload_digest" from
+    render_garmin. A mismatch means what you composed is not what was rendered:
+    re-copy it rather than hunting for the difference.
+
+    Also returns ui_checklist — what each step should read in the Garmin UI.
+    That is the fallback verification when get_workout_by_id is unavailable.
+
+    Pure comparison, no network access.
+    """
+    actual = payload_digest(payload)
+    result: dict[str, Any] = {
+        "digest": actual,
+        "step_seconds": total_step_seconds(payload),
+        "ui_checklist": ui_checklist(payload),
+    }
+    if expected_digest is None:
+        result["digest_checked"] = False
+        result["warning"] = (
+            "No digest given, so this payload was not compared against the rendered one. "
+            "Pass payload_digest from render_garmin to catch a transcription error."
+        )
+        return _dump(result)
+
+    result["digest_checked"] = True
+    result["matches_rendered"] = actual == expected_digest.strip()
+    if not result["matches_rendered"]:
+        result["problem"] = (
+            f"This payload digests to {actual}, but render_garmin issued "
+            f"{expected_digest.strip()}. What you composed is not what was "
+            "rendered. Do not upload it — copy the payload from render_garmin again. "
+            "(If the payload is right and the digest was mistyped, re-render and compare.)"
+        )
+    return _dump(result)
+
+
+@app.tool()
+def verify_garmin_upload(payload: dict, fetched: dict, expected_digest: str | None = None) -> str:
     """Check that Garmin stored the workout that was actually sent.
 
     Pass the payload given to upload_workout, and the response from
@@ -400,6 +467,11 @@ def verify_garmin_upload(payload: dict, fetched: dict) -> str:
     projection that will happily agree with a wrong-units payload. It also
     catches a repeat count silently corrupted by a missing conditionTypeId.
 
+    Pass expected_digest (render_garmin's "payload_digest") to also check that
+    what you sent is what was rendered. Without it this proves only that Garmin
+    kept what it was given — which a payload mistyped on its way out of your
+    context would also pass.
+
     Two things it cannot prove: whether a power target was stored as watts or
     as %FTP (the curated read drops the targetValueUnit field that distinguishes
     them), and whether the workout displays correctly on a head unit. Confirm
@@ -408,17 +480,29 @@ def verify_garmin_upload(payload: dict, fetched: dict) -> str:
     Pure comparison, no network access.
     """
     problems = compare_upload(payload, fetched)
-    return _dump(
-        {
-            "match": not problems,
-            "differences": problems,
-            "sent_step_seconds": total_step_seconds(payload),
-            "note": (
-                "Garmin's estimated_duration_seconds follows its own rules and can "
-                "disagree with the sum of the steps; it is not used for this check."
-            ),
-        }
-    )
+    result: dict[str, Any] = {
+        "match": not problems,
+        "differences": problems,
+        "sent_step_seconds": total_step_seconds(payload),
+        "note": (
+            "Garmin's estimated_duration_seconds follows its own rules and can "
+            "disagree with the sum of the steps; it is not used for this check."
+        ),
+    }
+    if expected_digest is not None:
+        # This check is upstream of the round-trip: it asks whether the payload
+        # that was sent is the payload that was rendered. A match here plus a
+        # match above is the only combination that means end-to-end correct.
+        result["matches_rendered"] = payload_digest(payload) == expected_digest.strip()
+        if not result["matches_rendered"]:
+            result["match"] = False
+            result["differences"] = [
+                *result["differences"],
+                "The payload sent is not the payload render_garmin produced — it was "
+                "altered or mistyped between rendering and upload. Garmin storing it "
+                "faithfully does not make it right.",
+            ]
+    return _dump(result)
 
 
 @app.tool()
@@ -474,10 +558,16 @@ def verify_mywhoosh_import(
 def get_skill(name: str | None = None) -> str:
     """Fetch a bundled procedure for uploading a workout to a platform.
 
+    Read this before uploading, scheduling, or exporting a rendered cycling
+    workout — a .zwo to MyWhoosh, or a Garmin Connect payload to a watch or
+    head unit. The procedures cover FTP sourcing, the upload call, verifying
+    the stored result, and the traps that fail silently.
+
     Call this whenever you are asked to follow, use, or run one of this
     server's skills by name — for example "use the mywhoosh-upload skill" — or
     when you are asked to put a workout onto MyWhoosh or Garmin Connect and want
-    the procedure rather than improvising one.
+    the procedure rather than improvising one. If you have rendered a workout
+    and are about to send it somewhere, you want this first.
 
     Omit `name` to list what is available. Pass a name to get that skill's full
     instructions, which you should then follow step by step.

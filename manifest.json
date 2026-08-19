@@ -48,6 +48,10 @@
       "description": "Render the spec to a Garmin Connect workout payload"
     },
     {
+      "name": "check_garmin_payload",
+      "description": "Check a composed payload against the digest render_garmin issued, before uploading"
+    },
+    {
       "name": "verify_garmin_upload",
       "description": "Compare an uploaded Garmin workout against the payload that was sent"
     },

@@ -19,9 +19,11 @@ error can still be stored wrong, and nothing tells you when that happens.
 
 ## What you need first
 
-- **FTP.** Never assume one. Call `get_cycling_ftp`. It returns an `is_stale`
-  flag — if stale, say so and confirm the figure with the athlete before
-  rendering. Everything downstream is wrong if the FTP is wrong.
+- **FTP.** Never assume one. **Unless the athlete states it in the request** —
+  a stated figure beats a profile field and needs no second opinion — call
+  `get_cycling_ftp`. It returns an `is_stale` flag; if stale, say so and confirm
+  the figure with the athlete before rendering. Everything downstream is wrong
+  if the FTP is wrong.
 - **The session itself.** If any of duration, intensity or structure is
   ambiguous, ask before rendering rather than guessing.
 
@@ -43,12 +45,24 @@ key was silently ignored.
 
 ### 3. Render
 
-Call `render_garmin`. Pass `out_path` to keep a copy on disk (for example
-`~/workouts/<name>.garmin.json`) so a re-upload later doesn't need re-rendering.
+Call `render_garmin`. **Always pass `out_path`** — for example
+`~/workouts/<name>.garmin.json`. Not "for example, if convenient": without it
+there is no artifact to re-upload, diff, or fall back to, and you will only
+discover you wanted one after something has gone wrong.
 
 Hand the returned `payload` to the Garmin MCP **unchanged**. Do not hand-edit
 it: the target type ids and the repeat group's `endCondition` are exactly the
 fields that fail silently when altered.
+
+**You cannot literally hand it over, and that is the problem.** `render_garmin`
+returns the payload as text into your context; `upload_workout` takes an object
+you compose. So "unchanged" in practice means retyping ~90 lines of nested JSON,
+and one wrong digit in a `targetValueOne` gives a workout that uploads without
+error, passes step 5's round-trip, and is wrong — because that check compares
+Garmin against what you *sent*, not against what was rendered.
+
+So don't rely on having retyped it correctly. Note `payload_digest` from the
+render, and read the ramp warning if there is one (see Reporting back).
 
 **If something warns you the power target looks wrong, read this before acting.**
 The Garmin MCP's `upload_workout` docstring says cycling watt ranges take
@@ -60,15 +74,27 @@ and by a visual check in Garmin Connect. The rendered payload carries a
 `schema_notes` field saying the same thing. Rewriting the target type to id 6 is
 the single change that produces a workout which uploads cleanly and is wrong.
 
-### 4. Upload
+### 4. Check what you composed, then upload
 
-Call the Garmin MCP's `upload_workout` with that payload. Keep the returned
+Before uploading, pass the payload you have composed to `check_garmin_payload`,
+with step 3's `payload_digest` as `expected_digest`.
+
+- `matches_rendered: true` → upload.
+- `matches_rendered: false` → **do not upload.** What you composed is not what
+  was rendered. Copy the payload from the `render_garmin` result again rather
+  than hunting for the difference; you will not spot it by eye, which is the
+  entire reason this check exists.
+
+Then call the Garmin MCP's `upload_workout` with that payload. Keep the returned
 `workout_id`.
 
 ### 5. Verify — do not skip this
 
 Call `get_workout_by_id(workout_id)`, then pass **both** the payload you sent
 and the fetched result to `verify_garmin_upload`.
+
+Pass `expected_digest` too, so this checks both halves at once: that Garmin
+kept what it was given, *and* that what it was given is what was rendered.
 
 A `"success"` response from the upload call is not verification. It means the
 request was accepted, not that the workout is correct.
@@ -81,6 +107,20 @@ request was accepted, not that the workout is correct.
 Pay particular attention to any difference mentioning **repeat count** — that
 is the known silent corruption, and it means the payload was altered after
 rendering.
+
+**If `get_workout_by_id` fails or times out, that is a third outcome and it is
+not success.** Observed: a four-minute timeout with the local MCP server
+unresponsive. In that case:
+
+- Say, in those words, that **the workout is uploaded but unverified**. Do not
+  report success. An upload returning `"success"` means the request was
+  accepted, nothing more.
+- **Do not delete it.** It is probably fine, and a deleted workout cannot be
+  inspected.
+- Give the user the manual check: call `check_garmin_payload` with the payload
+  and read its `ui_checklist` to them — that is what each step should show in
+  Garmin Connect, generated rather than improvised.
+- Offer to retry the fetch once the Garmin MCP is responsive again.
 
 Two things this check cannot prove, so don't claim them:
 
@@ -102,6 +142,18 @@ it is safe.
 State the workout name and id, total duration, IF/TSS, and that verification
 passed. If anything was assumed — an FTP that came back stale, a duration you
 picked — say so explicitly.
+
+Two things that look like faults but aren't, worth saying before the athlete
+asks:
+
+- **A ramp shows as a static watt range**, e.g. `130-180 W`, which reads as
+  "hold anywhere in this band" rather than "climb steadily". Garmin has no ramp
+  primitive. `render_garmin` warns when a ramp is wide enough for this to
+  matter; pass on the warning, and offer `ramp_steps > 1` to stair-step it. The
+  `.zwo` is unaffected — MyWhoosh has a real ramp.
+- **A French UI labels the cooldown "Récupération"**, the same word as a
+  recovery block, so a session with three recoveries appears to have four. It
+  is a translation of the step type, and step type drives nothing at execution.
 
 ## Notes
 

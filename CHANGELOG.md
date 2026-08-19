@@ -20,6 +20,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evidence an import took, and export is irreversible; the skill previously asked an agent to
   eyeball two numbers. It takes the pre-import snapshot as an argument, which is what distinguishes
   a real import from a silent no-op.
+- **`check_garmin_payload`** — the payload leaves this server as text in a model's context and
+  re-enters as an argument that model composes for the Garmin MCP, so "hand it over unchanged"
+  really means retyping ~90 lines of nested JSON. One wrong digit in a `targetValueOne` gives a
+  workout that uploads without error, passes `verify_garmin_upload` — which compares Garmin against
+  what was *sent* — and is wrong. `render_garmin` now issues a `payload_digest`, and this checks a
+  composed payload against it before upload. `verify_garmin_upload` takes the digest too, so the
+  round-trip can check both halves at once.
+- **A `ui_checklist`** of what each step should read in the Garmin UI, returned by
+  `check_garmin_payload`. It is the fallback when `get_workout_by_id` is unavailable, generated
+  rather than improvised.
 - **`render_zwo` returns `xml_js_literal`**, the same XML pre-escaped as a JavaScript string
   literal. The MyWhoosh flow injects the file into the page, and the documented snippet interpolated
   raw XML into a template literal — so a backtick or a `${` in a workout name or message, both
@@ -67,6 +77,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checked in one command.
 - **Guidance for a timed-out browser call**, which the skill had none of. A timeout says nothing
   about whether the action applied, and it is the case most likely to tempt a destructive retry.
+- **`render_garmin` warns when a ramp is flattened.** Garmin has no ramp primitive, so a single
+  step spanning 130→180 W displays as a band to hold rather than a climb. Nothing in the pipeline
+  said so, and it was being explained to athletes from inference.
+- **The renderers name the skill in their return value.** Under deferred tool loading a model can
+  render for Garmin, never learn the skill exists, improvise the upload, skip verification, and
+  "fix" the target type to id 6 on the Garmin MCP's advice — the exact catastrophe the design
+  guards against, reached by an entirely mundane route. `get_skill`'s description now carries
+  render/upload keywords so it surfaces alongside the renderers.
+- **The `garmin-upload` skill has a branch for the fetch being unavailable**, which is a third
+  outcome it did not cover and, on 2026-08-19, the one that happened: a four-minute timeout. The
+  workout is then uploaded but *unverified* — not successful, and not to be deleted.
+- **The skill says to always pass `out_path`**, not "for example". Without it no artifact exists to
+  re-upload or diff against, which is only discovered after something has gone wrong.
+- **The skill no longer implies a redundant `get_cycling_ftp` call** when the athlete stated their
+  FTP in the request. A stated figure beats a profile field.
+- **A note that a French Garmin UI labels a cooldown "Récupération"**, the same as a recovery, so a
+  session with three recoveries appears to have four. Cosmetic, but it was being explained ad hoc.
 
 ## [0.1.0] - 2026-08-12
 

@@ -48,6 +48,11 @@ TARGET_NO_TARGET = {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target
 TARGET_POWER = {"workoutTargetTypeId": 2, "workoutTargetTypeKey": "power.zone"}
 TARGET_CADENCE = {"workoutTargetTypeId": 3, "workoutTargetTypeKey": "cadence"}
 
+# How wide a single-step ramp has to be before flattening it is worth a warning.
+# A few watts either side of a target reads as a band anyway; 20 W is where the
+# athlete would notice they were told to hold rather than climb.
+RAMP_LOSSY_WATTS = 20
+
 
 class _Counter:
     """Garmin numbers steps globally, continuing through nested repeat groups."""
@@ -168,6 +173,21 @@ def _render_block(
             if low_w == high_w:
                 high_w = low_w + 1
             steps.append(_executable(block, counter.next(), seconds, TARGET_POWER, low_w, high_w))
+
+        # Say out loud that this rendering is lossy. A single step spanning the
+        # whole ramp displays on Garmin as a static band — "hold anywhere in
+        # 130-180 W", not "climb steadily" — and nothing else in the pipeline
+        # reports the difference. Observed being explained to an athlete from
+        # inference rather than from the tool output, 2026-08-19.
+        if block.ramp_steps == 1:
+            low_w = workout.watts(min(block.p_from, block.p_to))
+            high_w = workout.watts(max(block.p_from, block.p_to))
+            if high_w - low_w >= RAMP_LOSSY_WATTS:
+                warnings.append(
+                    f"{where}: ramp renders on Garmin as one {low_w}-{high_w} W step, which the "
+                    f"head unit shows as a range to hold rather than a climb. Garmin has no ramp "
+                    f"primitive; set ramp_steps > 1 to stair-step it. The .zwo is unaffected."
+                )
         return steps
 
     low, high = _watt_bounds(block, workout, warnings, where)

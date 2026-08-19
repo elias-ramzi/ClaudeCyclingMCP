@@ -26,6 +26,8 @@ shape, which would happily agree with a wrong-units payload.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 # Garmin normalises a target's key from its numeric id, which it treats as
@@ -436,3 +438,75 @@ def compare_mywhoosh_import(
         "problems": problems,
         "warnings": warnings,
     }
+
+
+# --- Transcription ------------------------------------------------------
+#
+# The payload leaves this server as text in a model's context and re-enters the
+# world as an argument the model composes for a different MCP's upload tool.
+# There is no mechanism by which a model can pass it through "unchanged" — it
+# retypes ~90 lines of nested JSON. A single wrong digit in targetValueOne
+# yields a workout that uploads cleanly, verifies as sent-equals-stored, and is
+# wrong, because the round-trip check compares Garmin against what was *sent*,
+# not against what the renderer produced.
+#
+# So the renderer issues a digest of what it produced, and this is where a
+# retyped payload gets checked against it. Reported after a real upload on
+# 2026-08-19 where the transcription happened to be faithful.
+
+DIGEST_LENGTH = 16
+
+
+def payload_digest(payload: dict) -> str:
+    """A short, stable digest of a payload's content.
+
+    Canonicalised first — sorted keys, no insignificant whitespace — so that
+    reformatting is not mistaken for corruption. Only the content matters.
+    """
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:DIGEST_LENGTH]
+
+
+# Garmin's step type ids as the UI labels them. Note that a French UI renders
+# both `cooldown` and `recovery` as "Récupération", so a cooldown looks like a
+# fourth recovery block. Cosmetic — step type drives nothing at execution.
+STEP_LABELS = {1: "Warm Up", 2: "Cool Down", 3: "Interval", 4: "Recovery", 5: "Rest"}
+
+
+def ui_checklist(payload: dict) -> list[str]:
+    """What the Garmin UI should show, step by step, for eyeballing by hand.
+
+    The fallback when `get_workout_by_id` is unavailable: verification by a
+    human reading the screen. Generating the list here rather than leaving a
+    model to improvise it makes that check the same every time.
+    """
+    lines: list[str] = []
+
+    def describe(step: dict, prefix: str = "") -> None:
+        if step.get("type") == "RepeatGroupDTO":
+            lines.append(f"{prefix}Repeat x{step.get('numberOfIterations')}:")
+            for child in step.get("workoutSteps", []):
+                describe(child, prefix + "  ")
+            return
+        label = STEP_LABELS.get(step.get("stepType", {}).get("stepTypeId"), "Step")
+        seconds = int(float(step.get("endConditionValue") or 0))
+        clock = f"{seconds // 60}:{seconds % 60:02d}"
+        target = step.get("targetType", {}).get("workoutTargetTypeId")
+        if target == 2:
+            low, high = step.get("targetValueOne"), step.get("targetValueTwo")
+            shown = f"{int(low)}-{int(high)} W"
+        elif target == 1:
+            shown = "no target"
+        else:
+            shown = f"target type {target}"
+        lines.append(f"{prefix}{label} · {clock} · {shown}")
+
+    for segment in payload.get("workoutSegments", []):
+        for step in segment.get("workoutSteps", []):
+            describe(step)
+
+    lines.append(
+        "A French UI labels a cooldown 'Récupération', the same as a recovery — "
+        "that is a translation, not a wrong step type."
+    )
+    return lines
