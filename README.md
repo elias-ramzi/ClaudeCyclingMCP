@@ -236,6 +236,7 @@ import and must be re-entered, but it does not change the stored fractions.
 | `render_zwo` | `.zwo` XML plus the filename to upload it under. Optional `out_path`. |
 | `render_garmin` | A payload ready for the Garmin MCP's `upload_workout`. Optional `out_path`. |
 | `verify_garmin_upload` | Compares a sent payload against what `get_workout_by_id` returns. Pure. |
+| `get_skill` | Fetch a bundled upload procedure by name, so a model asked to "use the mywhoosh-upload skill" can retrieve it. |
 | `spec_schema` | The spec's JSON schema and authoring notes. |
 
 `validate_spec` catches the mistakes that actually bite: empty workouts, zero or

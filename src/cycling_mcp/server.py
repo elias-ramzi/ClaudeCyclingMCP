@@ -386,6 +386,65 @@ def verify_garmin_upload(payload: dict, fetched: dict) -> str:
 
 
 @app.tool()
+def get_skill(name: str | None = None) -> str:
+    """Fetch a bundled procedure for uploading a workout to a platform.
+
+    Call this whenever you are asked to follow, use, or run one of this
+    server's skills by name — for example "use the mywhoosh-upload skill" — or
+    when you are asked to put a workout onto MyWhoosh or Garmin Connect and want
+    the procedure rather than improvising one.
+
+    Omit `name` to list what is available. Pass a name to get that skill's full
+    instructions, which you should then follow step by step.
+
+    Why this exists: the same procedures ship as `.claude/skills` (which only
+    Claude Code reads) and as MCP prompts (which a human must pick from a menu).
+    Neither route lets a model retrieve a procedure it has just been asked for,
+    which is what this tool is for.
+
+    Both skills stop and ask before doing anything irreversible — a MyWhoosh
+    export spends a finite slot credit — so follow them as written rather than
+    summarising them.
+    """
+    skills = load_skills()
+    if not skills:
+        return _dump({"ok": False, "error": "no bundled skills found in this install"})
+
+    if name is None:
+        return _dump(
+            {
+                "ok": True,
+                "skills": [{"name": s.name, "description": s.description} for s in skills],
+                "hint": "Call get_skill(name=...) to get the full procedure.",
+            }
+        )
+
+    wanted = name.strip().lower()
+    for skill in skills:
+        if skill.name.lower() == wanted:
+            return _dump(
+                {
+                    "ok": True,
+                    "name": skill.name,
+                    "description": skill.description,
+                    "instructions": skill.body,
+                    "note": (
+                        "Follow these steps as written. They stop for confirmation before any "
+                        "irreversible or credit-spending action."
+                    ),
+                }
+            )
+
+    return _dump(
+        {
+            "ok": False,
+            "error": f"no bundled skill named {name!r}",
+            "available": [s.name for s in skills],
+        }
+    )
+
+
+@app.tool()
 def spec_schema() -> str:
     """Return the workout spec's JSON schema plus the notes needed to author one.
 
