@@ -90,8 +90,14 @@ permission for a `PYPI_API_TOKEN` secret and pass `password:` to the publish act
 
 Merging the release PR adds a merge commit to `main` that `dev` lacks. With "require branches to be
 up to date" on `main`, that one commit leaves the *next* release PR flagged `BEHIND` and
-unmergeable, even though `dev` already holds all of `main`'s content. `back-merge.yml` opens (and
-auto-merges) a `main -> dev` PR after every push to `main`, so the gap never accumulates.
+unmergeable, even though `dev` already holds all of `main`'s content. `back-merge.yml` pushes the
+merge straight to `dev` after every push to `main`, so the gap never accumulates.
+
+It pushes rather than opening a pull request deliberately: creating a PR from a workflow requires
+the repository setting **Allow GitHub Actions to create and approve pull requests**, which is off by
+default — without it the job fails with `GitHub Actions is not permitted to create or approve pull
+requests`. A direct push needs only `contents: write`. If `dev` is ever protected, either exempt
+this workflow or switch back to the PR route and enable that setting.
 
 ## Branch protection to configure
 

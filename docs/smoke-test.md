@@ -1,4 +1,8 @@
-# Client smoke test
+# Smoke tests
+
+Two checks: the [server](#server-smoke-test) and the [MyWhoosh browser flow](#mywhoosh-dry-run).
+
+## Server smoke test
 
 A copy-paste prompt for checking that a client — Claude Desktop, Claude Code, anything else — has
 the server connected and is really calling it. Every expected value below is deterministic, so a
@@ -65,3 +69,71 @@ grep "Message from client" ~/Library/Logs/Claude/mcp-server-claude-cycling.log |
 If there is no recent line, nothing was sent and restarting the server will not help — the
 connector is not enabled for that conversation. If there are lines but no matching
 `Message from server`, the problem is in the server.
+
+
+## MyWhoosh dry run
+
+Exercises the whole browser flow — login, editor, reading the FTP, import, verification — and
+**stops before exporting**, so it spends no slot credit. Run it whenever MyWhoosh changes its UI,
+or before relying on the flow for a session that matters.
+
+The session is written in **% of FTP** on purpose. Duration, IF and TSS are then identical whatever
+FTP the builder holds, so the expected values below hold without knowing it in advance.
+
+### The prompt
+
+```text
+Use the mywhoosh-upload skill, but this is a DRY RUN: do not click
+EXPORT TO MYWHOOSH under any circumstances. It spends a slot credit and I
+am only testing the automation.
+
+Build this session, named "ZZ Test Session", filename "zz-test-session".
+It is written in % of FTP deliberately — read the FTP from the MyWhoosh
+builder rather than assuming one:
+
+- 20 min ramp from 51% to 71%
+- 10 min at 91%
+- 5 min at 57%
+- 10 min at 91%
+- 5 min at 57%
+- 10 min at 91%
+- 10 min ramp down from 55% to 51%
+
+Work through the skill and report, step by step:
+1. Which page you landed on, and whether you needed me to log in.
+2. The /editor/<id> URL you reached.
+3. The FTP and weight you read from the builder BEFORE importing, and
+   whether they look like real values or the 200 W / 62 kg defaults.
+4. Whether the import navigated to a NEW /editor/<id>, and that URL.
+5. The Workout Time and Training Load shown in the header.
+6. The slot counter value.
+
+Then STOP. Show me the describe_spec table and say whether the header
+Workout Time matches it. Do not export.
+```
+
+### Expected
+
+| Check | Expected |
+|---|---|
+| `describe_spec` | `1:10:00 total · IF 0.77 · TSS 70` |
+| `.zwo` first `SteadyState` | `Power="0.91"` |
+| Header **Workout Time** | `1:10:00` |
+| Header **Training Load** | approximately 70 |
+| Slot counter | **unchanged** — nothing was exported |
+
+### Failure signals
+
+- **`NaN` or `00:00` in the header.** The import silently failed. This is the most important check
+  in the flow: everything downstream looks fine while the workout is empty.
+- **Workout Time does not match `describe_spec`.** Blocks were dropped on import.
+- **Step 3 reads exactly 200 W / 62 kg.** Those are MyWhoosh's defaults, not the athlete's FTP. The
+  skill should say so and ask rather than render against them.
+- **A step reporting "expected X, saw Y".** That is the skill working as designed — each step states
+  what it expects so a UI change names itself instead of producing silence.
+
+### What it leaves behind
+
+Nothing in **My Workouts** — a session only lands there on export, which this test never performs,
+so the slot counter must be untouched. It does create editor drafts at `/editor/<id>`; whether
+those persist visibly in the MyWhoosh UI has not been checked.

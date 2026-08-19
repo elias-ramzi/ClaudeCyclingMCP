@@ -151,3 +151,50 @@ def test_env_override_wins(tmp_path, monkeypatch):
 
     monkeypatch.setenv(ENV_SKILLS_DIR, str(tmp_path / "custom"))
     assert [s.name for s in load_skills()] == ["override"]
+
+
+# --------------------------------------------------------------------------
+# get_skill — how a model retrieves a procedure it was asked for by name
+# --------------------------------------------------------------------------
+
+
+def test_get_skill_lists_when_no_name_given():
+    import json as _json
+
+    from cycling_mcp.server import get_skill
+
+    result = _json.loads(get_skill())
+    assert result["ok"] is True
+    assert sorted(s["name"] for s in result["skills"]) == ["garmin-upload", "mywhoosh-upload"]
+
+
+def test_get_skill_returns_the_full_procedure():
+    import json as _json
+
+    from cycling_mcp.server import get_skill
+
+    result = _json.loads(get_skill("mywhoosh-upload"))
+    assert result["ok"] is True
+    assert result["name"] == "mywhoosh-upload"
+    # The credit-spending gate must survive into what the model actually reads.
+    assert "EXPORT TO MYWHOOSH" in result["instructions"]
+    assert "slot credit" in result["instructions"]
+    assert len(result["instructions"]) > 5000
+
+
+def test_get_skill_is_case_insensitive_and_forgiving_of_spacing():
+    import json as _json
+
+    from cycling_mcp.server import get_skill
+
+    assert _json.loads(get_skill("  MyWhoosh-Upload "))["name"] == "mywhoosh-upload"
+
+
+def test_unknown_skill_says_what_is_available():
+    import json as _json
+
+    from cycling_mcp.server import get_skill
+
+    result = _json.loads(get_skill("nope"))
+    assert result["ok"] is False
+    assert "mywhoosh-upload" in result["available"]

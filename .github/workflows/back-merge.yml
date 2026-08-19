@@ -2,11 +2,17 @@
 #
 # Merging a release PR adds a merge commit to `main` that `dev` lacks. With "require branches to be
 # up to date" on `main`, that single commit leaves the next `dev -> main` release PR flagged BEHIND
-# and unmergeable, even though `dev` already holds all of `main`'s content. This opens (and
-# auto-merges) a `main -> dev` back-merge PR after every push to `main`, so the gap never accumulates.
+# and unmergeable, even though `dev` already holds all of `main`'s content. This pushes the merge
+# straight to `dev` after every push to `main`, so the gap never accumulates.
 #
-# It relies on `ci.yml` running `on: push`, so the required checks already exist on `main`'s HEAD SHA
-# and the back-merge PR inherits them — no separate CI run needed for auto-merge to proceed.
+# Why a direct push rather than a pull request: opening a PR from a workflow needs the repository
+# setting "Allow GitHub Actions to create and approve pull requests", which is off by default —
+# without it the job fails with "GitHub Actions is not permitted to create or approve pull
+# requests". A direct push needs only `contents: write`, which is granted below.
+#
+# If `dev` ever becomes a protected branch, this push will start failing. At that point either
+# exempt this workflow from the protection, or switch back to opening a PR and enable the setting
+# above.
 name: Back-merge main into dev
 
 on:
@@ -15,40 +21,41 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   back-merge:
-    name: Open and auto-merge main -> dev
+    name: Merge main into dev
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - name: Open (and auto-merge) the back-merge PR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge and push
         run: |
           set -euo pipefail
-          git fetch --quiet origin main dev || {
+
+          if ! git ls-remote --exit-code --heads origin dev >/dev/null 2>&1; then
             echo "No 'dev' branch yet — nothing to back-merge."
             exit 0
-          }
+          fi
+          git fetch --quiet origin main dev
 
           if git merge-base --is-ancestor origin/main origin/dev; then
             echo "dev already contains main — nothing to back-merge."
             exit 0
           fi
 
-          number="$(gh pr list --base dev --head main --state open --json number --jq '.[0].number // empty')"
-          if [ -z "$number" ]; then
-            number="$(gh pr create --base dev --head main \
-              --title "Back-merge main into dev" \
-              --body "Automated: carries the release merge commit from \`main\` onto \`dev\` so the next release PR is not flagged BEHIND. No file changes." \
-              --json number --jq .number 2>/dev/null || gh pr create --base dev --head main \
-              --title "Back-merge main into dev" \
-              --body "Automated back-merge." | grep -oE '[0-9]+$')"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B dev origin/dev
+
+          # A release merge carries no changes dev does not already have, so this is
+          # ordinarily conflict-free. If it ever conflicts, fail loudly rather than
+          # guessing at a resolution on a branch nobody is watching.
+          if ! git merge --no-edit origin/main -m "Back-merge main into dev"; then
+            echo "::error::Conflict merging main into dev — resolve it by hand."
+            exit 1
           fi
 
-          gh pr merge "$number" --merge --auto
-          echo "Back-merge PR #$number queued for auto-merge."
+          git push origin dev
+          echo "Back-merged main into dev."

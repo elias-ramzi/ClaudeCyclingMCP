@@ -7,6 +7,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`get_skill`** — returns a bundled procedure by name. The skills reach Claude Code through
+  `.claude/skills` and other clients through MCP prompts, but neither route lets a *model* retrieve
+  a procedure it has just been asked for by name; in Claude Desktop, "use the mywhoosh-upload skill"
+  resolved to nothing unless the skill had been uploaded to the account. This closes that gap.
+- **A MyWhoosh dry run** in `docs/smoke-test.md` that exercises the browser flow and stops before
+  the export, so it spends no slot credit.
+
+### Fixed
+
+- **`back-merge.yml` pushes to `dev` instead of opening a pull request.** It failed on first use:
+  opening a PR from a workflow needs a repository setting that is off by default.
+
 ## [0.1.0] - 2026-08-12
 
 First release.
