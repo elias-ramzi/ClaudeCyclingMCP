@@ -174,19 +174,27 @@ def _render_block(
                 high_w = low_w + 1
             steps.append(_executable(block, counter.next(), seconds, TARGET_POWER, low_w, high_w))
 
-        # Say out loud that this rendering is lossy. A single step spanning the
-        # whole ramp displays on Garmin as a static band — "hold anywhere in
-        # 130-180 W", not "climb steadily" — and nothing else in the pipeline
-        # reports the difference. Observed being explained to an athlete from
-        # inference rather than from the tool output, 2026-08-19.
+        # Say out loud that this rendering is lossy, in both the ways it is.
+        # A single step spanning the whole ramp displays on Garmin as a static
+        # band to hold, not a sweep; and because Garmin ranges are low-first,
+        # a descending ramp is reordered, so its direction survives only in the
+        # spec. Nothing downstream can recover either fact — a backwards
+        # cooldown and a correct one produce identical payloads, so the
+        # round-trip check passes on both. Observed 2026-08-19.
         if block.ramp_steps == 1:
             low_w = workout.watts(min(block.p_from, block.p_to))
             high_w = workout.watts(max(block.p_from, block.p_to))
             if high_w - low_w >= RAMP_LOSSY_WATTS:
+                direction = "down" if block.p_to < block.p_from else "up"
+                from_w = workout.watts(block.p_from)
+                to_w = workout.watts(block.p_to)
                 warnings.append(
-                    f"{where}: ramp renders on Garmin as one {low_w}-{high_w} W step, which the "
-                    f"head unit shows as a range to hold rather than a climb. Garmin has no ramp "
-                    f"primitive; set ramp_steps > 1 to stair-step it. The .zwo is unaffected."
+                    f"{where}: this {from_w}->{to_w} W ramp renders on Garmin as one "
+                    f"{low_w}-{high_w} W step — a band to hold, not a sweep. Garmin has no ramp "
+                    f"primitive and its ranges are low-first, so the fact that it goes "
+                    f"{direction} is not in the payload at all and no round-trip check can "
+                    f"catch it being wrong. Set ramp_steps > 1 to stair-step it. The .zwo "
+                    f"keeps the real ramp."
                 )
         return steps
 

@@ -77,6 +77,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checked in one command.
 - **Guidance for a timed-out browser call**, which the skill had none of. A timeout says nothing
   about whether the action applied, and it is the case most likely to tempt a destructive retry.
+- **`verify_garmin_upload` rejects a misused comparison instead of diffing two different shapes.**
+  Handed an upload payload where a fetched workout belongs, it reported that Garmin had dropped the
+  workout name, the sport and every segment — confident, specific, and entirely an artefact of
+  reading DTO keys with curated-read names. The skill's instruction on a mismatch is to *delete the
+  workout*, so failing open here destroyed correct work. A comparator that cannot tell it is being
+  misused should not be trusted to say when Garmin misbehaves.
+- **`check_garmin_payload` takes the spec** and re-renders it internally, so a mismatch names the
+  step and field rather than only saying the digest differs. Numbers compare by value, since a
+  model retyping a payload will not preserve 245 vs 245.0.
+- **A descending ramp warns that its direction is gone.** Garmin ranges are low-first, so 55→45%
+  and 45→55% both render as 115-140 W: a backwards cooldown and a correct one produce identical
+  payloads, and no round-trip check can tell them apart.
+- **`describe_spec` says a ramp flattens on Garmin.** The arrow in the block table reads as a
+  sweep, and that table is the artifact the skills tell you to show the athlete.
+- **`render_garmin` returns `expected_display`**, giving the visual check a concrete criterion.
+  The curated read drops `targetValueUnit`, so a look at the head unit is the only evidence a
+  target was stored as watts — which needs a pass/fail rule, not "open it once and see".
 - **`render_garmin` warns when a ramp is flattened.** Garmin has no ramp primitive, so a single
   step spanning 130→180 W displays as a band to hold rather than a climb. Nothing in the pipeline
   said so, and it was being explained to athletes from inference.

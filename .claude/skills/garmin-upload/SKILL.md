@@ -77,13 +77,15 @@ the single change that produces a workout which uploads cleanly and is wrong.
 ### 4. Check what you composed, then upload
 
 Before uploading, pass the payload you have composed to `check_garmin_payload`,
-with step 3's `payload_digest` as `expected_digest`.
+with step 3's `payload_digest` as `expected_digest` **and** the spec as `spec`.
+The digest says whether it was altered; the spec says which field.
 
 - `matches_rendered: true` → upload.
-- `matches_rendered: false` → **do not upload.** What you composed is not what
-  was rendered. Copy the payload from the `render_garmin` result again rather
-  than hunting for the difference; you will not spot it by eye, which is the
-  entire reason this check exists.
+- `matches_rendered: false` (or `matches_spec: false`) → **do not upload.**
+  What you composed is not what was rendered. Read
+  `differences_from_spec` to see what moved, then copy the payload from the
+  `render_garmin` result again rather than patching it — the difference you can
+  see may not be the only one.
 
 Then call the Garmin MCP's `upload_workout` with that payload. Keep the returned
 `workout_id`.
@@ -91,7 +93,13 @@ Then call the Garmin MCP's `upload_workout` with that payload. Keep the returned
 ### 5. Verify — do not skip this
 
 Call `get_workout_by_id(workout_id)`, then pass **both** the payload you sent
-and the fetched result to `verify_garmin_upload`.
+and the fetched result to `verify_garmin_upload` — `payload` is what you sent,
+`fetched` is what Garmin returned, and they are different shapes. Getting them
+the wrong way round is rejected rather than diffed, so an
+`error: "shape_mismatch"` means fix the call, not the workout.
+
+This tool is for *after* an upload. To check a payload beforehand, that is
+step 4's `check_garmin_payload`.
 
 Pass `expected_digest` too, so this checks both halves at once: that Garmin
 kept what it was given, *and* that what it was given is what was rendered.

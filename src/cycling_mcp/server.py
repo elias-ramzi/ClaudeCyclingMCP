@@ -29,7 +29,9 @@ from .spec import validate_spec as _validate_spec
 from .verify import (
     compare_mywhoosh_import,
     compare_upload,
+    diff_payloads,
     payload_digest,
+    shape_problem,
     total_step_seconds,
     ui_checklist,
 )
@@ -240,6 +242,15 @@ def _write(out_path: str, content: str) -> tuple[str | None, str | None]:
     return str(path), None
 
 
+def _first_target_text(payload: dict) -> str | None:
+    """The first watt range in a payload, for use as a worked example."""
+    for line in ui_checklist(payload):
+        _, _, tail = line.rpartition("· ")
+        if tail.endswith(" W"):
+            return tail
+    return None
+
+
 def _dump(payload: dict) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
@@ -394,6 +405,20 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
             "payload you composed to check_garmin_payload with payload_digest."
         ),
         "payload_digest": payload_digest(payload),
+        # The curated read drops targetValueUnit, so no round-trip can prove a
+        # target was stored as watts rather than %FTP. That leaves a visual
+        # check as the only evidence — which needs a concrete criterion, not
+        # "open it once and see if it looks right".
+        "expected_display": (
+            "Every power target should read in watts on the head unit, e.g. "
+            + (
+                f"'{_first_target_text(payload)}'. "
+                if _first_target_text(payload)
+                else "'245-255 W'. "
+            )
+            + "If any reads as a percentage or as a zone number instead, targetValueUnit "
+            "was added somewhere and the workout is scaled to the wrong athlete."
+        ),
         "warnings": workout.warnings + warnings,
         "summary": compute_metrics(workout).as_dict(),
         # Travels with the payload so a client reading it later does not
@@ -409,7 +434,9 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
 
 
 @app.tool()
-def check_garmin_payload(payload: dict, expected_digest: str | None = None) -> str:
+def check_garmin_payload(
+    payload: dict, expected_digest: str | None = None, spec: dict | None = None
+) -> str:
     """Check a payload you composed against the one the renderer produced.
 
     Call this BEFORE upload_workout, every time. render_garmin returns the
@@ -426,6 +453,11 @@ def check_garmin_payload(payload: dict, expected_digest: str | None = None) -> s
     Also returns ui_checklist — what each step should read in the Garmin UI.
     That is the fallback verification when get_workout_by_id is unavailable.
 
+    Pass `spec` as well, or instead, to get a field-by-field diff: the spec is
+    re-rendered here and compared against the payload you supply. That answers
+    the question directly — was this payload altered after rendering? — and
+    names the step and field, rather than only saying that something differs.
+
     Pure comparison, no network access.
     """
     actual = payload_digest(payload)
@@ -434,12 +466,30 @@ def check_garmin_payload(payload: dict, expected_digest: str | None = None) -> s
         "step_seconds": total_step_seconds(payload),
         "ui_checklist": ui_checklist(payload),
     }
+
+    if spec is not None:
+        try:
+            expected, _ = _render_garmin(load_spec(spec))
+        except SpecError as exc:
+            result["spec_errors"] = exc.errors
+        else:
+            differences = diff_payloads(expected, payload)
+            result["matches_spec"] = not differences
+            result["differences_from_spec"] = differences
+            if differences:
+                result["problem"] = (
+                    "The payload you composed is not what this spec renders to. Do not "
+                    "upload it — re-copy the payload from render_garmin."
+                )
     if expected_digest is None:
         result["digest_checked"] = False
-        result["warning"] = (
-            "No digest given, so this payload was not compared against the rendered one. "
-            "Pass payload_digest from render_garmin to catch a transcription error."
-        )
+        if spec is None:
+            # Neither reference given, so nothing was actually checked. Say so
+            # rather than returning a bare digest that reads like a pass.
+            result["warning"] = (
+                "Nothing was compared: pass expected_digest (from render_garmin) or spec "
+                "to check this payload against what the renderer produces."
+            )
         return _dump(result)
 
     result["digest_checked"] = True
@@ -479,8 +529,16 @@ def verify_garmin_upload(payload: dict, fetched: dict, expected_digest: str | No
 
     Pure comparison, no network access.
     """
+    # Refuse a misused comparison rather than diffing two different shapes.
+    # Failing open here is worse than not checking at all: the skill's response
+    # to a mismatch is to delete the workout.
+    misuse = shape_problem(payload, fetched)
+    if misuse:
+        return _dump({"ok": False, "error": "shape_mismatch", "detail": misuse})
+
     problems = compare_upload(payload, fetched)
     result: dict[str, Any] = {
+        "ok": True,
         "match": not problems,
         "differences": problems,
         "sent_step_seconds": total_step_seconds(payload),

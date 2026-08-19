@@ -8,6 +8,7 @@ import pytest
 
 from cycling_mcp.server import (
     check_garmin_payload,
+    describe_spec,
     render_garmin,
     render_zwo,
     verify_garmin_upload,
@@ -147,7 +148,7 @@ def test_one_wrong_digit_is_caught(rendered):
 def test_a_missing_digest_warns_rather_than_silently_passing(rendered):
     result = json.loads(check_garmin_payload(rendered["payload"]))
     assert result["digest_checked"] is False
-    assert "not compared" in result["warning"]
+    assert "Nothing was compared" in result["warning"]
     assert "matches_rendered" not in result
 
 
@@ -190,3 +191,105 @@ def test_the_renderers_point_at_the_skill(spec, rendered):
     have been read several turns ago, or not at all."""
     assert "get_skill('garmin-upload')" in rendered["next_step"]
     assert "get_skill('mywhoosh-upload')" in json.loads(render_zwo(spec))["next_step"]
+
+
+# --- the comparator must know when it is being misused -------------------
+
+
+def test_verify_rejects_a_payload_in_the_fetched_slot(rendered):
+    """The dangerous one: this used to fail open.
+
+    Handed a payload where a fetched workout belongs, every lookup misses and
+    every value reads as None, so the comparator reported that Garmin had
+    dropped the name, the sport and all the segments. The skill's instruction
+    on a mismatch is to delete the workout — so a correct workout would have
+    been destroyed on the strength of an artefact.
+    """
+    result = json.loads(verify_garmin_upload(rendered["payload"], rendered["payload"]))
+    assert result["ok"] is False
+    assert result["error"] == "shape_mismatch"
+    assert "check_garmin_payload" in result["detail"]
+    assert "differences" not in result
+
+
+def test_verify_rejects_the_arguments_the_wrong_way_round(rendered):
+    fetched = {"workout_id": 1, "name": "Threshold", "sport": "cycling", "segments": []}
+    result = json.loads(verify_garmin_upload(fetched, rendered["payload"]))
+    assert result["ok"] is False
+    assert "wrong way round" in result["detail"]
+
+
+def test_verify_still_compares_a_correctly_shaped_pair(rendered):
+    fetched = {
+        "workout_id": 1,
+        "name": rendered["payload"]["workoutName"],
+        "sport": "cycling",
+        "segments": [],
+    }
+    result = json.loads(verify_garmin_upload(rendered["payload"], fetched))
+    assert result["ok"] is True
+    assert "differences" in result
+
+
+# --- checking a composed payload against the spec ------------------------
+
+
+def test_a_spec_diff_names_the_field_that_changed(spec, rendered):
+    mangled = json.loads(json.dumps(rendered["payload"]))
+    mangled["workoutSegments"][0]["workoutSteps"][1]["targetValueTwo"] = 337
+    result = json.loads(check_garmin_payload(mangled, spec=spec))
+    assert result["matches_spec"] is False
+    assert any("targetValueTwo" in d and "337" in d for d in result["differences_from_spec"])
+
+
+def test_a_faithful_payload_matches_its_spec(spec, rendered):
+    result = json.loads(check_garmin_payload(rendered["payload"], spec=spec))
+    assert result["matches_spec"] is True
+    assert result["differences_from_spec"] == []
+
+
+def test_int_and_float_targets_are_the_same_target(spec, rendered):
+    """A model retyping a payload will not preserve 245 vs 245.0."""
+    floated = json.loads(json.dumps(rendered["payload"]))
+    step = floated["workoutSegments"][0]["workoutSteps"][1]
+    step["targetValueOne"] = float(step["targetValueOne"])
+    result = json.loads(check_garmin_payload(floated, spec=spec))
+    assert result["matches_spec"] is True
+
+
+def test_checking_nothing_says_so(rendered):
+    result = json.loads(check_garmin_payload(rendered["payload"]))
+    assert "Nothing was compared" in result["warning"]
+
+
+# --- ramps lose two things, not one --------------------------------------
+
+
+def test_a_descending_ramp_warns_that_its_direction_is_gone():
+    """A backwards cooldown and a correct one produce identical payloads.
+
+    Garmin ranges are low-first, so 55->45% and 45->55% both render as
+    115-140 W. No round-trip check can tell them apart, which makes this a
+    class of error that is structurally invisible after rendering.
+    """
+    spec = {
+        "name": "C",
+        "ftp": 255,
+        "blocks": [{"type": "ramp", "duration": "8:00", "from_pct": 55, "to_pct": 45}],
+    }
+    warnings = json.loads(render_garmin(spec))["warnings"]
+    assert any("goes down" in w and "no round-trip check can catch it" in w for w in warnings)
+
+
+def test_describe_spec_says_a_ramp_flattens_on_garmin(spec):
+    """The block table is what the skills tell you to show the athlete, so it
+    is the wrong place to leave the flattening unsaid."""
+    table = describe_spec(spec)
+    assert "->" in table, "the row still reads as a sweep"
+    assert "band to hold" in table
+    assert "MyWhoosh rides that sweep" in table
+
+
+def test_render_garmin_gives_the_visual_check_a_criterion(rendered):
+    assert "W'" in rendered["expected_display"]
+    assert "percentage" in rendered["expected_display"]

@@ -187,6 +187,62 @@ def _compare_steps(
                 problems.append(f"{here}: {field} sent as {want[field]!r}, returned {got[field]!r}")
 
 
+# The two shapes this module compares. A payload uses Garmin's DTO field names;
+# the curated read renames nearly all of them. Swapping the two arguments is
+# therefore not a near-miss — every lookup misses, every value reads as None,
+# and the comparator reports a workout that Garmin supposedly emptied.
+PAYLOAD_MARKERS = ("workoutSegments", "workoutName", "sportType")
+FETCHED_MARKERS = ("segments", "name", "sport", "workout_id", "workoutId")
+
+
+def _shape_of(obj: Any) -> str | None:
+    if not isinstance(obj, dict):
+        return None
+    if any(key in obj for key in PAYLOAD_MARKERS):
+        return "payload"
+    if any(key in obj for key in FETCHED_MARKERS):
+        return "fetched"
+    return None
+
+
+def shape_problem(payload: dict, fetched: dict) -> str | None:
+    """Reject a misused comparison instead of diffing two different shapes.
+
+    A comparator that cannot tell it is being misused should not be trusted to
+    say when Garmin misbehaves. Handed a payload in the `fetched` slot this
+    used to report "workout name returned None / Garmin returned 0 segments" —
+    confident, specific, and entirely an artefact of reading DTO keys with
+    curated-read names. The skill's instruction on a mismatch is to delete the
+    workout, so failing open here destroys correct work. Observed 2026-08-19.
+    """
+    if _shape_of(payload) == "fetched" and _shape_of(fetched) == "payload":
+        return (
+            "The two arguments are the wrong way round: 'payload' holds a "
+            "get_workout_by_id response and 'fetched' holds an upload payload. Swap them."
+        )
+    if _shape_of(fetched) == "payload":
+        return (
+            "'fetched' looks like an upload payload, not a get_workout_by_id response "
+            f"(found {sorted(k for k in PAYLOAD_MARKERS if k in fetched)}). Pass the "
+            "workout Garmin returned in this slot. To check a payload before uploading, "
+            "use check_garmin_payload instead."
+        )
+    if _shape_of(payload) == "fetched":
+        return (
+            "'payload' looks like a get_workout_by_id response, not the payload that was "
+            f"sent (found {sorted(k for k in FETCHED_MARKERS if k in payload)}). The two "
+            "arguments are the wrong way round."
+        )
+    if _shape_of(payload) is None:
+        return "'payload' has none of the fields an upload payload carries; it is not a payload."
+    if _shape_of(fetched) is None:
+        return (
+            "'fetched' has none of the fields a fetched workout carries; it is not a "
+            "get_workout_by_id response."
+        )
+    return None
+
+
 def compare_upload(payload: dict, fetched: dict) -> list[str]:
     """Return every mismatch between a sent payload and the fetched workout.
 
@@ -510,3 +566,50 @@ def ui_checklist(payload: dict) -> list[str]:
         "that is a translation, not a wrong step type."
     )
     return lines
+
+
+def diff_payloads(expected: dict, actual: dict, path: str = "") -> list[str]:
+    """Field-by-field differences between two upload payloads.
+
+    The digest says *that* a payload was altered; this says where. Given the
+    spec, the expected payload can be regenerated here, so the check needs no
+    state carried between tool calls — which matters when the caller composing
+    the payload is a language model rather than a program.
+    """
+    problems: list[str] = []
+
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        for key in sorted(set(expected) | set(actual)):
+            where = f"{path}.{key}" if path else key
+            if key not in actual:
+                problems.append(f"{where}: missing (expected {expected[key]!r})")
+            elif key not in expected:
+                problems.append(f"{where}: unexpected extra field {actual[key]!r}")
+            else:
+                problems.extend(diff_payloads(expected[key], actual[key], where))
+        return problems
+
+    if isinstance(expected, list) and isinstance(actual, list):
+        if len(expected) != len(actual):
+            problems.append(f"{path}: expected {len(expected)} items, got {len(actual)}")
+            return problems
+        for index, (want, got) in enumerate(zip(expected, actual, strict=True)):
+            problems.extend(diff_payloads(want, got, f"{path}[{index}]"))
+        return problems
+
+    # Numbers compare by value: 245 and 245.0 are the same target, and a model
+    # retyping a payload will not preserve int-vs-float.
+    numeric = (int, float)
+    if (
+        isinstance(expected, numeric)
+        and isinstance(actual, numeric)
+        and not isinstance(expected, bool)
+        and not isinstance(actual, bool)
+    ):
+        if float(expected) != float(actual):
+            problems.append(f"{path}: expected {expected!r}, got {actual!r}")
+        return problems
+
+    if expected != actual:
+        problems.append(f"{path}: expected {expected!r}, got {actual!r}")
+    return problems

@@ -214,6 +214,20 @@ def describe(workout: Workout) -> str:
             f"Note: free-ride blocks are scored at {FREE_RIDE_ASSUMED_FRACTION * 100:.0f}% FTP, "
             "so IF and TSS are approximate."
         )
+
+    # The arrow in a ramp row reads as a sweep, and this table is what the
+    # skills tell you to show the athlete — so it is the wrong place to leave
+    # the Garmin flattening unsaid. The .zwo does ramp properly; only Garmin
+    # needs the caveat, so name the platform rather than qualifying the row.
+    flat = [b for b in workout.steps() if b.kind == "ramp" and b.ramp_steps == 1]
+    if flat:
+        body.append("")
+        body.append(
+            f"Note: {len(flat)} ramp{'s' if len(flat) > 1 else ''} above show a sweep. "
+            "MyWhoosh rides that sweep; Garmin has no ramp primitive, so each becomes one "
+            "step showing the whole range as a band to hold. Set ramp_steps > 1 to "
+            "stair-step it for Garmin."
+        )
     if workout.warnings:
         body.append("")
         body.append("Warnings:")
