@@ -7,7 +7,7 @@
     "round-trip comparison can be tested without touching the network.",
     "Note what it records: targetType id 2 was sent with key 'power.zone' and",
     "came back as 'power.zone' with the watts intact. The same structure sent",
-    "with id 6 / 'power.between' came back as 'pace.zone' — see README."
+    "with id 6 / 'power.between' came back as 'pace.zone' — see docs/garmin-schema.md."
   ],
   "sent": {
     "workoutName": "ClaudeCyclingMCP_test_id2",
