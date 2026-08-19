@@ -265,3 +265,21 @@ def test_format_fraction_trims_noise():
     assert format_fraction(0.91) == "0.91"
     assert format_fraction(232 / 255) == "0.9098"
     assert format_fraction(1.0) == "1.0"
+
+
+def test_the_name_tag_is_spelled_name(sweetspot):
+    """Pin `<name>`, because a field report once claimed we emit `<n>`.
+
+    A 2026-08-19 run reported the returned XML as containing `<n>Sweet Spot…`
+    and filed it as a renderer bug. It was not: the source, the golden file and
+    the file written to disk all carried `<name>`, so the mangling happened
+    somewhere in that client's display of the tool result. The cost was real
+    anyway — the agent "fixed" it by importing a hand-built substitute, so the
+    file on disk and the file in MyWhoosh stopped being identical.
+
+    This test exists so the next reader of a mangled transcript can check the
+    claim in one command instead of editing the template.
+    """
+    xml, _ = render_zwo(sweetspot)
+    assert "<name>Sweet Spot 3x10</name>" in xml
+    assert "<n>" not in xml

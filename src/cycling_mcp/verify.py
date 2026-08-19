@@ -1,4 +1,10 @@
-"""Compare an uploaded Garmin payload against what Garmin gives back.
+"""Check what a platform stored against what was sent to it.
+
+Two halves, one per platform. The Garmin half compares an uploaded payload
+against what Garmin gives back; the MyWhoosh half, at the bottom of this file,
+compares a scraped builder header against the session that was rendered.
+Neither makes a network call — both are given the two sides to compare.
+
 
 `get_workout_by_id` returns a *curated* projection, not the payload that was
 sent. It is lossy in ways that matter:
@@ -290,3 +296,143 @@ def total_step_seconds(payload: dict) -> float:
         return total
 
     return sum(walk(s.get("workoutSteps", [])) for s in payload.get("workoutSegments", []))
+
+
+# --- MyWhoosh -----------------------------------------------------------
+#
+# MyWhoosh has no API to read a workout back, so the only evidence that an
+# import took is what its builder header shows: `Workout Time` and
+# `Training Load`. That header is the single check standing between a good
+# workout and spending an irreversible slot credit on a broken one, which is
+# too much to hang on an agent eyeballing two numbers.
+
+
+# `Training Load` is MyWhoosh's own model, not ours. Observed agreeing with our
+# TSS to the digit on 2026-08-19 (68:00 session, TSS 71, TL 71) — one data
+# point, so a disagreement here is reported as a warning, not a failure. The
+# duration is the hard check: it comes from the file, not from a model.
+TRAINING_LOAD_TOLERANCE_PCT = 10.0
+TRAINING_LOAD_TOLERANCE_ABS = 3.0
+
+
+def _parse_clock(value: Any) -> float | None:
+    """Seconds from a header duration, or None if it isn't one.
+
+    Accepts what the header actually renders: "68:00", "1:08:00", and the
+    failure values "00:00" and "NaN" (returned as 0.0 and None respectively).
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text.lower() == "nan":
+        return None
+    parts = text.split(":")
+    if not all(p.strip().isdigit() for p in parts) or len(parts) > 3:
+        return None
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return seconds
+
+
+def compare_mywhoosh_import(
+    expected_seconds: float,
+    expected_tss: float,
+    workout_time: Any,
+    training_load: Any = None,
+    before: dict | None = None,
+) -> dict:
+    """Check a MyWhoosh builder header against the session that was rendered.
+
+    `before` is the pre-import header snapshot (`workout_time`,
+    `training_load`, optionally `name`). It is what distinguishes a successful
+    import from a silent no-op: "Create New" routinely opens an editor that
+    already holds a previous workout, so a populated header proves nothing on
+    its own — and if that workout happens to share this session's duration,
+    neither does a duration that matches.
+    """
+    checks: list[dict] = []
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    observed_seconds = _parse_clock(workout_time)
+
+    if observed_seconds is None:
+        problems.append(
+            f"Workout Time reads {workout_time!r}, which is not a duration. "
+            "NaN means the import failed silently; do not export."
+        )
+    elif observed_seconds == 0:
+        problems.append("Workout Time is 00:00 — the import did not take. Do not export.")
+    elif abs(observed_seconds - expected_seconds) >= 1:
+        problems.append(
+            f"Workout Time is {workout_time} ({observed_seconds:.0f} s) but the "
+            f"rendered session is {expected_seconds:.0f} s. Something was dropped "
+            "on import; do not export."
+        )
+    checks.append(
+        {
+            "check": "workout_time",
+            "expected": expected_seconds,
+            "observed": observed_seconds,
+            "ok": observed_seconds is not None and abs(observed_seconds - expected_seconds) < 1,
+        }
+    )
+
+    if training_load is not None:
+        try:
+            observed_tl = float(training_load)
+        except (TypeError, ValueError):
+            observed_tl = None
+        tolerance = max(
+            TRAINING_LOAD_TOLERANCE_ABS, expected_tss * TRAINING_LOAD_TOLERANCE_PCT / 100
+        )
+        tl_ok = observed_tl is not None and abs(observed_tl - expected_tss) <= tolerance
+        if not tl_ok:
+            warnings.append(
+                f"Training Load is {training_load} but our TSS is {expected_tss:.1f}. "
+                "These are different models so they need not agree exactly, but a gap "
+                "this wide usually means the builder's FTP is not the FTP the file was "
+                "rendered against (Step 5)."
+            )
+        checks.append(
+            {
+                "check": "training_load",
+                "expected": round(expected_tss, 1),
+                "observed": observed_tl,
+                "tolerance": round(tolerance, 1),
+                "ok": tl_ok,
+            }
+        )
+
+    if before is None:
+        warnings.append(
+            "No pre-import snapshot given, so a silent no-op cannot be ruled out: a "
+            "header matching the session could be a workout that was already loaded. "
+            "Capture Workout Time and Training Load before importing (Step 2)."
+        )
+    else:
+        before_seconds = _parse_clock(before.get("workout_time"))
+        same_time = before_seconds is not None and before_seconds == observed_seconds
+        same_load = str(before.get("training_load")) == str(training_load)
+        unchanged = same_time and same_load
+        if unchanged:
+            problems.append(
+                "The header is identical to the pre-import snapshot "
+                f"({before.get('workout_time')} / {before.get('training_load')}), so the "
+                "import did nothing — regardless of whether those numbers match the "
+                "session. Do not export."
+            )
+        checks.append(
+            {"check": "changed_from_snapshot", "observed": not unchanged, "ok": not unchanged}
+        )
+
+    return {
+        "ok": not problems,
+        "safe_to_export": not problems,
+        "checks": checks,
+        "problems": problems,
+        "warnings": warnings,
+    }

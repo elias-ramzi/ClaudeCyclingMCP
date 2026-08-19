@@ -52,6 +52,14 @@
       "description": "Compare an uploaded Garmin workout against the payload that was sent"
     },
     {
+      "name": "verify_mywhoosh_import",
+      "description": "Check a MyWhoosh builder header against the session that was rendered, before export spends a credit"
+    },
+    {
+      "name": "get_skill",
+      "description": "Fetch a bundled upload procedure by name"
+    },
+    {
       "name": "spec_schema",
       "description": "Return the workout spec's JSON schema and authoring notes"
     }

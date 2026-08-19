@@ -15,6 +15,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resolved to nothing unless the skill had been uploaded to the account. This closes that gap.
 - **A MyWhoosh dry run** in `docs/smoke-test.md` that exercises the browser flow and stops before
   the export, so it spends no slot credit.
+- **`verify_mywhoosh_import`** — checks a scraped builder header against the rendered session and
+  returns `safe_to_export`. MyWhoosh has no API to read a workout back, so that header is the only
+  evidence an import took, and export is irreversible; the skill previously asked an agent to
+  eyeball two numbers. It takes the pre-import snapshot as an argument, which is what distinguishes
+  a real import from a silent no-op.
+- **`render_zwo` returns `xml_js_literal`**, the same XML pre-escaped as a JavaScript string
+  literal. The MyWhoosh flow injects the file into the page, and the documented snippet interpolated
+  raw XML into a template literal — so a backtick or a `${` in a workout name or message, both
+  athlete-supplied, would break or inject.
 
 ### Fixed
 
@@ -30,6 +39,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cannot coincide with an existing workout.
 - **`back-merge.yml` pushes to `dev` instead of opening a pull request.** It failed on first use:
   opening a PR from a workflow needs a repository setting that is off by default.
+- **A failed `out_path` write now says whose filesystem it is.** `/home/claude` fails on macOS with
+  a bare `[Errno 45] Operation not supported`, which tells a caller running elsewhere nothing about
+  why. The error now names the server's platform and home directory, and a failed write no longer
+  loses the rendered file.
+- **The MyWhoosh skill's import step fired into every file input at once**, which was observed
+  wedging the page — the call never returned, CDP timed out at 45 s, and the import did not apply.
+  It now fires into one input at a time.
+- **The skill's import-failure test could never fire.** It looked for an empty chart, while the step
+  before it says the editor usually opens with a previous workout already loaded. It now compares
+  against the pre-import snapshot, which is the check that works.
+- **The skill had no sanctioned recovery from a failed import**, so a free, fully recoverable
+  failure ended the flow. A new Step 4a authorises exactly one clean restart in a fresh editor —
+  nothing before `EXPORT TO MYWHOOSH` costs a credit.
+- **"Import resets FTP and weight" was stated as always true.** It has since been observed leaving
+  both untouched. The step now says to re-read and restore only what changed, on a page where every
+  stray interaction is a risk.
+- **The skill's FTP argument assumed watt-denominated sessions.** When every block is `power_pct`
+  the percentages are the intent and render identically under any FTP, so a disagreement is a
+  display and TSS question rather than a correctness one — worth reporting, not worth halting for.
+- **A Garmin FTP of exactly 200 W agreeing with the builder is not corroboration.** 200 is
+  MyWhoosh's default and a common stale Garmin entry, so two independent defaults colliding looks
+  identical to two sources confirming each other. The skill now calls this out.
+- **The skill says to import exactly what was rendered.** A run misread the returned `<name>` tag as
+  `<n>` — a display artefact, not the file — and imported a hand-built substitute, leaving the file
+  on disk and the file in MyWhoosh no longer identical. A test now pins the tag so the claim can be
+  checked in one command.
+- **Guidance for a timed-out browser call**, which the skill had none of. A timeout says nothing
+  about whether the action applied, and it is the case most likely to tempt a destructive retry.
 
 ## [0.1.0] - 2026-08-12
 

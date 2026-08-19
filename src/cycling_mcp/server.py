@@ -9,6 +9,7 @@ a human in the loop, so it lives in the bundled skills instead — see
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ from .render_zwo import zwo_filename
 from .skills import Skill, build_skill_message, load_skills
 from .spec import SpecError, load_spec
 from .spec import validate_spec as _validate_spec
-from .verify import compare_upload, total_step_seconds
+from .verify import compare_mywhoosh_import, compare_upload, total_step_seconds
 
 
 def _build_server():
@@ -209,11 +210,28 @@ Design rules worth knowing before writing a spec:
 """
 
 
-def _write(out_path: str, content: str) -> str:
-    path = Path(out_path).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    return str(path)
+def _write(out_path: str, content: str) -> tuple[str | None, str | None]:
+    """Write to the *server's* filesystem, or explain why it could not.
+
+    A caller running in a container naturally reaches for a container path, and
+    the OS error for one is unhelpful: `/home/claude` on macOS fails with
+    ENOTSUP ("Operation not supported") from the autofs mount, which says
+    nothing about whose filesystem this is. So name the machine in the error —
+    an agent that knows the platform and home directory can retry correctly on
+    the first attempt instead of guessing.
+    """
+    try:
+        path = Path(out_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return None, (
+            f"Could not write {out_path!r}: {exc.strerror or exc}. out_path is "
+            f"resolved on the machine running this MCP server (platform "
+            f"{sys.platform}, home {Path.home()}), which may not be the "
+            f"filesystem you are working in. Try a path under {Path.home()}."
+        )
+    return str(path), None
 
 
 def _dump(payload: dict) -> str:
@@ -277,7 +295,13 @@ def render_zwo(spec: dict, out_path: str | None = None) -> str:
     editable inside MyWhoosh's editor.
 
     Pass out_path to also write the file to disk; the content is returned either
-    way. Writing is the only filesystem access this server performs.
+    way. Writing is the only filesystem access this server performs, and it
+    happens on the machine running the server, which is not necessarily the
+    filesystem the caller is working in — a failed write says which.
+
+    "xml_js_literal" is the same XML as a ready-made JavaScript string literal.
+    Use it rather than interpolating "xml" into a template literal: a backtick
+    or a "${" in a workout name or message would otherwise break the script.
     """
     try:
         workout = load_spec(spec)
@@ -289,11 +313,19 @@ def render_zwo(spec: dict, out_path: str | None = None) -> str:
         "ok": True,
         "filename": zwo_filename(workout),
         "xml": xml,
+        # The MyWhoosh flow injects this XML into a page as JavaScript. A
+        # backtick or a "${" in an athlete's workout name or message text
+        # breaks a template literal and can inject, so ship a form that cannot:
+        # a complete JS string literal, ready to drop in as-is.
+        "xml_js_literal": json.dumps(xml),
         "warnings": workout.warnings + warnings,
         "summary": compute_metrics(workout).as_dict(),
     }
     if out_path:
-        result["written_to"] = _write(out_path, xml)
+        written, error = _write(out_path, xml)
+        result["written_to"] = written
+        if error:
+            result["write_error"] = error
     return _dump(result)
 
 
@@ -329,7 +361,8 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
     uploads and then verifies by fetching the workout back and comparing it
     against what was sent.
 
-    Pass out_path to also write the payload as JSON to disk.
+    Pass out_path to also write the payload as JSON to disk. That path is
+    resolved on the machine running this server; a failed write says so.
     """
     try:
         workout = load_spec(spec)
@@ -347,7 +380,10 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
         "schema_notes": GARMIN_SCHEMA_NOTES,
     }
     if out_path:
-        result["written_to"] = _write(out_path, _dump(payload))
+        written, error = _write(out_path, _dump(payload))
+        result["written_to"] = written
+        if error:
+            result["write_error"] = error
     return _dump(result)
 
 
@@ -383,6 +419,55 @@ def verify_garmin_upload(payload: dict, fetched: dict) -> str:
             ),
         }
     )
+
+
+@app.tool()
+def verify_mywhoosh_import(
+    spec: dict,
+    workout_time: str,
+    training_load: float | None = None,
+    before_workout_time: str | None = None,
+    before_training_load: str | None = None,
+) -> str:
+    """Check a MyWhoosh builder header against the session that was rendered.
+
+    Call this after importing a .zwo and before clicking EXPORT TO MYWHOOSH.
+    MyWhoosh has no API to read a workout back, so its header is the only
+    evidence the import took — and export spends an irreversible slot credit,
+    which is too much to hang on eyeballing two numbers.
+
+    Pass the header's `Workout Time` (as shown, e.g. "68:00") and
+    `Training Load`. Pass the pre-import values as before_* too: they are what
+    distinguishes a real import from a silent no-op, because "Create New"
+    routinely opens an editor already holding a previous workout. Without them
+    a header that matches the session might just be what was already loaded.
+
+    Returns safe_to_export plus the individual checks. Pure comparison, no
+    network and no browser access — it compares numbers you scraped.
+    """
+    try:
+        workout = load_spec(spec)
+    except SpecError as exc:
+        return _dump({"ok": False, "errors": exc.errors})
+
+    metrics = compute_metrics(workout)
+    before = None
+    if before_workout_time is not None or before_training_load is not None:
+        before = {"workout_time": before_workout_time, "training_load": before_training_load}
+
+    result = compare_mywhoosh_import(
+        expected_seconds=metrics.total_seconds,
+        expected_tss=metrics.tss,
+        workout_time=workout_time,
+        training_load=training_load,
+        before=before,
+    )
+    result["expected"] = {
+        "duration": metrics.as_dict()["total_duration"],
+        "tss": round(metrics.tss, 1),
+        "intensity_factor": round(metrics.intensity_factor, 3),
+    }
+    return _dump(result)
 
 
 @app.tool()

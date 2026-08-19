@@ -148,3 +148,78 @@ def test_no_target_steps_compare_clean():
 def test_the_renderer_output_compares_clean_against_its_own_echo(recorded):
     """A sanity check on the harness itself: identical data must not diff."""
     assert compare_upload(recorded["sent"], copy.deepcopy(recorded["fetched"])) == []
+
+
+# --- MyWhoosh header checks ---------------------------------------------
+
+from cycling_mcp.verify import compare_mywhoosh_import  # noqa: E402
+
+# The 68 min session from the 2026-08-19 run: 4080 s, TSS 71.
+GOOD = {"expected_seconds": 4080.0, "expected_tss": 71.0}
+SNAPSHOT = {"workout_time": "70:00", "training_load": "70"}
+
+
+def test_a_matching_header_with_a_changed_snapshot_is_safe():
+    result = compare_mywhoosh_import(
+        **GOOD, workout_time="68:00", training_load=71, before=SNAPSHOT
+    )
+    assert result["safe_to_export"]
+    assert result["problems"] == []
+    assert result["warnings"] == []
+
+
+def test_an_hour_plus_clock_parses():
+    result = compare_mywhoosh_import(**GOOD, workout_time="1:08:00", before=SNAPSHOT)
+    assert result["safe_to_export"]
+
+
+def test_a_header_identical_to_the_snapshot_is_a_silent_no_op():
+    """The case a duration check alone cannot catch.
+
+    "Create New" opens an editor that may already hold a workout. If that
+    workout happens to share this session's duration — which happened on
+    2026-08-19 — a matching header is indistinguishable from a failed import
+    without the snapshot.
+    """
+    result = compare_mywhoosh_import(
+        expected_seconds=4200.0,
+        expected_tss=70.0,
+        workout_time="70:00",
+        training_load="70",
+        before=SNAPSHOT,
+    )
+    assert not result["safe_to_export"]
+    assert "import did nothing" in " ".join(result["problems"])
+
+
+def test_nan_is_a_failed_import():
+    result = compare_mywhoosh_import(**GOOD, workout_time="NaN", before=SNAPSHOT)
+    assert not result["safe_to_export"]
+    assert "not a duration" in " ".join(result["problems"])
+
+
+def test_zero_duration_is_a_failed_import():
+    result = compare_mywhoosh_import(**GOOD, workout_time="00:00", before=SNAPSHOT)
+    assert not result["safe_to_export"]
+
+
+def test_a_wrong_duration_blocks_export():
+    result = compare_mywhoosh_import(**GOOD, workout_time="42:00", before=SNAPSHOT)
+    assert not result["safe_to_export"]
+    assert "42:00" in " ".join(result["problems"])
+
+
+def test_a_missing_snapshot_warns_but_does_not_block():
+    """Blocking here would be wrong — the check is weaker, not failed."""
+    result = compare_mywhoosh_import(**GOOD, workout_time="68:00", training_load=71)
+    assert result["safe_to_export"]
+    assert any("no-op" in w for w in result["warnings"])
+
+
+def test_a_far_off_training_load_warns_but_does_not_block():
+    """Training Load is MyWhoosh's model, not ours; a gap is a hint, not proof."""
+    result = compare_mywhoosh_import(
+        **GOOD, workout_time="68:00", training_load=44, before=SNAPSHOT
+    )
+    assert result["safe_to_export"]
+    assert any("Training Load" in w for w in result["warnings"])
