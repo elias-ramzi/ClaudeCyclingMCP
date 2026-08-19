@@ -1,5 +1,7 @@
 import pytest
 
+from cycling_mcp.metrics import describe
+from cycling_mcp.render_zwo import render_zwo
 from cycling_mcp.spec import SpecError, load_spec, parse_duration, validate_spec
 
 
@@ -252,3 +254,55 @@ def test_repeat_expands_in_execution_order():
     steps = list(workout.steps())
     assert len(steps) == 6
     assert workout.total_seconds == 3 * (240 + 120)
+
+
+# --- FTP provenance ------------------------------------------------------
+
+
+def test_ftp_provenance_is_recorded_when_given():
+    """Six months on, a workout is raw watts with no record of which FTP made
+    them. The spec is the only place that can carry it."""
+    workout = load_spec(
+        {
+            "name": "T",
+            "ftp": 255,
+            "ftp_source": "athlete_stated",
+            "ftp_date": "2026-08-19",
+            "blocks": [{"type": "steady", "duration": 600, "power_pct": 90}],
+        }
+    )
+    assert workout.ftp_provenance() == "athlete stated, 2026-08-19"
+
+
+def test_ftp_provenance_is_absent_when_unrecorded():
+    workout = load_spec(
+        {"name": "T", "ftp": 255, "blocks": [{"type": "steady", "duration": 600, "power_pct": 90}]}
+    )
+    assert workout.ftp_provenance() is None
+
+
+def test_an_unknown_ftp_source_is_an_error_not_a_warning():
+    _, errors, _ = validate_spec(
+        {
+            "name": "T",
+            "ftp": 255,
+            "ftp_source": "vibes",
+            "blocks": [{"type": "steady", "duration": 600, "power_pct": 90}],
+        }
+    )
+    assert any("ftp_source must be one of" in e for e in errors)
+
+
+def test_provenance_reaches_the_artifacts_the_athlete_reads():
+    spec = {
+        "name": "T",
+        "ftp": 255,
+        "ftp_source": "test_result",
+        "ftp_date": "2026-08-01",
+        "blocks": [{"type": "steady", "duration": 600, "power_pct": 90}],
+    }
+    workout = load_spec(spec)
+    assert "(test result, 2026-08-01)" in describe(workout)
+    # A .zwo stores fractions only, so the description is the one field that
+    # can still say what they were fractions of.
+    assert "Built against FTP 255 W (test result, 2026-08-01)" in render_zwo(workout)[0]

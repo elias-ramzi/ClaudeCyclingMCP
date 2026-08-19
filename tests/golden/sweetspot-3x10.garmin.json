@@ -66,8 +66,8 @@
             "workoutTargetTypeId": 2,
             "workoutTargetTypeKey": "power.zone"
           },
-          "targetValueOne": 142.0,
-          "targetValueTwo": 148.0
+          "targetValueOne": 138.0,
+          "targetValueTwo": 152.0
         },
         {
           "type": "ExecutableStepDTO",
@@ -104,8 +104,8 @@
             "workoutTargetTypeId": 2,
             "workoutTargetTypeKey": "power.zone"
           },
-          "targetValueOne": 142.0,
-          "targetValueTwo": 148.0
+          "targetValueOne": 138.0,
+          "targetValueTwo": 152.0
         },
         {
           "type": "ExecutableStepDTO",

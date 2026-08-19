@@ -42,11 +42,24 @@ _SPEC_KEYS = {
     "ftp",
     "filename",
     "garmin_target_band_pct",
+    "ftp_source",
+    "ftp_date",
     "blocks",
     "comment",
 }
 
+# Where an FTP came from. Six months on, a workout is a set of raw watts with
+# no record of which athlete-number produced them; this keeps the provenance
+# with the session rather than only in whoever's memory built it.
+FTP_SOURCES = ("athlete_stated", "garmin_profile", "test_result")
+
+# The band placed around a scalar power target, per role. Garmin needs ranges,
+# and one width does not fit both ends of a session: +/-2% of a 250 W interval
+# is +/-5 W, which is right, while +/-2% of a 140 W recovery is +/-3 W — a
+# window narrow enough to alarm continuously on an easy spin. Reported from a
+# real ride, 2026-08-19. An explicit garmin_target_band_pct overrides all of it.
 DEFAULT_TARGET_BAND_PCT = 2.0
+RECOVERY_TARGET_BAND_PCT = 5.0
 
 
 class SpecError(ValueError):
@@ -116,8 +129,22 @@ class Workout:
     author: str = "ClaudeCyclingMCP"
     description: str = ""
     filename: str | None = None
-    target_band_pct: float = DEFAULT_TARGET_BAND_PCT
+    # None means no explicit override; the Garmin renderer then bands by role.
+    target_band_pct: float | None = None
+    ftp_source: str | None = None
+    ftp_date: str | None = None
     warnings: list[str] = field(default_factory=list)
+
+    def ftp_provenance(self) -> str | None:
+        """Where this FTP came from, as a phrase, or None if unrecorded."""
+        if self.ftp_source is None:
+            return None
+        phrase = {
+            "athlete_stated": "athlete stated",
+            "garmin_profile": "Garmin profile",
+            "test_result": "test result",
+        }[self.ftp_source]
+        return f"{phrase}, {self.ftp_date}" if self.ftp_date else phrase
 
     def steps(self) -> Iterator[Block]:
         """Every executable block in execution order, repeats expanded."""
@@ -473,10 +500,21 @@ def validate_spec(spec: Any) -> tuple[Workout | None, list[str], list[str]]:
     else:
         ftp = float(ftp_raw)
 
-    band = spec.get("garmin_target_band_pct", DEFAULT_TARGET_BAND_PCT)
-    if isinstance(band, bool) or not isinstance(band, (int, float)) or band < 0:
-        out.error("spec", f"garmin_target_band_pct must be a number >= 0, got {band!r}")
-        band = DEFAULT_TARGET_BAND_PCT
+    # None means "no explicit override", which is what lets the renderer pick a
+    # band by role. A caller who sets the knob still gets exactly that number.
+    band: float | None = None
+    if "garmin_target_band_pct" in spec:
+        raw_band = spec["garmin_target_band_pct"]
+        if isinstance(raw_band, bool) or not isinstance(raw_band, (int, float)) or raw_band < 0:
+            out.error("spec", f"garmin_target_band_pct must be a number >= 0, got {raw_band!r}")
+        else:
+            band = float(raw_band)
+
+    ftp_source = _text(spec.get("ftp_source"), "spec", "ftp_source", out)
+    if ftp_source is not None and ftp_source not in FTP_SOURCES:
+        out.error("spec", f"ftp_source must be one of {list(FTP_SOURCES)}, got {ftp_source!r}")
+        ftp_source = None
+    ftp_date = _text(spec.get("ftp_date"), "spec", "ftp_date", out)
 
     author = _text(spec.get("author"), "spec", "author", out)
     description = _text(spec.get("description"), "spec", "description", out)
@@ -510,7 +548,9 @@ def validate_spec(spec: Any) -> tuple[Workout | None, list[str], list[str]]:
         author=author or "ClaudeCyclingMCP",
         description=description or "",
         filename=filename,
-        target_band_pct=float(band),
+        target_band_pct=band,
+        ftp_source=ftp_source,
+        ftp_date=ftp_date,
         warnings=list(out.warnings),
     )
     return workout, [], out.warnings

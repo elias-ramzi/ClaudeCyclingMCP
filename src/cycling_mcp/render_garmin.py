@@ -26,7 +26,13 @@ Schema notes, all of them load-bearing (see README "Garmin schema provenance"):
 
 from __future__ import annotations
 
-from .spec import Block, Repeat, Workout
+from .spec import (
+    DEFAULT_TARGET_BAND_PCT,
+    RECOVERY_TARGET_BAND_PCT,
+    Block,
+    Repeat,
+    Workout,
+)
 
 SPORT_CYCLING = {"sportTypeId": 2, "sportTypeKey": "cycling"}
 
@@ -52,6 +58,23 @@ TARGET_CADENCE = {"workoutTargetTypeId": 3, "workoutTargetTypeKey": "cadence"}
 # A few watts either side of a target reads as a band anyway; 20 W is where the
 # athlete would notice they were told to hold rather than climb.
 RAMP_LOSSY_WATTS = 20
+
+# The easy end of a session gets a wider band than the hard end. See the note
+# on RECOVERY_TARGET_BAND_PCT in spec.py for why one width does not fit both.
+ROLE_BAND_PCT = {
+    "interval": DEFAULT_TARGET_BAND_PCT,
+    "rest": DEFAULT_TARGET_BAND_PCT,
+    "recovery": RECOVERY_TARGET_BAND_PCT,
+    "warmup": RECOVERY_TARGET_BAND_PCT,
+    "cooldown": RECOVERY_TARGET_BAND_PCT,
+}
+
+
+def _band_pct(block: Block, workout: Workout) -> float:
+    """The band width for this block: the spec's override, or the role default."""
+    if workout.target_band_pct is not None:
+        return workout.target_band_pct
+    return ROLE_BAND_PCT.get(block.role, DEFAULT_TARGET_BAND_PCT)
 
 
 class _Counter:
@@ -86,11 +109,12 @@ def _watt_bounds(
     low_fraction, high_fraction = block.p_low, block.p_high
     assert low_fraction is not None and high_fraction is not None
 
+    band_pct = _band_pct(block, workout)
     if block.is_scalar_target:
         centre = low_fraction * workout.ftp
-        margin = centre * workout.target_band_pct / 100.0
+        margin = centre * band_pct / 100.0
         low, high = round(centre - margin), round(centre + margin)
-        if low == high and workout.target_band_pct > 0:
+        if low == high and band_pct > 0:
             low, high = low - 1, high + 1
     else:
         low, high = workout.watts(low_fraction), workout.watts(high_fraction)

@@ -198,7 +198,10 @@ def describe(workout: Workout) -> str:
     def line(values: tuple[str, ...]) -> str:
         return "  ".join(value.ljust(widths[i]) for i, value in enumerate(values)).rstrip()
 
+    provenance = workout.ftp_provenance()
     header_text = f"{workout.name}  —  FTP {workout.ftp} W"
+    if provenance:
+        header_text += f" ({provenance})"
     summary = (
         f"{format_duration(stats.total_seconds)} total · "
         f"NP {stats.normalised_power} W · IF {stats.intensity_factor:.2f} · "

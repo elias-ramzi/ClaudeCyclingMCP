@@ -77,6 +77,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checked in one command.
 - **Guidance for a timed-out browser call**, which the skill had none of. A timeout says nothing
   about whether the action applied, and it is the case most likely to tempt a destructive retry.
+- **Target bands are chosen by role.** 2% for interval and rest, 5% for recovery, warmup and
+  cooldown. ±2% of a 250 W interval is ±5 W, which is right; ±2% of a 140 W recovery is a 6 W
+  window that alarms continuously on an easy spin. An explicit `garmin_target_band_pct` still
+  applies one number everywhere. **The Garmin golden file changed** — the two recovery steps in
+  `sweetspot-3x10.garmin.json` move from 142–148 W to 138–152 W; nothing else.
+- **Optional `ftp_source` and `ftp_date`** record where an FTP came from. A workout on a head unit
+  is raw watts and a `.zwo` stores only fractions, so neither file says which number produced it.
+  Recorded in the `describe_spec` header and in the `.zwo` description. Not added to the Garmin
+  payload: its DTO has a description field, but that field has never been verified against the live
+  API, and this repo does not put unverified fields in a payload.
 - **`verify_garmin_upload` rejects a misused comparison instead of diffing two different shapes.**
   Handed an upload payload where a fetched workout belongs, it reported that Garmin had dropped the
   workout name, the sport and every segment — confident, specific, and entirely an artefact of

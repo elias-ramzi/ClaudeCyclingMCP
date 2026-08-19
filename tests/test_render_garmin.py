@@ -176,11 +176,51 @@ def test_scalar_target_gets_a_band_because_garmin_needs_a_range():
         {
             "name": "T",
             "ftp": 255,
-            "blocks": [{"type": "steady", "duration": 600, "power_w": 232}],
+            "blocks": [{"type": "steady", "duration": 600, "power_w": 232, "role": "interval"}],
         }
     )
     step = steps(built)[0]
     assert (step["targetValueOne"], step["targetValueTwo"]) == (227.0, 237.0)
+
+
+def test_the_easy_end_of_a_session_gets_a_wider_band_than_the_hard_end():
+    """One width does not fit both ends.
+
+    +/-2% of a 250 W interval is +/-5 W, which is right; +/-2% of a 140 W
+    recovery is +/-3 W, a window narrow enough to alarm continuously on an easy
+    spin. Reported from a real ride, 2026-08-19.
+    """
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 255,
+            "blocks": [
+                {"type": "steady", "duration": 600, "power_w": 250, "role": "interval"},
+                {"type": "steady", "duration": 300, "power_w": 140, "role": "recovery"},
+            ],
+        }
+    )
+    interval, recovery = steps(built)
+    assert (interval["targetValueOne"], interval["targetValueTwo"]) == (245.0, 255.0)
+    assert (recovery["targetValueOne"], recovery["targetValueTwo"]) == (133.0, 147.0)
+
+
+def test_an_explicit_band_overrides_every_role():
+    """The existing knob keeps meaning exactly what it says."""
+    built = payload(
+        {
+            "name": "T",
+            "ftp": 255,
+            "garmin_target_band_pct": 1.0,
+            "blocks": [
+                {"type": "steady", "duration": 600, "power_w": 250, "role": "interval"},
+                {"type": "steady", "duration": 300, "power_w": 140, "role": "recovery"},
+            ],
+        }
+    )
+    interval, recovery = steps(built)
+    assert (interval["targetValueOne"], interval["targetValueTwo"]) == (248.0, 252.0)
+    assert (recovery["targetValueOne"], recovery["targetValueTwo"]) == (139.0, 141.0)
 
 
 def test_band_width_is_configurable():

@@ -24,7 +24,7 @@ from .render_garmin import render_garmin as _render_garmin
 from .render_zwo import render_zwo as _render_zwo
 from .render_zwo import zwo_filename
 from .skills import Skill, build_skill_message, load_skills
-from .spec import SpecError, load_spec
+from .spec import FTP_SOURCES, SpecError, load_spec
 from .spec import validate_spec as _validate_spec
 from .verify import (
     compare_mywhoosh_import,
@@ -79,12 +79,28 @@ SPEC_SCHEMA: dict[str, Any] = {
         },
         "garmin_target_band_pct": {
             "type": "number",
-            "default": 2.0,
             "description": (
                 "Half-width of the watt band placed around a scalar power target when "
                 "rendering for Garmin, which needs ranges. Ignored where the spec already "
-                "gives an explicit [low, high]."
+                "gives an explicit [low, high]. Omit it and the width is chosen by role: "
+                "2% for interval and rest, 5% for recovery, warmup and cooldown — because "
+                "2% of a 140 W easy spin is a 6 W window that alarms continuously, while "
+                "2% of a 250 W interval is right. Setting it applies that one number "
+                "everywhere."
             ),
+        },
+        "ftp_source": {
+            "enum": list(FTP_SOURCES),
+            "description": (
+                "Optional. Where the FTP came from. A workout is a set of raw watts once "
+                "it is on the head unit, and a .zwo stores only fractions, so neither "
+                "file records which number produced it. Recorded in the describe_spec "
+                "header and in the .zwo description."
+            ),
+        },
+        "ftp_date": {
+            "type": "string",
+            "description": "Optional. When that FTP was established, e.g. '2026-08-19'.",
         },
         "blocks": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/block"}},
     },
