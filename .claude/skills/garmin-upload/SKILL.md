@@ -29,6 +29,18 @@ error can still be stored wrong, and nothing tells you when that happens.
 
 ## Steps
 
+### 0. Check the destination exists
+
+Confirm the Garmin MCP is connected — you need `upload_workout`,
+`get_workout_by_id` and `delete_workout`. **If they are not there, say so now,
+before rendering.** The workout can still be rendered and written to disk for
+manual import, but do not begin the upload procedure and do not describe the
+result as uploaded.
+
+This costs one look and converts a failure at step 4 into a fact stated at the
+start. Observed: a full session spent building a workout for a Garmin MCP that
+was not connected.
+
 ### 1. Write the spec
 
 Call `spec_schema` if the format isn't already familiar. Keep the spec flat and
@@ -81,11 +93,16 @@ with step 3's `payload_digest` as `expected_digest` **and** the spec as `spec`.
 The digest says whether it was altered; the spec says which field.
 
 - `matches_rendered: true` → upload.
-- `matches_rendered: false` (or `matches_spec: false`) → **do not upload.**
-  What you composed is not what was rendered. Read
-  `differences_from_spec` to see what moved, then copy the payload from the
+- `matches_spec: false` → **do not upload.** Read `differences_from_spec`: it
+  names the step and field that moved. Copy the payload from the
   `render_garmin` result again rather than patching it — the difference you can
   see may not be the only one.
+- `matches_rendered: false` **with** `matches_spec: true` and an empty
+  `differences_from_spec` → those contradict, and the spec diff is the one to
+  believe: it names fields, the digest only says something moved. Report the
+  contradiction, do not upload, and treat it as a bug in this server rather
+  than in your payload.
+- Both true → upload.
 
 Then call the Garmin MCP's `upload_workout` with that payload. Keep the returned
 `workout_id`.
@@ -125,9 +142,12 @@ unresponsive. In that case:
   accepted, nothing more.
 - **Do not delete it.** It is probably fine, and a deleted workout cannot be
   inspected.
-- Give the user the manual check: call `check_garmin_payload` with the payload
-  and read its `ui_checklist` to them — that is what each step should show in
-  Garmin Connect, generated rather than improvised.
+- Give the user the manual check: read them the `ui_checklist` **from the
+  `render_garmin` result you already have** — that is what each step should
+  show in Garmin Connect, generated rather than improvised. Do not call this
+  server again to fetch it; if the Garmin read is failing, this server may be
+  unreachable too, and the checklist is already in your context. It is also on
+  disk beside the payload as `.checklist.txt` if you passed `out_path`.
 - Offer to retry the fetch once the Garmin MCP is responsive again.
 
 Two things this check cannot prove, so don't claim them:

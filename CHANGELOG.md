@@ -91,6 +91,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checked in one command.
 - **Guidance for a timed-out browser call**, which the skill had none of. A timeout says nothing
   about whether the action applied, and it is the case most likely to tempt a destructive retry.
+- **`payload_digest` rejected correct payloads, blocking every upload.** JSON has one number type,
+  so a renderer emitting `227.0` and a model retyping it as `227` produce equal payloads that
+  hashed differently — and that retyping is unavoidable, since the payload leaves this server as
+  text and re-enters as an argument someone composed. `diff_payloads` already compared numbers by
+  value, so one response could carry `matches_spec: true` with an empty diff *and*
+  `matches_rendered: false`, which the skill turned into "do not upload". Integral floats are now
+  folded before hashing, so the two checks cannot disagree about what "the same payload" means.
+  **Only the tampered path had test coverage**, so a digest that rejected everything still passed
+  the suite; the identity path is now tested through a JSON round-trip.
+- **`render_garmin` returns `ui_checklist`** and writes it beside `out_path`. It is the
+  manual-verification fallback for when the Garmin read is unavailable, and it previously required
+  another call to this server — no fallback at all when this server is what stopped answering.
+- **`garmin-upload` gains a step 0**: confirm the Garmin MCP is connected before rendering. A whole
+  session was spent building a workout for a platform that was not there, discovered at step 4.
+- **The skill's gate prefers `matches_spec`.** It names the field that moved; the digest only says
+  one did. A digest that disagrees with a clean spec diff is now reported as a bug in this server,
+  not as a corrupt payload.
 - **A repeated block warns once, not once per repetition.** Repeats are flattened for MyWhoosh, so
   a child is emitted `count` times — but it was authored once, and three identical lines is noise
   in the artifact people read. The path now names where the author can find the block

@@ -513,13 +513,41 @@ def compare_mywhoosh_import(
 DIGEST_LENGTH = 16
 
 
+def _canonical(value: Any) -> Any:
+    """Strip everything that is representation rather than content.
+
+    JSON has one number type. Python does not, so a renderer emitting 227.0
+    and a model retyping it as 227 produce equal payloads that hash
+    differently — and the retyping is unavoidable, because the payload leaves
+    this server as text and re-enters as an argument someone composed.
+
+    Getting this wrong is worse than not checking. A digest that fires on a
+    clean payload teaches its reader to override it, which is precisely when
+    the real corruption gets through. `diff_payloads` already compares numbers
+    by value; this is the same rule, applied before hashing, so the two cannot
+    disagree about what "the same payload" means. Observed disagreeing on a
+    real session, 2026-08-20.
+    """
+    if isinstance(value, dict):
+        return {key: _canonical(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_canonical(item) for item in value]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
 def payload_digest(payload: dict) -> str:
     """A short, stable digest of a payload's content.
 
-    Canonicalised first — sorted keys, no insignificant whitespace — so that
-    reformatting is not mistaken for corruption. Only the content matters.
+    Canonicalised first — sorted keys, no insignificant whitespace, and
+    integral floats folded to ints — so that only content changes the digest.
     """
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    canonical = json.dumps(
+        _canonical(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:DIGEST_LENGTH]
 
 

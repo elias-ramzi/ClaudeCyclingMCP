@@ -435,9 +435,17 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
         # skill only surfaced on a second, lucky tool search.
         "next_step": (
             "Call get_skill('garmin-upload') and follow it. Before uploading, pass the "
-            "payload you composed to check_garmin_payload with payload_digest."
+            "payload you composed to check_garmin_payload with BOTH payload_digest and "
+            "spec — the spec diff names the field that moved, the digest only says one "
+            "did."
         ),
         "payload_digest": payload_digest(payload),
+        # Returned here, not only from check_garmin_payload, because this is
+        # the manual-verification fallback for when the Garmin read is
+        # unavailable — and a fallback that requires another call to this
+        # server is no fallback when this server is the thing that stopped
+        # answering. Reported after two 4-minute timeouts, 2026-08-20.
+        "ui_checklist": ui_checklist(payload),
         # The curated read drops targetValueUnit, so no round-trip can prove a
         # target was stored as watts rather than %FTP. That leaves a visual
         # check as the only evidence — which needs a concrete criterion, not
@@ -472,6 +480,9 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
                 result["digest_written_to"] = sidecar
             else:
                 result["write_error"] = sidecar_error
+            checklist, _ = _write(f"{out_path}.checklist.txt", "\n".join(result["ui_checklist"]))
+            if checklist:
+                result["checklist_written_to"] = checklist
     return _dump(result)
 
 

@@ -361,3 +361,68 @@ def test_out_path_writes_a_digest_beside_the_payload(spec, tmp_path):
     sidecar = Path(result["digest_written_to"])
     assert sidecar.read_text().strip() == result["payload_digest"]
     assert sidecar.name == "t.garmin.json.sha256"
+
+
+def _through_the_wire(payload: dict):
+    """What a payload becomes when a model retypes it from a tool result.
+
+    JSON has one number type, so 227.0 comes back as 227. This is not
+    avoidable — the payload leaves the server as text and re-enters as an
+    argument someone composed — so any check on it must survive the trip.
+    """
+
+    def normalise(value):
+        if isinstance(value, dict):
+            return {k: normalise(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [normalise(v) for v in value]
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+
+    return normalise(json.loads(json.dumps(payload)))
+
+
+def test_the_identity_path_passes_the_digest(rendered):
+    """The case that was never tested, and so shipped broken.
+
+    Only the tampered path had coverage, so a digest that rejected *every*
+    payload still passed the suite. A real session hit it immediately: the
+    clean payload reported matches_spec true with an empty diff and
+    matches_rendered false, in the same response, and the skill's gate turned
+    that into "do not upload".
+    """
+    result = json.loads(
+        check_garmin_payload(_through_the_wire(rendered["payload"]), rendered["payload_digest"])
+    )
+    assert result["matches_rendered"] is True, result.get("problem")
+    assert "problem" not in result
+
+
+def test_the_two_checks_never_contradict_each_other(spec, rendered):
+    """A digest and a diff that disagree teach the reader to ignore both."""
+    for candidate in (rendered["payload"], _through_the_wire(rendered["payload"])):
+        result = json.loads(check_garmin_payload(candidate, rendered["payload_digest"], spec))
+        assert result["matches_rendered"] == result["matches_spec"], result
+
+
+def test_a_real_change_still_moves_the_digest_after_canonicalising(rendered):
+    """Tolerating 227.0 == 227 must not tolerate 237 == 237.5."""
+    nearly = _through_the_wire(rendered["payload"])
+    nearly["workoutSegments"][0]["workoutSteps"][1]["targetValueTwo"] = 237.5
+    result = json.loads(check_garmin_payload(nearly, rendered["payload_digest"]))
+    assert result["matches_rendered"] is False
+
+
+def test_the_checklist_ships_with_the_render(rendered):
+    """The manual-verification fallback must not require another call to the
+    server that just stopped answering."""
+    assert any("W" in line for line in rendered["ui_checklist"])
+    assert "spec" in rendered["next_step"]
+
+
+def test_out_path_writes_the_checklist_too(spec, tmp_path):
+    target = tmp_path / "t.garmin.json"
+    result = json.loads(render_garmin(spec, out_path=str(target)))
+    written = Path(result["checklist_written_to"]).read_text()
+    assert written.splitlines() == result["ui_checklist"]
