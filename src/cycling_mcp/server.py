@@ -620,9 +620,9 @@ def verify_garmin_upload(payload: dict, fetched: dict, expected_digest: str | No
 def verify_mywhoosh_import(
     spec: dict,
     workout_time: str,
-    training_load: float | None = None,
+    training_load: float | str | None = None,
     before_workout_time: str | None = None,
-    before_training_load: str | None = None,
+    before_training_load: float | str | None = None,
 ) -> str:
     """Check a MyWhoosh builder header against the session that was rendered.
 

@@ -395,6 +395,24 @@ def _parse_clock(value: Any) -> float | None:
     return seconds
 
 
+def _as_number(value):
+    """A scraped header value as a number, or None if it isn't one.
+
+    Training Load arrives as text from a page, and by the time it reaches this
+    comparison one side may have been coerced to a float while the other stays
+    a string. Comparing their `str()` forms then makes "72" and "72.0" look
+    like a change — which is this check's own failure mode, inverted: it
+    reported the header as changed on the exact silent no-op it exists to
+    catch. Observed 2026-08-20.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def compare_mywhoosh_import(
     expected_seconds: float,
     expected_tss: float,
@@ -474,8 +492,25 @@ def compare_mywhoosh_import(
     else:
         before_seconds = _parse_clock(before.get("workout_time"))
         same_time = before_seconds is not None and before_seconds == observed_seconds
-        same_load = str(before.get("training_load")) == str(training_load)
+        before_load = _as_number(before.get("training_load"))
+        observed_load = _as_number(training_load)
+        same_load = before_load == observed_load
         unchanged = same_time and same_load
+
+        # Even when something did change, a Training Load nearer the old
+        # workout's than this session's suggests the chart on screen is still
+        # the old workout. Cheap, local, and independent of the tolerance.
+        if (
+            not unchanged
+            and before_load is not None
+            and observed_load is not None
+            and abs(observed_load - before_load) < abs(observed_load - expected_tss)
+        ):
+            warnings.append(
+                f"Training Load {training_load} is closer to the pre-import value "
+                f"({before.get('training_load')}) than to this session's TSS "
+                f"({expected_tss:.1f}). Check the chart matches the session you built."
+            )
         if unchanged:
             problems.append(
                 "The header is identical to the pre-import snapshot "
@@ -483,8 +518,19 @@ def compare_mywhoosh_import(
                 "import did nothing — regardless of whether those numbers match the "
                 "session. Do not export."
             )
+        # Show what was compared, so a caller can see the comparison happened
+        # rather than trusting a bare boolean.
         checks.append(
-            {"check": "changed_from_snapshot", "observed": not unchanged, "ok": not unchanged}
+            {
+                "check": "changed_from_snapshot",
+                "before": {
+                    "workout_time": before.get("workout_time"),
+                    "training_load": before.get("training_load"),
+                },
+                "after": {"workout_time": workout_time, "training_load": training_load},
+                "observed": not unchanged,
+                "ok": not unchanged,
+            }
         )
 
     return {

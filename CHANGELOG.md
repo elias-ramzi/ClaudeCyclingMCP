@@ -91,6 +91,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checked in one command.
 - **Guidance for a timed-out browser call**, which the skill had none of. A timeout says nothing
   about whether the action applied, and it is the case most likely to tempt a destructive retry.
+- **`verify_mywhoosh_import` reported an unchanged header as changed**, returning
+  `safe_to_export: true` on the exact silent no-op it exists to catch. A scraped Training Load
+  arrives as text while `training_load` is typed numeric, so the two sides of one reading were
+  compared as `"72"` against `"72.0"`. Both are now coerced to numbers, both parameters accept
+  either form, and the check reports the `before` and `after` it compared rather than a bare
+  boolean. Note the shape of the failure: a caller who followed Step 2 and captured a snapshot got
+  false reassurance, while one who skipped it got an honest warning — the careful path was the
+  dangerous one.
+- **A stdio contract suite** that drives the server the way a client does. Two bugs have now
+  shipped past a green in-process suite — this and the payload digest — and both were type
+  mismatches that only exist after JSON and pydantic coercion, which calling the Python function
+  directly cannot reproduce.
+- **A warning when the observed Training Load sits nearer the pre-import value than the session's**
+  — independent of the tolerance, and a cheap second signal that the chart on screen is still the
+  old workout.
+- **`mywhoosh-upload` Step 3 says the FTP and weight fields appear twice**, that agreement is the
+  normal case, and that a disagreement means read the second — matching Step 5, which already
+  writes to the second. The snippet now reports each field's index, since `name`, `id` and
+  `placeholder` are all null on those inputs.
 - **CI was red on Windows only.** Tests read files this project writes as UTF-8 using the platform
   default encoding, which is cp1252 on Windows, so the `·` separators and `Récupération` in the
   Garmin UI checklist came back mangled. The written files were always correct; the tests were

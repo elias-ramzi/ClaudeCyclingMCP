@@ -124,11 +124,19 @@ misparse:
 
 ```javascript
 [...document.querySelectorAll('input')]
-  .map(i => ({name: i.name || i.id || i.getAttribute('placeholder'), value: i.value}))
+  .map((i, index) => ({index, name: i.name || i.id || i.getAttribute('placeholder'), value: i.value}))
   .filter(x => x.value !== '');
 ```
 
-*Expect:* an FTP in watts and a weight in kg.
+*Expect:* an FTP in watts and a weight in kg — **each appearing twice**, e.g.
+`255, 72, 255, 72, ...`. That duplication is the same one Step 5 warns about
+(`find` returns two sets of refs, the second is the live one). `name`, `id` and
+`placeholder` all come back `null` on these fields, so the index is the only
+handle you have — which is why the snippet reports it.
+
+Agreement between the two copies is the normal case and means nothing is at
+risk. **If they disagree, use the second**, for the same reason Step 5 writes to
+the second. Say which you saw either way.
 
 **Then judge what you got, out loud:**
 
