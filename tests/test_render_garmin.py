@@ -12,7 +12,7 @@ GOLDEN = Path(__file__).parent / "golden"
 
 @pytest.fixture
 def sweetspot():
-    return load_spec(json.loads((GOLDEN / "sweetspot-3x10.json").read_text()))
+    return load_spec(json.loads((GOLDEN / "sweetspot-3x10.json").read_text(encoding="utf-8")))
 
 
 def payload(spec: dict) -> dict:
@@ -30,7 +30,7 @@ def walk(step_list):
 
 
 def test_matches_the_golden_payload(sweetspot):
-    expected = json.loads((GOLDEN / "sweetspot-3x10.garmin.json").read_text())
+    expected = json.loads((GOLDEN / "sweetspot-3x10.garmin.json").read_text(encoding="utf-8"))
     assert render_garmin(sweetspot)[0] == expected
 
 

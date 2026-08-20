@@ -21,7 +21,7 @@ GOLDEN = Path(__file__).parent / "golden"
 
 @pytest.fixture
 def spec():
-    return json.loads((GOLDEN / "sweetspot-3x10.json").read_text())
+    return json.loads((GOLDEN / "sweetspot-3x10.json").read_text(encoding="utf-8"))
 
 
 def test_the_js_literal_is_the_same_file_safely_quoted(spec):
@@ -63,7 +63,7 @@ def test_an_unwritable_out_path_says_whose_filesystem_it_is(spec, tmp_path):
     is as blind as the first.
     """
     blocked = tmp_path / "wall"
-    blocked.write_text("not a directory")
+    blocked.write_text("not a directory", encoding="utf-8")
     result = json.loads(render_zwo(spec, out_path=str(blocked / "sub" / "x.zwo")))
     assert result["ok"] is True, "a failed write must not lose the rendered file"
     assert result["written_to"] is None
@@ -75,7 +75,7 @@ def test_a_good_out_path_still_reports_where_it_landed(spec, tmp_path):
     result = json.loads(render_zwo(spec, out_path=str(target)))
     assert result["written_to"] == str(target)
     assert "write_error" not in result
-    assert target.read_text() == result["xml"]
+    assert target.read_text(encoding="utf-8") == result["xml"]
 
 
 def test_verify_mywhoosh_import_blocks_on_an_unchanged_header(spec):
@@ -359,7 +359,7 @@ def test_out_path_writes_a_digest_beside_the_payload(spec, tmp_path):
     target = tmp_path / "t.garmin.json"
     result = json.loads(render_garmin(spec, out_path=str(target)))
     sidecar = Path(result["digest_written_to"])
-    assert sidecar.read_text().strip() == result["payload_digest"]
+    assert sidecar.read_text(encoding="utf-8").strip() == result["payload_digest"]
     assert sidecar.name == "t.garmin.json.sha256"
 
 
@@ -424,7 +424,7 @@ def test_the_checklist_ships_with_the_render(rendered):
 def test_out_path_writes_the_checklist_too(spec, tmp_path):
     target = tmp_path / "t.garmin.json"
     result = json.loads(render_garmin(spec, out_path=str(target)))
-    written = Path(result["checklist_written_to"]).read_text()
+    written = Path(result["checklist_written_to"]).read_text(encoding="utf-8")
     assert written.splitlines() == result["ui_checklist"]
 
 
@@ -442,3 +442,18 @@ def test_server_info_makes_the_build_sayable():
     # Distinguishes a local editable checkout from a uvx cache in one glance.
     assert info["package_path"].endswith("cycling_mcp")
     assert info["uploads"] is False
+
+
+def test_written_files_are_utf8_regardless_of_platform_default(spec, tmp_path):
+    """Windows defaults text I/O to cp1252, so "UTF-8" has to be explicit.
+
+    The checklist carries '·' separators and the word 'Récupération'; a test
+    that read it back at the platform default passed on macOS and failed in CI
+    on Windows. Assert against the bytes, so the check does not depend on
+    whatever locale happens to be running it.
+    """
+    target = tmp_path / "t.garmin.json"
+    result = json.loads(render_garmin(spec, out_path=str(target)))
+    raw = Path(result["checklist_written_to"]).read_bytes()
+    assert raw.decode("utf-8").splitlines() == result["ui_checklist"]
+    assert "Récupération".encode() in raw

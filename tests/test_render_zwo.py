@@ -12,7 +12,7 @@ GOLDEN = Path(__file__).parent / "golden"
 
 @pytest.fixture
 def sweetspot():
-    return load_spec(json.loads((GOLDEN / "sweetspot-3x10.json").read_text()))
+    return load_spec(json.loads((GOLDEN / "sweetspot-3x10.json").read_text(encoding="utf-8")))
 
 
 def render(spec: dict) -> str:
@@ -21,7 +21,7 @@ def render(spec: dict) -> str:
 
 def test_matches_the_golden_file(sweetspot):
     """The 70 min sweet-spot session that imported cleanly into MyWhoosh."""
-    assert render_zwo(sweetspot)[0] == (GOLDEN / "sweetspot-3x10.zwo").read_text()
+    assert render_zwo(sweetspot)[0] == (GOLDEN / "sweetspot-3x10.zwo").read_text(encoding="utf-8")
 
 
 def test_emitted_xml_parses(sweetspot):

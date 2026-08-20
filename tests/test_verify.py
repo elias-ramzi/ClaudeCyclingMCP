@@ -19,7 +19,7 @@ GOLDEN = Path(__file__).parent / "golden"
 
 @pytest.fixture
 def recorded():
-    return json.loads((GOLDEN / "recorded_roundtrip.json").read_text())
+    return json.loads((GOLDEN / "recorded_roundtrip.json").read_text(encoding="utf-8"))
 
 
 def test_a_real_exchange_compares_clean(recorded):

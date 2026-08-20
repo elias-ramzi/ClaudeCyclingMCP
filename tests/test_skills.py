@@ -134,7 +134,8 @@ def test_packaged_skills_are_found_without_the_repo(tmp_path, monkeypatch):
     packaged = tmp_path / "_skills" / "demo"
     packaged.mkdir(parents=True)
     (packaged / "SKILL.md").write_text(
-        "---\nname: demo\ndescription: A demo skill for testing.\n---\n\n# Demo\n\nDo the thing.\n"
+        "---\nname: demo\ndescription: A demo skill for testing.\n---\n\n# Demo\n\nDo the thing.\n",
+        encoding="utf-8",
     )
     monkeypatch.setattr(module, "__file__", str(tmp_path / "skills.py"))
     monkeypatch.delenv(module.ENV_SKILLS_DIR, raising=False)
@@ -145,7 +146,8 @@ def test_env_override_wins(tmp_path, monkeypatch):
     custom = tmp_path / "custom" / "override"
     custom.mkdir(parents=True)
     (custom / "SKILL.md").write_text(
-        "---\nname: override\ndescription: Overridden skill.\n---\n\n# Override\n\nBody.\n"
+        "---\nname: override\ndescription: Overridden skill.\n---\n\n# Override\n\nBody.\n",
+        encoding="utf-8",
     )
     from cycling_mcp.skills import ENV_SKILLS_DIR
 

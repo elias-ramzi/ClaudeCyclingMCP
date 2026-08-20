@@ -91,6 +91,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checked in one command.
 - **Guidance for a timed-out browser call**, which the skill had none of. A timeout says nothing
   about whether the action applied, and it is the case most likely to tempt a destructive retry.
+- **CI was red on Windows only.** Tests read files this project writes as UTF-8 using the platform
+  default encoding, which is cp1252 on Windows, so the `·` separators and `Récupération` in the
+  Garmin UI checklist came back mangled. The written files were always correct; the tests were
+  asserting something locale-dependent. Every read and write in the suite now names its encoding,
+  one test asserts the bytes rather than the decoded text, and ruff's `PLW1514` is enabled so the
+  next one is a lint error rather than a red build on one of nine matrix legs.
 - **`server_info`** — version, package path, Python, and the skills served. Four sessions in a row
   either reported findings against a build that no longer existed or could not state their build at
   all; the tool surface dates a session, but only alongside a version and a load path. `package_path`
