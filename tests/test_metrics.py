@@ -11,7 +11,7 @@ GOLDEN = Path(__file__).parent / "golden"
 
 @pytest.fixture
 def sweetspot():
-    return load_spec(json.loads((GOLDEN / "sweetspot-3x10.json").read_text()))
+    return load_spec(json.loads((GOLDEN / "sweetspot-3x10.json").read_text(encoding="utf-8")))
 
 
 def test_power_series_has_one_sample_per_second(sweetspot):

@@ -34,6 +34,13 @@ are `fraction × the FTP MyWhoosh has`. So if the session is "3 x 10 min at
 is ridden at 182 W — about 22% too easy — and **nothing anywhere reports a
 problem**. The file is valid; it is just scaled to a different athlete.
 
+**Unless the session is written in percentages.** If every block is
+`power_pct`, the percentages *are* the intent: they render to the same fractions
+under any FTP, so the builder's FTP changes only the watts displayed and the
+TSS/IF figures — nothing stored is rescaled. Still read it and still report a
+disagreement, but do not halt over one. The FTP is load-bearing exactly when the
+athlete gave watts.
+
 `get_cycling_ftp` reads **Garmin's** profile, which is a different number and
 frequently stale. It is a starting point, not the answer.
 
@@ -109,18 +116,27 @@ are located by their visible text, so a renamed button is the likely cause.
 
 You are in the editor and have not imported anything yet. The FTP and weight
 fields on this page are what MyWhoosh is currently working from — read them
-**before** importing, because import overwrites them with defaults.
+**before** importing, because import sometimes overwrites them with defaults
+(see Step 5) and you need the originals to restore.
 
 Read the values directly rather than from rendered text, which is easier to
 misparse:
 
 ```javascript
 [...document.querySelectorAll('input')]
-  .map(i => ({name: i.name || i.id || i.getAttribute('placeholder'), value: i.value}))
+  .map((i, index) => ({index, name: i.name || i.id || i.getAttribute('placeholder'), value: i.value}))
   .filter(x => x.value !== '');
 ```
 
-*Expect:* an FTP in watts and a weight in kg.
+*Expect:* an FTP in watts and a weight in kg — **each appearing twice**, e.g.
+`255, 72, 255, 72, ...`. That duplication is the same one Step 5 warns about
+(`find` returns two sets of refs, the second is the live one). `name`, `id` and
+`placeholder` all come back `null` on these fields, so the index is the only
+handle you have — which is why the snippet reports it.
+
+Agreement between the two copies is the normal case and means nothing is at
+risk. **If they disagree, use the second**, for the same reason Step 5 writes to
+the second. Say which you saw either way.
 
 **Then judge what you got, out loud:**
 
@@ -131,6 +147,12 @@ misparse:
 - **It disagrees with Garmin's `get_cycling_ftp`** → report both numbers and ask
   which is current. Do not silently prefer either. A stale Garmin value and a
   stale MyWhoosh value are both plausible.
+- **Both read exactly 200** → this is not corroboration, and it is the one case
+  where agreement is evidence of nothing. 200 W is MyWhoosh's default *and* a
+  common stale Garmin entry; two independent defaults colliding looks identical
+  to two sources confirming each other. Observed on 2026-08-19, when Garmin
+  returned 200 W (`is_stale: true`, MANUAL, 2025-01-18) while the builder held
+  the athlete's real 255 W. Ask.
 
 **Known limitation, worth stating rather than papering over:** this reads the
 *builder's* FTP field. Whether that field is populated from the athlete's
@@ -149,7 +171,16 @@ Now render:
    visible and cheap to fix.
 3. Call `render_zwo` with `out_path` set — for example
    `~/workouts/<filename>.zwo`. **Always keep the file on disk**, so a failed
-   export or a later re-upload does not need re-rendering.
+   export or a later re-upload does not need re-rendering. `out_path` resolves
+   on the machine running the MCP server, not wherever you are running; if the
+   write fails, the error names that machine's home directory.
+
+**Import exactly what was rendered — never a version you retyped or corrected.**
+If the XML looks wrong to you, say so and stop; do not fix it in flight. A run
+on 2026-08-19 read the returned `<name>` tag as `<n>` — a display artefact, not
+the file — and imported a hand-built substitute, leaving the file on disk and
+the file in MyWhoosh no longer identical. That divergence is invisible
+afterwards and defeats the point of keeping the file at all.
 
 *Sanity check before importing:* pick one block and confirm
 `watts ÷ spec.ftp` equals the fraction in the rendered file. If the session
@@ -162,37 +193,83 @@ tooltip is clipped by the chart container and resizing blocks needs
 pixel-accurate drags. Import the file instead.
 
 `file_upload` does **not** work here — it rejects filesystem paths. Construct
-the file in-page with `javascript_tool` and dispatch a change event. There are
-several file inputs including a hidden one; setting all of them is simpler than
-identifying the right one:
+the file in-page with `javascript_tool` and dispatch a change event.
+
+**Paste `xml_js_literal` from `render_zwo`, not `xml`.** It is the same file
+already escaped as a JavaScript string literal. Interpolating the raw XML into a
+template literal breaks on a backtick or a `${` in a workout name or message —
+text the athlete supplies, so it is reachable.
+
+There are several file inputs including a hidden one, and it is not obvious
+which is live. **Fire into one at a time**, checking the URL between each, and
+stop at the first that navigates. Run this once with `n = 0`, then `n = 1`, and
+so on until it navigates or you run out of inputs:
 
 ```javascript
-const zwoText = `...contents of the .zwo...`;
-const file = new File([zwoText], 'session-name.zwo', {type: 'application/xml'});
+const n = 0;
+const zwoText = "<paste xml_js_literal here, quotes included>";
+const inputs = [...document.querySelectorAll('input[type=file]')];
 const dt = new DataTransfer();
-dt.items.add(file);
-for (const inp of document.querySelectorAll('input[type=file]')) {
-  inp.files = dt.files;
-  inp.dispatchEvent(new Event('change', {bubbles: true}));
-}
+dt.items.add(new File([zwoText], 'session-name.zwo', {type: 'application/xml'}));
+inputs[n].files = dt.files;
+inputs[n].dispatchEvent(new Event('change', {bubbles: true}));
+({inputs: inputs.length, fired: n, href: location.href});
 ```
+
+Then read the page: if the URL is a new `/editor/<id>`, you are done — do not
+fire into the remaining inputs.
+
+**Do not loop over all of them in one call.** Doing so has been observed
+**wedging the page**: on 2026-08-19 the call never returned, CDP timed out at
+45 s, and the tab stayed unresponsive for another ~25 s before recovering with
+the import not applied. Three concurrent imports into the same React app is the
+likely cause.
 
 Use the exact filename from `render_zwo` — it becomes the library name.
 
 *Expect:* the page navigates to a **new** `/editor/<id>` and the chart now shows
 the workout's blocks.
 
-*If the URL doesn't change and the chart stays empty:* the import didn't take.
-Report that the change event fired but no navigation followed, and stop — do not
-retry blindly, and do not fall back to building blocks by hand.
+**If the call times out, it has told you nothing.** A timed-out
+`javascript_tool` is not evidence the import failed *or* succeeded — the page
+state is simply unknown. Wait for the tab to respond, re-read it, and compare
+against the Step 2 snapshot. Never re-fire the import to "make sure"; that is
+the move most likely to do damage.
+
+*If the URL doesn't change and `Workout Time` / `Training Load` still match the
+Step 2 snapshot:* the import didn't take. (Do not test for an *empty* chart —
+Step 2 says the editor often opens with a previous workout already in it, so the
+chart is rarely empty and that test would never fire.)
+
+## Step 4a — If the import didn't take
+
+Recover once, then stop. **Nothing in this recovery costs a credit** — credits
+are spent only by `EXPORT TO MYWHOOSH` — so a clean retry is free, and stopping
+dead at a recoverable failure helps nobody.
+
+Prefer a **fresh editor** over retrying in place: re-firing into an input that
+already holds the file is the genuinely risky move.
+
+1. Navigate to `/workouts-library`.
+2. Click **Create New** again for a new `/editor/<id>`.
+3. Take a fresh Step 2 snapshot, then re-run the import above.
+
+If the second attempt also fails, stop and report both attempts. Do not go
+round a third time, and **do not fall back to building blocks by hand** — the
+graphical editor is why this flow imports a file in the first place.
 
 ## Step 5 — Restore FTP and weight
 
-**Import resets FTP and weight to defaults (200 W / 62 kg).** Put back the
-values you read in Step 3 — you already have them, so this is restoring a known
-state, not guessing at one. If the FTP you settled on differs from what Step 3
-read (because it was the 200 W default, or the athlete corrected it), set the
-settled value.
+**Import may reset FTP and weight to defaults (200 W / 62 kg) — re-read both
+and restore only what actually changed.** It has been observed both ways: reset
+on 2026-08-12, and left at the athlete's 255 W / 72 kg on 2026-08-19. So verify
+rather than assume. Writing a value that is already correct is harmless in
+principle but this is a page where every stray interaction is a risk, so don't.
+
+If a value did change, put back what you read in Step 3 — you already have it,
+so this is restoring a known state, not guessing at one. If the FTP you settled
+on differs from what Step 3 read (because it was the 200 W default, or the
+athlete corrected it), set the settled value.
 
 The power fractions inside the file stay correct regardless — this field is a
 preview setting, so it changes what the athlete reads off the screen, not what
@@ -222,14 +299,33 @@ Check the header: it shows **`Workout Time`** and **`Training Load`**.
 - **`NaN` or `00:00` means the import silently failed.** Stop and report it. Do
   not proceed to export — that would spend a credit on a broken workout.
 
-**Compare against the Step 2 snapshot first.** If the name, `Workout Time` and
-`Training Load` are all unchanged from what was loaded before the import, the
-import did nothing — report that, regardless of whether the numbers happen to
-match your session. This check, not the duration, is what distinguishes a
-successful import from a silent no-op.
+**Do not eyeball this.** Call `verify_mywhoosh_import` with the spec, the
+header's `Workout Time` and `Training Load`, and the Step 2 snapshot as
+`before_workout_time` / `before_training_load`. It does all three checks at
+once — duration against the rendered session, Training Load against our TSS, and
+the header against the snapshot — and returns `safe_to_export`.
 
-Then cross-check `Workout Time` against the total from `describe_spec`. If they
-disagree, something was dropped on import; stop and report both numbers.
+**If `safe_to_export` is false, do not export.** Report its `problems` verbatim.
+Its `warnings` are worth reading out but do not block.
+
+**If the tool is unavailable — timeout, or the server is not answering — do not
+export either.** The header alone is not sufficient evidence; that is the whole
+reason this check exists, and a populated editor showing plausible numbers is
+exactly what a silent no-op looks like. Nothing before `EXPORT TO MYWHOOSH`
+costs a credit, so waiting is free and exporting on a guess is not. Say the
+check could not be run, leave the editor as it is, and resume once the server
+is back — the editor state and the `.zwo` on disk both survive.
+
+Worth knowing before you diagnose: no tool on this server has ever taken more
+than a few milliseconds. A timeout is a broken connection, not a slow
+computation, so retrying the same call immediately is unlikely to help and
+restarting the MCP server usually is.
+
+The snapshot argument is the one that matters most: if the name, `Workout Time`
+and `Training Load` are all unchanged from before the import, the import did
+nothing — regardless of whether those numbers happen to match your session. That
+check, not the duration, is what distinguishes a successful import from a silent
+no-op, and it is why Step 2 insists on writing the numbers down.
 
 ## Step 7 — Stop and confirm before exporting
 
@@ -241,6 +337,8 @@ user:
 
 - the workout name (i.e. the filename) as it will appear in their library
 - duration, IF and TSS from `describe_spec`
+- that `verify_mywhoosh_import` returned `safe_to_export`, and any warnings it
+  raised
 - the current slot counter value
 - any open question about the session
 

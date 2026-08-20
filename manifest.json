@@ -48,8 +48,24 @@
       "description": "Render the spec to a Garmin Connect workout payload"
     },
     {
+      "name": "check_garmin_payload",
+      "description": "Check a composed payload against the digest render_garmin issued, before uploading"
+    },
+    {
       "name": "verify_garmin_upload",
       "description": "Compare an uploaded Garmin workout against the payload that was sent"
+    },
+    {
+      "name": "verify_mywhoosh_import",
+      "description": "Check a MyWhoosh builder header against the session that was rendered, before export spends a credit"
+    },
+    {
+      "name": "server_info",
+      "description": "Identify this server: version, where it is loaded from, and what it serves"
+    },
+    {
+      "name": "get_skill",
+      "description": "Fetch a bundled upload procedure by name"
     },
     {
       "name": "spec_schema",

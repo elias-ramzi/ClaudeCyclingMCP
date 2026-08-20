@@ -26,7 +26,13 @@ Schema notes, all of them load-bearing (see README "Garmin schema provenance"):
 
 from __future__ import annotations
 
-from .spec import Block, Repeat, Workout
+from .spec import (
+    DEFAULT_TARGET_BAND_PCT,
+    RECOVERY_TARGET_BAND_PCT,
+    Block,
+    Repeat,
+    Workout,
+)
 
 SPORT_CYCLING = {"sportTypeId": 2, "sportTypeKey": "cycling"}
 
@@ -47,6 +53,28 @@ TARGET_NO_TARGET = {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target
 # docstring; id 6 silently becomes a pace target on a cycling workout.
 TARGET_POWER = {"workoutTargetTypeId": 2, "workoutTargetTypeKey": "power.zone"}
 TARGET_CADENCE = {"workoutTargetTypeId": 3, "workoutTargetTypeKey": "cadence"}
+
+# How wide a single-step ramp has to be before flattening it is worth a warning.
+# A few watts either side of a target reads as a band anyway; 20 W is where the
+# athlete would notice they were told to hold rather than climb.
+RAMP_LOSSY_WATTS = 20
+
+# The easy end of a session gets a wider band than the hard end. See the note
+# on RECOVERY_TARGET_BAND_PCT in spec.py for why one width does not fit both.
+ROLE_BAND_PCT = {
+    "interval": DEFAULT_TARGET_BAND_PCT,
+    "rest": DEFAULT_TARGET_BAND_PCT,
+    "recovery": RECOVERY_TARGET_BAND_PCT,
+    "warmup": RECOVERY_TARGET_BAND_PCT,
+    "cooldown": RECOVERY_TARGET_BAND_PCT,
+}
+
+
+def _band_pct(block: Block, workout: Workout) -> float:
+    """The band width for this block: the spec's override, or the role default."""
+    if workout.target_band_pct is not None:
+        return workout.target_band_pct
+    return ROLE_BAND_PCT.get(block.role, DEFAULT_TARGET_BAND_PCT)
 
 
 class _Counter:
@@ -81,11 +109,12 @@ def _watt_bounds(
     low_fraction, high_fraction = block.p_low, block.p_high
     assert low_fraction is not None and high_fraction is not None
 
+    band_pct = _band_pct(block, workout)
     if block.is_scalar_target:
         centre = low_fraction * workout.ftp
-        margin = centre * workout.target_band_pct / 100.0
+        margin = centre * band_pct / 100.0
         low, high = round(centre - margin), round(centre + margin)
-        if low == high and workout.target_band_pct > 0:
+        if low == high and band_pct > 0:
             low, high = low - 1, high + 1
     else:
         low, high = workout.watts(low_fraction), workout.watts(high_fraction)
@@ -96,6 +125,19 @@ def _watt_bounds(
             "garmin_target_band_pct is 0; most head units expect a range"
         )
     return low, high
+
+
+def target_band_watts(block: Block, workout: Workout) -> tuple[int, int] | None:
+    """The watt band this block will carry on Garmin, or None if it has none.
+
+    Exposed so `describe_spec` can show the band that actually ships. The
+    block table is where the skills say a wrong number is cheap to catch, and
+    band width is both invisible there and consequential on a head unit —
+    a tight corridor at VO2 power alarms continuously outdoors.
+    """
+    if block.kind != "steady" or not block.is_scalar_target:
+        return None
+    return _watt_bounds(block, workout, [], "")
 
 
 def _apply_cadence(step: dict, block: Block) -> None:
@@ -168,6 +210,29 @@ def _render_block(
             if low_w == high_w:
                 high_w = low_w + 1
             steps.append(_executable(block, counter.next(), seconds, TARGET_POWER, low_w, high_w))
+
+        # Say out loud that this rendering is lossy, in both the ways it is.
+        # A single step spanning the whole ramp displays on Garmin as a static
+        # band to hold, not a sweep; and because Garmin ranges are low-first,
+        # a descending ramp is reordered, so its direction survives only in the
+        # spec. Nothing downstream can recover either fact — a backwards
+        # cooldown and a correct one produce identical payloads, so the
+        # round-trip check passes on both. Observed 2026-08-19.
+        if block.ramp_steps == 1:
+            low_w = workout.watts(min(block.p_from, block.p_to))
+            high_w = workout.watts(max(block.p_from, block.p_to))
+            if high_w - low_w >= RAMP_LOSSY_WATTS:
+                direction = "down" if block.p_to < block.p_from else "up"
+                from_w = workout.watts(block.p_from)
+                to_w = workout.watts(block.p_to)
+                warnings.append(
+                    f"{where}: this {from_w}->{to_w} W ramp renders on Garmin as one "
+                    f"{low_w}-{high_w} W step — a band to hold, not a sweep. Garmin has no ramp "
+                    f"primitive and its ranges are low-first, so the fact that it goes "
+                    f"{direction} is not in the payload at all and no round-trip check can "
+                    f"catch it being wrong. Set ramp_steps > 1 to stair-step it. The .zwo "
+                    f"keeps the real ramp."
+                )
         return steps
 
     low, high = _watt_bounds(block, workout, warnings, where)
@@ -180,7 +245,10 @@ def render_garmin(workout: Workout) -> tuple[dict, list[str]]:
     counter = _Counter()
     steps: list[dict] = []
 
-    for index, node in enumerate(workout.nodes, start=1):
+    # 0-based, matching both spec.py's warning paths and the JSON array the
+    # author actually wrote. They disagreed until 2026-08-20, so one warning
+    # list could carry two "blocks[1]" labels meaning two different blocks.
+    for index, node in enumerate(workout.nodes):
         where = f"blocks[{index}]"
         if isinstance(node, Repeat):
             group: dict = {
@@ -193,7 +261,7 @@ def render_garmin(workout: Workout) -> tuple[dict, list[str]]:
                 "smartRepeat": False,
                 "workoutSteps": [],
             }
-            for child_index, child in enumerate(node.blocks, start=1):
+            for child_index, child in enumerate(node.blocks):
                 group["workoutSteps"].extend(
                     _render_block(
                         child, workout, counter, warnings, f"{where}.blocks[{child_index}]"

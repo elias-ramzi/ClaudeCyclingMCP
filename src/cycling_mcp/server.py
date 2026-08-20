@@ -9,6 +9,7 @@ a human in the loop, so it lives in the bundled skills instead — see
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +23,18 @@ from .metrics import compute_metrics, describe
 from .render_garmin import render_garmin as _render_garmin
 from .render_zwo import render_zwo as _render_zwo
 from .render_zwo import zwo_filename
-from .skills import Skill, build_skill_message, load_skills
-from .spec import SpecError, load_spec
+from .skills import Skill, _skills_dir, build_skill_message, load_skills
+from .spec import FTP_SOURCES, SpecError, load_spec
 from .spec import validate_spec as _validate_spec
-from .verify import compare_upload, total_step_seconds
+from .verify import (
+    compare_mywhoosh_import,
+    compare_upload,
+    diff_payloads,
+    payload_digest,
+    shape_problem,
+    total_step_seconds,
+    ui_checklist,
+)
 
 
 def _build_server():
@@ -70,12 +79,31 @@ SPEC_SCHEMA: dict[str, Any] = {
         },
         "garmin_target_band_pct": {
             "type": "number",
-            "default": 2.0,
             "description": (
                 "Half-width of the watt band placed around a scalar power target when "
-                "rendering for Garmin, which needs ranges. Ignored where the spec already "
-                "gives an explicit [low, high]."
+                "rendering for Garmin, which needs ranges. It is a percentage OF THE "
+                "RESOLVED TARGET, not of FTP: at 2.0, a 293 W target becomes 287-299 W "
+                "(+/-5.9 W) while a 128 W target becomes 125-131 W (+/-2.6 W). Ignored "
+                "where the spec already gives an explicit [low, high]. Omit it and the "
+                "width is chosen by role: "
+                "2% for interval and rest, 5% for recovery, warmup and cooldown — because "
+                "2% of a 140 W easy spin is a 6 W window that alarms continuously, while "
+                "2% of a 250 W interval is right. Setting it applies that one number "
+                "everywhere."
             ),
+        },
+        "ftp_source": {
+            "enum": list(FTP_SOURCES),
+            "description": (
+                "Optional. Where the FTP came from. A workout is a set of raw watts once "
+                "it is on the head unit, and a .zwo stores only fractions, so neither "
+                "file records which number produced it. Recorded in the describe_spec "
+                "header and in the .zwo description."
+            ),
+        },
+        "ftp_date": {
+            "type": "string",
+            "description": "Optional. When that FTP was established, e.g. '2026-08-19'.",
         },
         "blocks": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/block"}},
     },
@@ -93,7 +121,21 @@ SPEC_SCHEMA: dict[str, Any] = {
         },
         "block": {
             "type": "object",
-            "required": ["type", "duration"],
+            # A repeat has no duration of its own — it is the sum of its
+            # contents — so requiring one of every block told an author to add
+            # a key the server then reported as a probable typo. Branch on the
+            # type rather than requiring the union of both shapes.
+            "required": ["type"],
+            "allOf": [
+                {
+                    "if": {"properties": {"type": {"const": "repeat"}}},
+                    "then": {
+                        "required": ["count", "blocks"],
+                        "not": {"required": ["duration"]},
+                    },
+                    "else": {"required": ["duration"]},
+                }
+            ],
             "properties": {
                 "type": {"enum": ["steady", "ramp", "free", "repeat"]},
                 "duration": {"$ref": "#/$defs/duration"},
@@ -209,11 +251,37 @@ Design rules worth knowing before writing a spec:
 """
 
 
-def _write(out_path: str, content: str) -> str:
-    path = Path(out_path).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    return str(path)
+def _write(out_path: str, content: str) -> tuple[str | None, str | None]:
+    """Write to the *server's* filesystem, or explain why it could not.
+
+    A caller running in a container naturally reaches for a container path, and
+    the OS error for one is unhelpful: `/home/claude` on macOS fails with
+    ENOTSUP ("Operation not supported") from the autofs mount, which says
+    nothing about whose filesystem this is. So name the machine in the error —
+    an agent that knows the platform and home directory can retry correctly on
+    the first attempt instead of guessing.
+    """
+    try:
+        path = Path(out_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return None, (
+            f"Could not write {out_path!r}: {exc.strerror or exc}. out_path is "
+            f"resolved on the machine running this MCP server (platform "
+            f"{sys.platform}, home {Path.home()}), which may not be the "
+            f"filesystem you are working in. Try a path under {Path.home()}."
+        )
+    return str(path), None
+
+
+def _first_target_text(payload: dict) -> str | None:
+    """The first watt range in a payload, for use as a worked example."""
+    for line in ui_checklist(payload):
+        _, _, tail = line.rpartition("· ")
+        if tail.endswith(" W"):
+            return tail
+    return None
 
 
 def _dump(payload: dict) -> str:
@@ -277,7 +345,13 @@ def render_zwo(spec: dict, out_path: str | None = None) -> str:
     editable inside MyWhoosh's editor.
 
     Pass out_path to also write the file to disk; the content is returned either
-    way. Writing is the only filesystem access this server performs.
+    way. Writing is the only filesystem access this server performs, and it
+    happens on the machine running the server, which is not necessarily the
+    filesystem the caller is working in — a failed write says which.
+
+    "xml_js_literal" is the same XML as a ready-made JavaScript string literal.
+    Use it rather than interpolating "xml" into a template literal: a backtick
+    or a "${" in a workout name or message would otherwise break the script.
     """
     try:
         workout = load_spec(spec)
@@ -288,12 +362,21 @@ def render_zwo(spec: dict, out_path: str | None = None) -> str:
     result: dict[str, Any] = {
         "ok": True,
         "filename": zwo_filename(workout),
+        "next_step": "Call get_skill('mywhoosh-upload') and follow it.",
         "xml": xml,
+        # The MyWhoosh flow injects this XML into a page as JavaScript. A
+        # backtick or a "${" in an athlete's workout name or message text
+        # breaks a template literal and can inject, so ship a form that cannot:
+        # a complete JS string literal, ready to drop in as-is.
+        "xml_js_literal": json.dumps(xml),
         "warnings": workout.warnings + warnings,
         "summary": compute_metrics(workout).as_dict(),
     }
     if out_path:
-        result["written_to"] = _write(out_path, xml)
+        written, error = _write(out_path, xml)
+        result["written_to"] = written
+        if error:
+            result["write_error"] = error
     return _dump(result)
 
 
@@ -327,9 +410,15 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
 
     This server does not upload. Use the bundled garmin-upload skill, which
     uploads and then verifies by fetching the workout back and comparing it
-    against what was sent.
+    against what was sent — call get_skill("garmin-upload") to read it.
 
-    Pass out_path to also write the payload as JSON to disk.
+    "payload_digest" is a digest of the payload as rendered. You will retype
+    this payload into another tool's arguments, and a single wrong digit gives
+    a workout that uploads cleanly and is wrong. Pass what you composed to
+    check_garmin_payload with this digest BEFORE uploading.
+
+    Pass out_path to also write the payload as JSON to disk. That path is
+    resolved on the machine running this server; a failed write says so.
     """
     try:
         workout = load_spec(spec)
@@ -340,6 +429,37 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
     result: dict[str, Any] = {
         "ok": True,
         "payload": payload,
+        # Read at the moment of composing the upload call, which the docstring
+        # may not be. A model that never found the skill improvises the upload
+        # and skips verification entirely — reported 2026-08-19, where the
+        # skill only surfaced on a second, lucky tool search.
+        "next_step": (
+            "Call get_skill('garmin-upload') and follow it. Before uploading, pass the "
+            "payload you composed to check_garmin_payload with BOTH payload_digest and "
+            "spec — the spec diff names the field that moved, the digest only says one "
+            "did."
+        ),
+        "payload_digest": payload_digest(payload),
+        # Returned here, not only from check_garmin_payload, because this is
+        # the manual-verification fallback for when the Garmin read is
+        # unavailable — and a fallback that requires another call to this
+        # server is no fallback when this server is the thing that stopped
+        # answering. Reported after two 4-minute timeouts, 2026-08-20.
+        "ui_checklist": ui_checklist(payload),
+        # The curated read drops targetValueUnit, so no round-trip can prove a
+        # target was stored as watts rather than %FTP. That leaves a visual
+        # check as the only evidence — which needs a concrete criterion, not
+        # "open it once and see if it looks right".
+        "expected_display": (
+            "Every power target should read in watts on the head unit, e.g. "
+            + (
+                f"'{_first_target_text(payload)}'. "
+                if _first_target_text(payload)
+                else "'245-255 W'. "
+            )
+            + "If any reads as a percentage or as a zone number instead, targetValueUnit "
+            "was added somewhere and the workout is scaled to the wrong athlete."
+        ),
         "warnings": workout.warnings + warnings,
         "summary": compute_metrics(workout).as_dict(),
         # Travels with the payload so a client reading it later does not
@@ -347,12 +467,98 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
         "schema_notes": GARMIN_SCHEMA_NOTES,
     }
     if out_path:
-        result["written_to"] = _write(out_path, _dump(payload))
+        written, error = _write(out_path, _dump(payload))
+        result["written_to"] = written
+        if error:
+            result["write_error"] = error
+        else:
+            # A digest beside the file answers, in a later session with none of
+            # this context, whether the JSON on disk is still the JSON that was
+            # rendered. Without it a re-upload months later is an act of faith.
+            sidecar, sidecar_error = _write(f"{out_path}.sha256", result["payload_digest"] + "\n")
+            if sidecar:
+                result["digest_written_to"] = sidecar
+            else:
+                result["write_error"] = sidecar_error
+            checklist, _ = _write(f"{out_path}.checklist.txt", "\n".join(result["ui_checklist"]))
+            if checklist:
+                result["checklist_written_to"] = checklist
     return _dump(result)
 
 
 @app.tool()
-def verify_garmin_upload(payload: dict, fetched: dict) -> str:
+def check_garmin_payload(
+    payload: dict, expected_digest: str | None = None, spec: dict | None = None
+) -> str:
+    """Check a payload you composed against the one the renderer produced.
+
+    Call this BEFORE upload_workout, every time. render_garmin returns the
+    payload as text into your context, and upload_workout takes an object you
+    compose — so "hand it over unchanged" really means retyping ~90 lines of
+    nested JSON. A single wrong digit in targetValueOne produces a workout that
+    uploads without error, passes verify_garmin_upload (which compares Garmin
+    against what you *sent*, not against what was rendered), and is wrong.
+
+    Pass the payload you are about to upload and the "payload_digest" from
+    render_garmin. A mismatch means what you composed is not what was rendered:
+    re-copy it rather than hunting for the difference.
+
+    Also returns ui_checklist — what each step should read in the Garmin UI.
+    That is the fallback verification when get_workout_by_id is unavailable.
+
+    Pass `spec` as well, or instead, to get a field-by-field diff: the spec is
+    re-rendered here and compared against the payload you supply. That answers
+    the question directly — was this payload altered after rendering? — and
+    names the step and field, rather than only saying that something differs.
+
+    Pure comparison, no network access.
+    """
+    actual = payload_digest(payload)
+    result: dict[str, Any] = {
+        "digest": actual,
+        "step_seconds": total_step_seconds(payload),
+        "ui_checklist": ui_checklist(payload),
+    }
+
+    if spec is not None:
+        try:
+            expected, _ = _render_garmin(load_spec(spec))
+        except SpecError as exc:
+            result["spec_errors"] = exc.errors
+        else:
+            differences = diff_payloads(expected, payload)
+            result["matches_spec"] = not differences
+            result["differences_from_spec"] = differences
+            if differences:
+                result["problem"] = (
+                    "The payload you composed is not what this spec renders to. Do not "
+                    "upload it — re-copy the payload from render_garmin."
+                )
+    if expected_digest is None:
+        result["digest_checked"] = False
+        if spec is None:
+            # Neither reference given, so nothing was actually checked. Say so
+            # rather than returning a bare digest that reads like a pass.
+            result["warning"] = (
+                "Nothing was compared: pass expected_digest (from render_garmin) or spec "
+                "to check this payload against what the renderer produces."
+            )
+        return _dump(result)
+
+    result["digest_checked"] = True
+    result["matches_rendered"] = actual == expected_digest.strip()
+    if not result["matches_rendered"]:
+        result["problem"] = (
+            f"This payload digests to {actual}, but render_garmin issued "
+            f"{expected_digest.strip()}. What you composed is not what was "
+            "rendered. Do not upload it — copy the payload from render_garmin again. "
+            "(If the payload is right and the digest was mistyped, re-render and compare.)"
+        )
+    return _dump(result)
+
+
+@app.tool()
+def verify_garmin_upload(payload: dict, fetched: dict, expected_digest: str | None = None) -> str:
     """Check that Garmin stored the workout that was actually sent.
 
     Pass the payload given to upload_workout, and the response from
@@ -364,6 +570,11 @@ def verify_garmin_upload(payload: dict, fetched: dict) -> str:
     projection that will happily agree with a wrong-units payload. It also
     catches a repeat count silently corrupted by a missing conditionTypeId.
 
+    Pass expected_digest (render_garmin's "payload_digest") to also check that
+    what you sent is what was rendered. Without it this proves only that Garmin
+    kept what it was given — which a payload mistyped on its way out of your
+    context would also pass.
+
     Two things it cannot prove: whether a power target was stored as watts or
     as %FTP (the curated read drops the targetValueUnit field that distinguishes
     them), and whether the workout displays correctly on a head unit. Confirm
@@ -371,15 +582,115 @@ def verify_garmin_upload(payload: dict, fetched: dict) -> str:
 
     Pure comparison, no network access.
     """
+    # Refuse a misused comparison rather than diffing two different shapes.
+    # Failing open here is worse than not checking at all: the skill's response
+    # to a mismatch is to delete the workout.
+    misuse = shape_problem(payload, fetched)
+    if misuse:
+        return _dump({"ok": False, "error": "shape_mismatch", "detail": misuse})
+
     problems = compare_upload(payload, fetched)
+    result: dict[str, Any] = {
+        "ok": True,
+        "match": not problems,
+        "differences": problems,
+        "sent_step_seconds": total_step_seconds(payload),
+        "note": (
+            "Garmin's estimated_duration_seconds follows its own rules and can "
+            "disagree with the sum of the steps; it is not used for this check."
+        ),
+    }
+    if expected_digest is not None:
+        # This check is upstream of the round-trip: it asks whether the payload
+        # that was sent is the payload that was rendered. A match here plus a
+        # match above is the only combination that means end-to-end correct.
+        result["matches_rendered"] = payload_digest(payload) == expected_digest.strip()
+        if not result["matches_rendered"]:
+            result["match"] = False
+            result["differences"] = [
+                *result["differences"],
+                "The payload sent is not the payload render_garmin produced — it was "
+                "altered or mistyped between rendering and upload. Garmin storing it "
+                "faithfully does not make it right.",
+            ]
+    return _dump(result)
+
+
+@app.tool()
+def verify_mywhoosh_import(
+    spec: dict,
+    workout_time: str,
+    training_load: float | str | None = None,
+    before_workout_time: str | None = None,
+    before_training_load: float | str | None = None,
+) -> str:
+    """Check a MyWhoosh builder header against the session that was rendered.
+
+    Call this after importing a .zwo and before clicking EXPORT TO MYWHOOSH.
+    MyWhoosh has no API to read a workout back, so its header is the only
+    evidence the import took — and export spends an irreversible slot credit,
+    which is too much to hang on eyeballing two numbers.
+
+    Pass the header's `Workout Time` (as shown, e.g. "68:00") and
+    `Training Load`. Pass the pre-import values as before_* too: they are what
+    distinguishes a real import from a silent no-op, because "Create New"
+    routinely opens an editor already holding a previous workout. Without them
+    a header that matches the session might just be what was already loaded.
+
+    Returns safe_to_export plus the individual checks. Pure comparison, no
+    network and no browser access — it compares numbers you scraped.
+    """
+    try:
+        workout = load_spec(spec)
+    except SpecError as exc:
+        return _dump({"ok": False, "errors": exc.errors})
+
+    metrics = compute_metrics(workout)
+    before = None
+    if before_workout_time is not None or before_training_load is not None:
+        before = {"workout_time": before_workout_time, "training_load": before_training_load}
+
+    result = compare_mywhoosh_import(
+        expected_seconds=metrics.total_seconds,
+        expected_tss=metrics.tss,
+        workout_time=workout_time,
+        training_load=training_load,
+        before=before,
+    )
+    result["expected"] = {
+        "duration": metrics.as_dict()["total_duration"],
+        "tss": round(metrics.tss, 1),
+        "intensity_factor": round(metrics.intensity_factor, 3),
+    }
+    return _dump(result)
+
+
+@app.tool()
+def server_info() -> str:
+    """Identify this server: version, where it is loaded from, what it serves.
+
+    Call it when reporting a problem with this server, or when you want to know
+    whether the build you are talking to is the one you expect. A tool surface
+    is a build fingerprint — a tool that exists in one release and not another
+    dates a session precisely — but only if you can see it alongside a version.
+
+    It also answers instantly and touches nothing, so a reply is proof the
+    server is alive and a non-reply is not about this server being slow: no
+    tool here has ever taken more than a few milliseconds.
+    """
+    skills = load_skills()
     return _dump(
         {
-            "match": not problems,
-            "differences": problems,
-            "sent_step_seconds": total_step_seconds(payload),
+            "name": "claude-cycling-mcp",
+            "version": __version__,
+            "package_path": str(Path(__file__).resolve().parent),
+            "python": sys.version.split()[0],
+            "skills": [skill.name for skill in skills],
+            "skills_dir": str(_skills_dir()),
+            "uploads": False,
             "note": (
-                "Garmin's estimated_duration_seconds follows its own rules and can "
-                "disagree with the sum of the steps; it is not used for this check."
+                "This server is pure: no network, no credentials, no uploads. The only "
+                "filesystem access is writing a rendered file when out_path is given."
             ),
         }
     )
@@ -389,10 +700,16 @@ def verify_garmin_upload(payload: dict, fetched: dict) -> str:
 def get_skill(name: str | None = None) -> str:
     """Fetch a bundled procedure for uploading a workout to a platform.
 
+    Read this before uploading, scheduling, or exporting a rendered cycling
+    workout — a .zwo to MyWhoosh, or a Garmin Connect payload to a watch or
+    head unit. The procedures cover FTP sourcing, the upload call, verifying
+    the stored result, and the traps that fail silently.
+
     Call this whenever you are asked to follow, use, or run one of this
     server's skills by name — for example "use the mywhoosh-upload skill" — or
     when you are asked to put a workout onto MyWhoosh or Garmin Connect and want
-    the procedure rather than improvising one.
+    the procedure rather than improvising one. If you have rendered a workout
+    and are about to send it somewhere, you want this first.
 
     Omit `name` to list what is available. Pass a name to get that skill's full
     instructions, which you should then follow step by step.

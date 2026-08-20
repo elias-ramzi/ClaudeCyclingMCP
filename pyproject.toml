@@ -25,6 +25,10 @@ dev = [
     # 3.10 has no stdlib tomllib; without this the version lock-step test would
     # skip there rather than run.
     "tomli>=2.0; python_version < '3.11'",
+    # The spec schema is published to callers, so a test validates real specs
+    # against it. mcp happens to pull this in today; depending on that would
+    # make the check vanish silently if it ever stopped.
+    "jsonschema>=4.0",
 ]
 live = ["garminconnect>=0.2.25"]  # only for the live Garmin round-trip test
 
@@ -51,6 +55,10 @@ target-version = "py310"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
+# PLW1514 is preview-only, and explicit-preview-rules keeps that opt-in to
+# this one rule rather than to preview as a whole.
+preview = true
+explicit-preview-rules = true
 select = [
     "E",   # pycodestyle errors
     "F",   # pyflakes
@@ -59,6 +67,10 @@ select = [
     "B",   # bugbear
     "SIM", # simplify
     "RUF",
+    # Every file this project writes is UTF-8, so reading one back at the
+    # platform default is a bug — and one that only shows on Windows, where
+    # the default is cp1252. Caught in CI rather than by review.
+    "PLW1514",
 ]
 ignore = [
     "E501",   # line length is enforced by the formatter, not the linter

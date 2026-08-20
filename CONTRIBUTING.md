@@ -75,3 +75,24 @@ pytest -m live      # adds the real Garmin round-trip; needs tokens
 ```
 
 The offline suite is fast and hermetic. No test writes outside a tmp directory.
+
+## Before filing that a tool is wrong
+
+Every tool on this server is pure, so re-running one is free and instant. Use that.
+
+Twice now, a report has attributed a difference to a tool when the two outputs came from
+**different inputs**: once claiming `render_garmin` swallowed a validation warning it does in fact
+propagate, and once claiming the `.zwo` renderer emits `<n>` instead of `<name>` — a display
+artefact in the reporter's own transcript, "fixed" by importing a hand-built file, so the file on
+disk and the file on the platform silently diverged. That divergence is the exact failure this
+repo's golden files exist to prevent.
+
+So before filing:
+
+1. **Re-run the exact call on the exact input** and paste what came back.
+2. **Separate observed from inferred**, and say which is which.
+3. **Say which build you were on.** Listing the tool names is enough — a tool that was added or
+   renamed dates the session precisely, and three reports have described builds that no longer
+   existed.
+
+A report that does these three things is worth more than one twice as long that does not.

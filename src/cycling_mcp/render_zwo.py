@@ -95,6 +95,14 @@ def _element(block: Block, warnings: list[str], where: str) -> list[str]:
     return [opening + ">", *[f"    {event}" for event in events], f"</{tag}>"]
 
 
+def _description_text(workout: Workout) -> str:
+    provenance = workout.ftp_provenance()
+    if not provenance:
+        return workout.description
+    note = f"Built against FTP {workout.ftp} W ({provenance})."
+    return f"{workout.description} {note}".strip()
+
+
 def render_zwo(workout: Workout) -> tuple[str, list[str]]:
     """Return the `.zwo` XML and any warnings raised while rendering."""
     warnings: list[str] = []
@@ -109,18 +117,27 @@ def render_zwo(workout: Workout) -> tuple[str, list[str]]:
         "<workout_file>",
         f"    <author>{escape(folded(workout.author, 'author'))}</author>",
         f"    <name>{escape(folded(workout.name, 'name'))}</name>",
-        f"    <description>{escape(folded(workout.description, 'description'))}</description>",
+        # The FTP a .zwo was built against is not recoverable from the file —
+        # it stores fractions — so when the spec records where the number came
+        # from, that goes in the one field the athlete can still read later.
+        f"    <description>{escape(folded(_description_text(workout), 'description'))}</description>",
         "    <sportType>bike</sportType>",
         "    <tags></tags>",
         "    <workout>",
     ]
 
-    for index, node in enumerate(workout.nodes, start=1):
+    for index, node in enumerate(workout.nodes):
         if isinstance(node, Repeat):
             for iteration in range(node.count):
-                for child_index, child in enumerate(node.blocks, start=1):
-                    where = f"blocks[{index}] rep {iteration + 1}/{node.count} block {child_index}"
-                    lines.extend(f"        {line}" for line in _element(child, warnings, where))
+                for child_index, child in enumerate(node.blocks):
+                    # Repeats are flattened for MyWhoosh, so each child is
+                    # emitted `count` times — but it was authored once, and a
+                    # warning about its content is one fact, not `count` facts.
+                    # Collect only on the first pass, and name where the author
+                    # can find it rather than which repetition produced it.
+                    sink = warnings if iteration == 0 else []
+                    where = f"blocks[{index}].blocks[{child_index}]"
+                    lines.extend(f"        {line}" for line in _element(child, sink, where))
         else:
             lines.extend(f"        {line}" for line in _element(node, warnings, f"blocks[{index}]"))
 

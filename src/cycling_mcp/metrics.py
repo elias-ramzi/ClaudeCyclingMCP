@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .render_garmin import target_band_watts
 from .spec import Block, Repeat, Workout, format_duration
 
 # A free-ride block has no target, so it cannot contribute a real number. It is
@@ -129,6 +130,18 @@ def _target_text(block: Block, workout: Workout) -> str:
     )
 
 
+def _band_text(block: Block, workout: Workout) -> str:
+    """What Garmin will actually show for a scalar target.
+
+    A single number cannot be a Garmin target, so one becomes a band — and the
+    band is wider at the easy end of the session than the hard end. That is
+    deliberate, but it is a difference the athlete should be able to see here
+    rather than discover on the bike.
+    """
+    band = target_band_watts(block, workout)
+    return f"{band[0]}-{band[1]} W" if band else ""
+
+
 def _cadence_text(block: Block) -> str:
     if block.cadence_low is None:
         return ""
@@ -161,6 +174,7 @@ def describe(workout: Workout) -> str:
                     "",
                     "",
                     "",
+                    "",
                 )
             )
             for child_index, child in enumerate(node.blocks, start=1):
@@ -171,6 +185,7 @@ def describe(workout: Workout) -> str:
                         format_duration(child.duration_s),
                         "",
                         _target_text(child, workout),
+                        _band_text(child, workout),
                         _cadence_text(child),
                         _notes_text(child),
                     )
@@ -184,12 +199,18 @@ def describe(workout: Workout) -> str:
                     format_duration(node.duration_s),
                     format_duration(elapsed),
                     _target_text(node, workout),
+                    _band_text(node, workout),
                     _cadence_text(node),
                     _notes_text(node),
                 )
             )
 
-    headers = ("#", "Block", "Dur", "Elapsed", "Target", "Cadence", "Notes")
+    headers = ("#", "Block", "Dur", "Elapsed", "Target", "Garmin", "Cadence", "Notes")
+    if not any(row[5] for row in rows):
+        # Nothing to say — every target is already a range, a ramp or a free
+        # ride. An empty column is worse than no column.
+        headers = tuple(h for h in headers if h != "Garmin")
+        rows = [row[:5] + row[6:] for row in rows]
     widths = [
         max(len(headers[column]), *(len(row[column]) for row in rows))
         for column in range(len(headers))
@@ -198,7 +219,10 @@ def describe(workout: Workout) -> str:
     def line(values: tuple[str, ...]) -> str:
         return "  ".join(value.ljust(widths[i]) for i, value in enumerate(values)).rstrip()
 
+    provenance = workout.ftp_provenance()
     header_text = f"{workout.name}  —  FTP {workout.ftp} W"
+    if provenance:
+        header_text += f" ({provenance})"
     summary = (
         f"{format_duration(stats.total_seconds)} total · "
         f"NP {stats.normalised_power} W · IF {stats.intensity_factor:.2f} · "
@@ -213,6 +237,21 @@ def describe(workout: Workout) -> str:
         body.append(
             f"Note: free-ride blocks are scored at {FREE_RIDE_ASSUMED_FRACTION * 100:.0f}% FTP, "
             "so IF and TSS are approximate."
+        )
+
+    # The arrow in a ramp row reads as a sweep, and this table is what the
+    # skills tell you to show the athlete — so it is the wrong place to leave
+    # the Garmin flattening unsaid. The .zwo does ramp properly; only Garmin
+    # needs the caveat, so name the platform rather than qualifying the row.
+    flat = [b for b in workout.steps() if b.kind == "ramp" and b.ramp_steps == 1]
+    if flat:
+        body.append("")
+        body.append(
+            f"Note: {len(flat)} ramp{'s' if len(flat) > 1 else ''} above "
+            f"{'show' if len(flat) > 1 else 'shows'} a sweep. "
+            "MyWhoosh rides that sweep; Garmin has no ramp primitive, so each becomes one "
+            "step showing the whole range as a band to hold. Set ramp_steps > 1 to "
+            "stair-step it for Garmin."
         )
     if workout.warnings:
         body.append("")

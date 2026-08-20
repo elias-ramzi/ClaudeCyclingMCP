@@ -17,7 +17,7 @@ spec (JSON) → validate → resolved Workout tree ──┬── render_zwo   
 | `metrics.py` | 1 Hz power series, NP/IF/TSS, and the `describe_spec` table. |
 | `render_zwo.py` | MyWhoosh XML. Hand-built strings, not ElementTree, to control the exact format. |
 | `render_garmin.py` | Garmin `upload_workout` payload. |
-| `verify.py` | compare a sent payload against what Garmin returns. |
+| `verify.py` | compare what a platform stored against what was sent: Garmin's returned payload, and MyWhoosh's scraped builder header. |
 | `skills.py` | load `.claude/skills/*/SKILL.md` and serve them as MCP prompts. |
 | `server.py` | the MCP tool surface. Thin — logic lives in the modules above. |
 
