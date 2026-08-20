@@ -138,7 +138,18 @@ Agreement between the two copies is the normal case and means nothing is at
 risk. **If they disagree, use the second**, for the same reason Step 5 writes to
 the second. Say which you saw either way.
 
-**Then judge what you got, out loud:**
+**Then judge what you got, out loud.** Which of the two branches below applies
+depends on how the athlete wrote the session, so settle that first:
+
+- **Targets in watts** → the FTP is load-bearing. It is the number that converts
+  those watts into the fractions actually stored, so a wrong one silently
+  rescales the whole session. Work through the cases below and resolve any
+  disagreement before rendering.
+- **Targets in percentages** → the FTP only moves displayed watts and the
+  TSS/IF figures; the stored fractions are identical under any FTP. Still read
+  it, still report a disagreement, but do not halt over one.
+
+The cases:
 
 - **A plausible athlete FTP** (not 200) → render against it.
 - **Exactly 200 W / 62 kg** → these are MyWhoosh's defaults. That is not
@@ -282,6 +293,11 @@ should now agree with the `describe_spec` table from Step 3; if they don't, the
 FTP in the field and the FTP you rendered against have diverged — stop and
 resolve that before exporting.
 
+Re-running Step 3's snippet here also returns a new row at index 0 —
+`contained-button-file` holding `C:\fakepath\<name>.zwo`. That is expected
+after an import, and its presence is weak corroboration that the file input
+took. It is not one of the duplicated FTP/weight rows.
+
 Set both with `form_input`. **Do not use `triple_click` + `type`** — typing does
 not stick on these number fields.
 
@@ -348,15 +364,33 @@ blocks in the graphical editor.
 
 ## Step 8 — Export and confirm it landed
 
-Click `EXPORT TO MYWHOOSH` via `find` → `ref`.
+Locate it with `find` and click the returned ref. **`find` returns two refs for
+this button, both described as exact matches — use the second**, for the same
+reason Step 5 uses the second set for the FTP fields. Confirmed working
+2026-08-21: the second ref exported, redirected, and decremented the counter by
+one. What the first ref does has never been established, so do not click it to
+find out — this is the one irreversible control on the page, and "nothing
+happened" is the observation most likely to produce a second click and a second
+credit.
 
-*Expect:* a redirect to the workout library.
+*Expect:* a redirect to the workout library, landing on the **Collections** tab.
+Switch to **My Workouts** to see the session.
 
 Then verify it actually exists — clicking the button is not the same as the
 workout being there:
 
-1. **My Workouts** tab lists the session, with a duration, TSS and IF.
+1. **My Workouts** tab lists the session, with a duration, TSS and IF. Pass
+   those to `verify_mywhoosh_library_entry` along with the spec rather than
+   comparing them by eye — the credit is already spent, so this is about
+   knowing precisely what it bought.
 2. The **slot counter has decremented by one**.
+
+**The card renders the name with a multiplication sign.** An uploaded
+`Tempo-3x14` displays as `Tempo-3×14`, while the editor header showed the ASCII
+form — so the substitution happens at export or at library render. Whether the
+stored name carries `×` has not been established. `verify_mywhoosh_library_entry`
+folds the two together, so this is not a mismatch and should not be reported as
+one.
 
 *If the redirect happened but the workout is not in My Workouts:* report that,
 and check the slot counter — if it decremented, a credit was spent without a

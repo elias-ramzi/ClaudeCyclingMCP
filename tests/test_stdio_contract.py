@@ -188,3 +188,41 @@ def test_every_tool_answers_over_stdio(client, spec):
     assert client.call("render_garmin", spec=spec)["ok"] is True
     assert client.call("spec_schema")["schema"]
     assert client.call("get_skill", name="mywhoosh-upload")
+
+
+def test_a_missing_snapshot_blocks_over_stdio(client, spec):
+    """Two checks that both pass on a no-op are not evidence of success."""
+    result = client.call(
+        "verify_mywhoosh_import", spec=spec, workout_time="1:10:00", training_load=70
+    )
+    assert result["safe_to_export"] is False
+    assert any("did not run" in p for p in result["problems"])
+
+
+def test_the_library_card_that_actually_landed(client, spec):
+    """The real card from the 2026-08-21 export, in the card's own formats.
+
+    "1h 18m" not "78:00", and the name rendered with U+00D7 while the ASCII
+    form was uploaded.
+    """
+    result = client.call(
+        "verify_mywhoosh_library_entry",
+        spec={**spec, "filename": "Tempo-3x14"},
+        name="Tempo-3×14",
+        duration="1h 10m",
+        tss=70,
+        intensity_factor=0.77,
+    )
+    assert result["landed"] is True, result
+    assert result["problems"] == []
+
+
+def test_a_library_card_for_a_different_workout_is_caught(client, spec):
+    result = client.call(
+        "verify_mywhoosh_library_entry",
+        spec={**spec, "filename": "Tempo-3x14"},
+        name="Sweet-Spot-3x11",
+        duration="1h 08m",
+    )
+    assert result["landed"] is False
+    assert any("different workout" in p for p in result["problems"])

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 # Garmin normalises a target's key from its numeric id, which it treats as
@@ -484,11 +485,23 @@ def compare_mywhoosh_import(
         )
 
     if before is None:
-        warnings.append(
-            "No pre-import snapshot given, so a silent no-op cannot be ruled out: a "
-            "header matching the session could be a workout that was already loaded. "
-            "Capture Workout Time and Training Load before importing (Step 2)."
+        # Not a warning. On a real no-op both numeric checks above pass — that
+        # is precisely how the failure presents — so without the snapshot this
+        # tool cannot distinguish success from nothing having happened, and
+        # saying "safe to export" on the strength of two checks that provably
+        # do not discriminate is worse than saying nothing.
+        #
+        # Blocking here does not train an operator to override, because the
+        # remedy is free: no credit is spent before export, so a fresh editor
+        # and a re-import cost only time.
+        problems.append(
+            "No pre-import snapshot given, so the check that distinguishes a real import "
+            "from a silent no-op did not run — and on a no-op the duration and Training "
+            "Load checks both pass, which is exactly how it hides. Start again from a "
+            "fresh editor, note Workout Time and Training Load before importing, and "
+            "re-run this. Nothing before EXPORT TO MYWHOOSH costs a credit."
         )
+        checks.append({"check": "changed_from_snapshot", "observed": None, "ok": False})
     else:
         before_seconds = _parse_clock(before.get("workout_time"))
         same_time = before_seconds is not None and before_seconds == observed_seconds
@@ -687,3 +700,138 @@ def diff_payloads(expected: dict, actual: dict, path: str = "") -> list[str]:
     if expected != actual:
         problems.append(f"{path}: expected {expected!r}, got {actual!r}")
     return problems
+
+
+# What MyWhoosh's library card shows, versus what was uploaded. The card is the
+# only evidence the export produced a workout rather than just a redirect, and
+# until now it was compared by eye — the same manual check the pre-export tool
+# exists to replace.
+
+# MyWhoosh renders "Tempo-3x14" as "Tempo-3×14" on the library card while the
+# editor header shows the ASCII form. Whether the stored name carries U+00D7 or
+# it is display-only was not established, so fold the multiplication signs and
+# stop the question from mattering. Observed 2026-08-21.
+_NAME_FOLD = {"×": "x", "✕": "x", "✖": "x", "⨯": "x", "−": "-", "–": "-"}
+
+# MyWhoosh's TSS and IF come from its own model, as Training Load does.
+LIBRARY_TSS_TOLERANCE_PCT = 10.0
+LIBRARY_TSS_TOLERANCE_ABS = 3.0
+LIBRARY_IF_TOLERANCE = 0.02
+
+
+def fold_library_name(name: str) -> str:
+    """A library name reduced to what is actually being compared."""
+    folded = "".join(_NAME_FOLD.get(char, char) for char in str(name))
+    return " ".join(folded.split()).casefold()
+
+
+def parse_library_duration(value: Any) -> float | None:
+    """Seconds from a library card duration.
+
+    The card writes "1h 18m" where the builder header writes "78:00", so both
+    forms have to parse or the comparison is between a number and a shrug.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if not text:
+        return None
+    if ":" in text:
+        return _parse_clock(text)
+    match = re.fullmatch(r"(?:(\d+)\s*h)?\s*(?:(\d+)\s*m(?:in)?)?\s*(?:(\d+)\s*s)?", text)
+    if not match or not any(match.groups()):
+        return None
+    hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
+    return float(hours * 3600 + minutes * 60 + seconds)
+
+
+def compare_library_entry(
+    expected_name: str,
+    expected_seconds: float,
+    expected_tss: float,
+    expected_if: float,
+    name: Any,
+    duration: Any,
+    tss: Any = None,
+    intensity_factor: Any = None,
+) -> dict:
+    """Check a MyWhoosh library card against the session that was exported.
+
+    The credit is already spent by the time this runs, so it cannot prevent
+    anything — it establishes whether the spend produced the right workout.
+    That is worth knowing precisely rather than approximately: the failure this
+    catches is a redirect that created nothing, or created something else.
+    """
+    checks: list[dict] = []
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    name_ok = fold_library_name(name) == fold_library_name(expected_name)
+    if not name_ok:
+        problems.append(
+            f"Library entry is named {name!r}, but {expected_name!r} was uploaded. "
+            "MyWhoosh takes the name from the filename, so a different name means a "
+            "different workout."
+        )
+    checks.append({"check": "name", "expected": expected_name, "observed": name, "ok": name_ok})
+
+    observed_seconds = parse_library_duration(duration)
+    duration_ok = observed_seconds is not None and abs(observed_seconds - expected_seconds) < 60
+    if not duration_ok:
+        problems.append(
+            f"Library entry shows {duration!r}, but the session is {expected_seconds / 60:.0f} min."
+        )
+    checks.append(
+        {
+            "check": "duration",
+            "expected_seconds": expected_seconds,
+            "observed": duration,
+            "observed_seconds": observed_seconds,
+            "ok": duration_ok,
+        }
+    )
+
+    if tss is not None:
+        observed_tss = _as_number(tss)
+        tolerance = max(LIBRARY_TSS_TOLERANCE_ABS, expected_tss * LIBRARY_TSS_TOLERANCE_PCT / 100)
+        tss_ok = observed_tss is not None and abs(observed_tss - expected_tss) <= tolerance
+        if not tss_ok:
+            warnings.append(
+                f"Library TSS {tss} against our {expected_tss:.1f}. Different models, so "
+                "they need not agree exactly, but a wide gap usually means the builder's "
+                "FTP was not the FTP the file was rendered against."
+            )
+        checks.append(
+            {
+                "check": "tss",
+                "expected": round(expected_tss, 1),
+                "observed": observed_tss,
+                "tolerance": round(tolerance, 1),
+                "ok": tss_ok,
+            }
+        )
+
+    if intensity_factor is not None:
+        observed_if = _as_number(intensity_factor)
+        if_ok = observed_if is not None and abs(observed_if - expected_if) <= LIBRARY_IF_TOLERANCE
+        if not if_ok:
+            warnings.append(f"Library IF {intensity_factor} against our {expected_if:.3f}.")
+        checks.append(
+            {
+                "check": "intensity_factor",
+                "expected": round(expected_if, 3),
+                "observed": observed_if,
+                "tolerance": LIBRARY_IF_TOLERANCE,
+                "ok": if_ok,
+            }
+        )
+
+    return {
+        "ok": not problems,
+        "landed": not problems,
+        "checks": checks,
+        "problems": problems,
+        "warnings": warnings,
+    }

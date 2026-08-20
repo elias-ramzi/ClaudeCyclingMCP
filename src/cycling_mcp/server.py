@@ -27,6 +27,7 @@ from .skills import Skill, _skills_dir, build_skill_message, load_skills
 from .spec import FTP_SOURCES, SpecError, load_spec
 from .spec import validate_spec as _validate_spec
 from .verify import (
+    compare_library_entry,
     compare_mywhoosh_import,
     compare_upload,
     diff_payloads,
@@ -658,6 +659,53 @@ def verify_mywhoosh_import(
         before=before,
     )
     result["expected"] = {
+        "duration": metrics.as_dict()["total_duration"],
+        "tss": round(metrics.tss, 1),
+        "intensity_factor": round(metrics.intensity_factor, 3),
+    }
+    return _dump(result)
+
+
+@app.tool()
+def verify_mywhoosh_library_entry(
+    spec: dict,
+    name: str,
+    duration: str,
+    tss: float | str | None = None,
+    intensity_factor: float | str | None = None,
+) -> str:
+    """Check a MyWhoosh library card against the session that was exported.
+
+    Call this after EXPORT TO MYWHOOSH, with what the card in My Workouts
+    shows. The credit is already spent by then, so this prevents nothing — it
+    establishes whether the spend produced the right workout, which is the
+    question the redirect alone cannot answer.
+
+    Accepts the card's own formats: "1h 18m" as readily as "78:00". Names are
+    compared with multiplication signs folded, because MyWhoosh renders an
+    uploaded "Tempo-3x14" as "Tempo-3×14" on the card while the editor header
+    shows the ASCII form.
+
+    Pure comparison, no network and no browser access.
+    """
+    try:
+        workout = load_spec(spec)
+    except SpecError as exc:
+        return _dump({"ok": False, "errors": exc.errors})
+
+    metrics = compute_metrics(workout)
+    result = compare_library_entry(
+        expected_name=zwo_filename(workout).removesuffix(".zwo"),
+        expected_seconds=metrics.total_seconds,
+        expected_tss=metrics.tss,
+        expected_if=metrics.intensity_factor,
+        name=name,
+        duration=duration,
+        tss=tss,
+        intensity_factor=intensity_factor,
+    )
+    result["expected"] = {
+        "name": zwo_filename(workout).removesuffix(".zwo"),
         "duration": metrics.as_dict()["total_duration"],
         "tss": round(metrics.tss, 1),
         "intensity_factor": round(metrics.intensity_factor, 3),

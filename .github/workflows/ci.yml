@@ -71,8 +71,8 @@ jobs:
           # telling you nothing about whether packaging worked.
           REQUIRED = {'validate_spec', 'describe_spec', 'render_zwo', 'render_garmin',
                       'check_garmin_payload', 'verify_garmin_upload',
-                      'verify_mywhoosh_import', 'spec_schema', 'get_skill',
-                      'server_info'}
+                      'verify_mywhoosh_import', 'verify_mywhoosh_library_entry',
+                      'spec_schema', 'get_skill', 'server_info'}
 
           async def main():
               names = {t.name for t in await app.list_tools()}

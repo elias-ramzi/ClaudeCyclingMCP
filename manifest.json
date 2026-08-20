@@ -60,6 +60,10 @@
       "description": "Check a MyWhoosh builder header against the session that was rendered, before export spends a credit"
     },
     {
+      "name": "verify_mywhoosh_library_entry",
+      "description": "Check a MyWhoosh library card against the session that was exported"
+    },
+    {
       "name": "server_info",
       "description": "Identify this server: version, where it is loaded from, and what it serves"
     },
