@@ -300,6 +300,19 @@ the header against the snapshot — and returns `safe_to_export`.
 **If `safe_to_export` is false, do not export.** Report its `problems` verbatim.
 Its `warnings` are worth reading out but do not block.
 
+**If the tool is unavailable — timeout, or the server is not answering — do not
+export either.** The header alone is not sufficient evidence; that is the whole
+reason this check exists, and a populated editor showing plausible numbers is
+exactly what a silent no-op looks like. Nothing before `EXPORT TO MYWHOOSH`
+costs a credit, so waiting is free and exporting on a guess is not. Say the
+check could not be run, leave the editor as it is, and resume once the server
+is back — the editor state and the `.zwo` on disk both survive.
+
+Worth knowing before you diagnose: no tool on this server has ever taken more
+than a few milliseconds. A timeout is a broken connection, not a slow
+computation, so retrying the same call immediately is unlikely to help and
+restarting the MCP server usually is.
+
 The snapshot argument is the one that matters most: if the name, `Workout Time`
 and `Training Load` are all unchanged from before the import, the import did
 nothing — regardless of whether those numbers happen to match your session. That

@@ -23,7 +23,7 @@ from .metrics import compute_metrics, describe
 from .render_garmin import render_garmin as _render_garmin
 from .render_zwo import render_zwo as _render_zwo
 from .render_zwo import zwo_filename
-from .skills import Skill, build_skill_message, load_skills
+from .skills import Skill, _skills_dir, build_skill_message, load_skills
 from .spec import FTP_SOURCES, SpecError, load_spec
 from .spec import validate_spec as _validate_spec
 from .verify import (
@@ -663,6 +663,37 @@ def verify_mywhoosh_import(
         "intensity_factor": round(metrics.intensity_factor, 3),
     }
     return _dump(result)
+
+
+@app.tool()
+def server_info() -> str:
+    """Identify this server: version, where it is loaded from, what it serves.
+
+    Call it when reporting a problem with this server, or when you want to know
+    whether the build you are talking to is the one you expect. A tool surface
+    is a build fingerprint — a tool that exists in one release and not another
+    dates a session precisely — but only if you can see it alongside a version.
+
+    It also answers instantly and touches nothing, so a reply is proof the
+    server is alive and a non-reply is not about this server being slow: no
+    tool here has ever taken more than a few milliseconds.
+    """
+    skills = load_skills()
+    return _dump(
+        {
+            "name": "claude-cycling-mcp",
+            "version": __version__,
+            "package_path": str(Path(__file__).resolve().parent),
+            "python": sys.version.split()[0],
+            "skills": [skill.name for skill in skills],
+            "skills_dir": str(_skills_dir()),
+            "uploads": False,
+            "note": (
+                "This server is pure: no network, no credentials, no uploads. The only "
+                "filesystem access is writing a rendered file when out_path is given."
+            ),
+        }
+    )
 
 
 @app.tool()

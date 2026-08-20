@@ -426,3 +426,19 @@ def test_out_path_writes_the_checklist_too(spec, tmp_path):
     result = json.loads(render_garmin(spec, out_path=str(target)))
     written = Path(result["checklist_written_to"]).read_text()
     assert written.splitlines() == result["ui_checklist"]
+
+
+def test_server_info_makes_the_build_sayable():
+    """Three sessions reported findings against builds that no longer existed,
+    and a fourth could not state its build at all. A tool surface dates a
+    session, but only next to a version and a load path."""
+    from cycling_mcp import __version__
+    from cycling_mcp.server import server_info
+
+    info = json.loads(server_info())
+    assert info["version"] == __version__
+    assert info["skills"] == ["garmin-upload", "mywhoosh-upload"]
+    assert Path(info["package_path"]).is_dir()
+    # Distinguishes a local editable checkout from a uvx cache in one glance.
+    assert info["package_path"].endswith("cycling_mcp")
+    assert info["uploads"] is False

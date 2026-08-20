@@ -91,6 +91,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checked in one command.
 - **Guidance for a timed-out browser call**, which the skill had none of. A timeout says nothing
   about whether the action applied, and it is the case most likely to tempt a destructive retry.
+- **`server_info`** — version, package path, Python, and the skills served. Four sessions in a row
+  either reported findings against a build that no longer existed or could not state their build at
+  all; the tool surface dates a session, but only alongside a version and a load path. `package_path`
+  also separates a local editable checkout from a `uvx` cache at a glance. It answers instantly and
+  touches nothing, so a reply is also proof the server is alive.
+- **`mywhoosh-upload` says what to do when `verify_mywhoosh_import` is unavailable**: do not export.
+  The header alone is not sufficient evidence — a populated editor showing plausible numbers is
+  exactly what a silent no-op looks like — and nothing before the export costs a credit, so waiting
+  is free. Both skills now note that no tool here has ever taken more than a few milliseconds, so a
+  timeout is a broken connection rather than a slow computation.
 - **`payload_digest` rejected correct payloads, blocking every upload.** JSON has one number type,
   so a renderer emitting `227.0` and a model retyping it as `227` produce equal payloads that
   hashed differently — and that retyping is unavoidable, since the payload leaves this server as
