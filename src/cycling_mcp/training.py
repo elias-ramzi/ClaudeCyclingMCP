@@ -66,6 +66,13 @@ COMPLIANCE_TOLERANCE_PCT = 5.0
 # under one of these is the session working as intended.
 EASY_ROLES = ("recovery", "warmup", "cooldown")
 
+# Verdicts that are not a departure from the plan. `no_power` belongs here
+# because it says nothing about the session: the lap recorded no watts, so the
+# target could not be checked either way. Counting it as a deviation makes an
+# HR-only ride read as a failed one.
+COMPLIANT_VERDICTS = ("on_target", "easier_than_target", "no_target")
+UNVERIFIABLE_VERDICTS = ("no_power",)
+
 _ORDINALS = (
     "first",
     "second",

@@ -22,7 +22,7 @@ fails on a new one fails for every ride at once.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # Garmin reports a bike ride under whichever child type the device chose:
@@ -215,11 +215,24 @@ def _activity_id(raw: Any) -> str | None:
     return None
 
 
-def _timestamp(value: Any) -> str | None:
+def _timestamp(value: Any, to_utc: bool = False) -> str | None:
     """Garmin's several time formats, normalised to `YYYY-MM-DDTHH:MM:SS`.
 
     Seen in the wild: "2026-08-20 07:12:33", the same with a "T", a trailing
-    ".0" of milliseconds, and epoch milliseconds on `beginTimestamp`.
+    ".0" of milliseconds, epoch milliseconds on `beginTimestamp`, and — from
+    anything that re-exports Garmin data — full ISO-8601 with a UTC offset,
+    "2026-08-20T07:12:33+02:00".
+
+    The offset form is parsed first, by `fromisoformat`, because the pattern
+    list cannot read one: stripping fractional seconds leaves "+02:00" attached
+    and every pattern fails. Both start times then come back None and the whole
+    activity is rejected as having no readable start — a ride lost to a
+    timezone suffix.
+
+    `to_utc` decides what an offset means. For a local start time the wall
+    clock is the point ("the day the athlete rode"), so the offset is dropped.
+    For `startTimeGMT` the instant is the point, so an offset is converted;
+    a naive value is already UTC and is left alone.
     """
     if value is None or isinstance(value, bool):
         return None
@@ -233,10 +246,25 @@ def _timestamp(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
 
-    text = value.strip().replace("T", " ").replace("Z", "").strip()
+    text = value.strip()
     if not text:
         return None
-    text = text.split(".")[0]
+
+    # "Z" is only accepted by fromisoformat from 3.11; this package supports
+    # 3.10, where the equivalent offset spelling parses on every version.
+    iso = text.replace(" ", "T")
+    if iso.endswith(("Z", "z")):
+        iso = iso[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(iso)
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc) if to_utc else parsed.replace(tzinfo=None)
+        return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+
+    text = text.replace("T", " ").replace("Z", "").strip().split(".")[0]
     for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             return datetime.strptime(text, pattern).strftime("%Y-%m-%dT%H:%M:%S")
@@ -310,7 +338,7 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
         )
 
     local = _timestamp(values["start_time_local"])
-    utc = _timestamp(values["start_time_utc"])
+    utc = _timestamp(values["start_time_utc"], to_utc=True)
     if local is None and utc is None:
         return None, f"activity {activity_id} has no readable start time (startTimeLocal/GMT)"
 

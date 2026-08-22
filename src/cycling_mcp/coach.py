@@ -30,8 +30,10 @@ from .spec import SpecError, format_duration, load_spec, parse_duration
 from .spec import validate_spec as _validate_spec
 from .store import CURRENT_SCHEMA_VERSION, DEFAULT_ATHLETE_ID, now_utc, open_db
 from .training import (
+    COMPLIANT_VERDICTS,
     LTHR_FROM_MAX_HR,
     TWENTY_MINUTE_FACTOR,
+    UNVERIFIABLE_VERDICTS,
     Load,
     compare_block,
     compute_activity_load,
@@ -408,6 +410,57 @@ def _activity_load(conn: sqlite3.Connection, athlete_id: int, activity: dict) ->
     return load
 
 
+def _aggregate_load(entries: list[dict]) -> dict:
+    """Total the loads in a list of rows, without lying about what went into it.
+
+    Two things a bare `sum(... or 0)` gets wrong, both of which this repo says
+    out loud elsewhere and so must not drift here:
+
+    * **A null TSS is not a zero.** It means the ride could not be scored — no
+      power, no heart rate, no FTP for that date. Folding it to zero makes a
+      week with three unscored rides read as a light week, which is the same
+      mistake as treating a rest day and an unmeasured ride alike.
+    * **Power TSS and hrTSS are different quantities.** Adding them gives a
+      number on the TSS scale that is not a TSS. It is reported, because a
+      partial total beats no total, but never without saying what it is made
+      of.
+
+    Returns the total plus `scored`, `unscored`, `by_method`, and a warning
+    string when the total mixes methods.
+    """
+    by_method: dict[str, int] = {}
+    scored: list[float] = []
+    unscored = 0
+    for entry in entries:
+        load = entry.get("load") or entry
+        method = load.get("method", "none")
+        by_method[method] = by_method.get(method, 0) + 1
+        if load.get("tss") is None:
+            unscored += 1
+        else:
+            scored.append(float(load["tss"]))
+
+    result: dict[str, Any] = {
+        "total_tss": round(sum(scored), 1),
+        "scored": len(scored),
+        "unscored": unscored,
+        "by_method": by_method,
+    }
+    if by_method.get("hr") and (by_method.get("power") or by_method.get("power_avg")):
+        result["mixed_methods_warning"] = (
+            "This total adds power TSS and hrTSS together. They are different quantities on "
+            "the same scale — read it as an order of magnitude, and compare like with like "
+            "when judging whether a week was harder than the last."
+        )
+    if unscored:
+        result["unscored_warning"] = (
+            f"{unscored} activit{'y' if unscored == 1 else 'ies'} could not be scored and "
+            "contributed nothing to this total, which therefore understates the week. "
+            "compute_load says why, per ride."
+        )
+    return result
+
+
 def _spec_of(row: dict) -> dict:
     return json.loads(row["spec_json"])
 
@@ -488,8 +541,18 @@ def get_profile(athlete_id: int = DEFAULT_ATHLETE_ID) -> dict:
         gaps.append({"field": "ftp", "matters_for": _GAP_REASONS["ftp"]})
     if not weight:
         gaps.append({"field": "weight", "matters_for": _GAP_REASONS["weight"]})
-    if not hr or not hr.get("threshold_hr"):
-        gaps.append({"field": "threshold_hr", "matters_for": _GAP_REASONS["threshold_hr"]})
+    # `resolve_hr` substitutes 92% of max HR for a missing threshold, so testing
+    # the resolved dict closed this gap the moment a max HR existed — the
+    # athlete was never asked for a measured LTHR again, and every no-power
+    # ride's load stayed pinned to the estimate.
+    if not hr or not hr.get("threshold_hr") or hr.get("threshold_hr_estimated"):
+        reason = _GAP_REASONS["threshold_hr"]
+        if hr and hr.get("threshold_hr_estimated"):
+            reason = (
+                f"{reason} — currently estimated at {hr['threshold_hr']} bpm from max HR, "
+                "which is wide enough to be worth replacing with a measured figure"
+            )
+        gaps.append({"field": "threshold_hr", "matters_for": reason})
     if not hr or not hr.get("max_hr"):
         gaps.append({"field": "max_hr", "matters_for": _GAP_REASONS["max_hr"]})
     if not events:
@@ -975,7 +1038,7 @@ def record_race_result(
     garmin_activity_id: str | int | None = None,
     finish_time: str | float | None = None,
     debrief: str | None = None,
-    status: str = "completed",
+    status: str | None = None,
     force: bool = False,
     athlete_id: int = DEFAULT_ATHLETE_ID,
 ) -> dict:
@@ -996,7 +1059,10 @@ def record_race_result(
     it went wrong, what to do differently. `list_events` hands it back the next
     time this event is planned for.
     """
-    status = _one_of(status, EVENT_STATUSES, "status") or "completed"
+    # Omitted means "leave it alone", not "completed". Adding a debrief to a
+    # race the athlete abandoned used to quietly rewrite it as finished — and
+    # nothing in the response said so.
+    status = _one_of(status, EVENT_STATUSES, "status")
     seconds: int | None = None
     if finish_time is not None:
         try:
@@ -1025,7 +1091,13 @@ def record_race_result(
                     "midnight, a mis-set device clock)."
                 )
 
-        updates: dict[str, Any] = {"status": status}
+        updates: dict[str, Any] = {}
+        if status is not None:
+            updates["status"] = status
+        elif event["status"] == "upcoming":
+            # No result recorded yet, so filing one completes it. An event
+            # already marked abandoned or dns keeps that: it is the outcome.
+            updates["status"] = "completed"
         if activity is not None:
             updates["linked_activity_id"] = activity["id"]
         if seconds is not None:
@@ -1042,6 +1114,10 @@ def record_race_result(
         load = _activity_load(conn, athlete_id, activity).as_dict() if activity else None
 
     result: dict[str, Any] = {"stored": _event_out(stored or {}), "updated_fields": sorted(updates)}
+    if "status" not in updates:
+        result["status_unchanged"] = (
+            f"'{event['name']}' stays {event['status']}. Pass status explicitly to change it."
+        )
     if activity is not None:
         result["linked_activity"] = _project(activity, _ACTIVITY_OUT_FIELDS)
         result["linked_activity_load"] = load
@@ -1309,6 +1385,13 @@ def list_activities(
     filters on the family ("cycling", "running", "swimming", "other"), which
     deliberately catches every indoor and virtual sub-type; the device's own
     key is in `sub_sport`.
+
+    A ride imported from a payload carrying no activity type has an **unknown**
+    sport, not "other", and a sport filter excludes it — it is not known to be
+    cycling. That exclusion is reported rather than silent: the response
+    carries `excluded_unknown_sport` when the filter hid any, because a ride
+    dropping out of a list without a word is how a real session becomes a
+    missed-session narrative.
     """
     sport = _one_of(sport, SPORTS, "sport")
     clauses = ["athlete_id = ?"]
@@ -1319,16 +1402,31 @@ def list_activities(
     if end:
         clauses.append("local_date <= ?")
         params.append(parse_date(end, "end").isoformat())
+
+    # The date filter alone, kept separately: it is what counts the rides a
+    # sport filter would hide rather than report.
+    date_clauses, date_params = list(clauses), list(params)
     if sport:
         clauses.append("sport = ?")
         params.append(sport)
 
     with open_db() as conn:
+        # One more than asked for, so "there is more" is a fact rather than the
+        # guess `len(rows) == limit` makes when exactly `limit` rows match.
         rows = conn.execute(
             f"SELECT * FROM activities WHERE {' AND '.join(clauses)} "
             f"ORDER BY local_date DESC, start_time_utc DESC, id DESC LIMIT ?",
-            (*params, int(limit)),
+            (*params, int(limit) + 1),
         ).fetchall()
+        truncated = len(rows) > int(limit)
+        rows = rows[: int(limit)]
+        unknown_sport = 0
+        if sport:
+            unknown_sport = conn.execute(
+                f"SELECT COUNT(*) AS n FROM activities "
+                f"WHERE {' AND '.join(date_clauses)} AND sport IS NULL",
+                date_params,
+            ).fetchone()["n"]
         activities = []
         for row in rows:
             entry = _project(row, _ACTIVITY_OUT_FIELDS)
@@ -1336,18 +1434,27 @@ def list_activities(
                 entry["load"] = _activity_load(conn, athlete_id, _dict(row) or {}).as_dict()
             activities.append(entry)
 
-    total_tss = sum(
-        (entry.get("load") or {}).get("tss") or 0.0 for entry in activities if include_load
-    )
-    return {
+    result: dict[str, Any] = {
         "count": len(activities),
         "start": start,
         "end": end,
         "sport": sport,
         "activities": activities,
-        "total_tss": round(total_tss, 1) if include_load else None,
-        "truncated": len(activities) >= int(limit),
+        "truncated": truncated,
     }
+    if include_load:
+        result.update(_aggregate_load(activities))
+    else:
+        result["total_tss"] = None
+    if sport and unknown_sport:
+        result["excluded_unknown_sport"] = unknown_sport
+        result["excluded_unknown_sport_note"] = (
+            f"{unknown_sport} activit{'y' if unknown_sport == 1 else 'ies'} in this range "
+            f"{'carries' if unknown_sport == 1 else 'carry'} no sport from Garmin and "
+            f"{'is' if unknown_sport == 1 else 'are'} not in this list. That is training "
+            "that happened; drop the sport filter to see it."
+        )
+    return result
 
 
 def link_activity(
@@ -1384,20 +1491,31 @@ def link_activity(
         if activity_id is not None or garmin_activity_id is not None:
             chosen = _find_activity(conn, athlete_id, activity_id, garmin_activity_id)
         elif auto:
-            planned_seconds = None
             try:
-                planned_seconds = compute_metrics(load_spec(_spec_of(planned))).total_seconds
+                # total_seconds sums the blocks; compute_metrics would expand a
+                # 1 Hz power series for the whole session to reach the same number.
+                planned_seconds = load_spec(_spec_of(planned)).total_seconds
             except SpecError:
                 planned_seconds = None
+            # NULL sport means the payload carried no activity type, not that
+            # the ride was something other than a bike. Excluding it reported
+            # "no cycling activity stored on that date" for a ride sitting in
+            # the log on exactly that date — a missed-session narrative for a
+            # session that happened.
             rows = conn.execute(
-                "SELECT * FROM activities WHERE athlete_id = ? AND local_date = ? AND sport = ? "
-                "ORDER BY start_time_utc",
+                "SELECT * FROM activities WHERE athlete_id = ? AND local_date = ? "
+                "AND (sport = ? OR sport IS NULL) ORDER BY start_time_utc",
                 (athlete_id, planned["scheduled_date"], "cycling"),
             ).fetchall()
             for row in rows:
                 entry = _project(row, _ACTIVITY_OUT_FIELDS)
                 if planned_seconds and entry["duration_s"]:
                     entry["duration_delta_s"] = round(entry["duration_s"] - planned_seconds)
+                if entry["sport"] is None:
+                    entry["sport_note"] = (
+                        "Garmin sent no activity type for this ride, so its sport is unknown. "
+                        "It is offered as a candidate rather than hidden."
+                    )
                 candidates.append(entry)
             candidates.sort(key=lambda e: abs(e.get("duration_delta_s") or 0))
             if len(candidates) == 1:
@@ -1673,7 +1791,6 @@ def get_week(
     reference = _today(today)
 
     with open_db() as conn:
-        current_ftp = _latest(conn, "ftp_history", athlete_id, None)
         planned_rows = [
             _dict(row)
             for row in conn.execute(
@@ -1704,11 +1821,54 @@ def get_week(
             entry["load"] = _activity_load(conn, athlete_id, row).as_dict()
             activities.append(entry)
 
+        # The FTP each session should have been written against: the one in
+        # effect on its own date. Resolving "the latest entry" instead let a
+        # future-dated one — a scheduled test result, or a typo — mark this
+        # week's correctly-written plans as stale against a number not yet in
+        # force.
+        ftp_on_date = {
+            row["scheduled_date"]: resolve_ftp(conn, athlete_id, row["scheduled_date"])
+            for row in planned_rows
+            if row
+        }
+
+        # Links are stored on the planned workout, and link_activity permits a
+        # cross-date link — a Sunday session ridden Monday. Looking only at
+        # plans scheduled inside the window left that ride reported as
+        # unplanned in the following week, with the link sitting in the
+        # database the whole time.
+        activity_ids = [entry["id"] for entry in activities]
+        linked_elsewhere: set[int] = set()
+        events_by_activity_any_date: dict[int, dict] = {}
+        if activity_ids:
+            marks = ", ".join("?" for _ in activity_ids)
+            linked_elsewhere = {
+                row["linked_activity_id"]
+                for row in conn.execute(
+                    f"SELECT linked_activity_id FROM planned_workouts WHERE athlete_id = ? "
+                    f"AND linked_activity_id IN ({marks})",
+                    (athlete_id, *activity_ids),
+                )
+            }
+            events_by_activity_any_date = {
+                row["linked_activity_id"]: _dict(row) or {}
+                for row in conn.execute(
+                    f"SELECT * FROM events WHERE athlete_id = ? "
+                    f"AND linked_activity_id IN ({marks})",
+                    (athlete_id, *activity_ids),
+                )
+            }
+
     linked_to_plan = {
         row["linked_activity_id"] for row in planned_rows if row and row["linked_activity_id"]
-    }
+    } | linked_elsewhere
     event_by_activity = {
-        row["linked_activity_id"]: row for row in event_rows if row and row["linked_activity_id"]
+        **events_by_activity_any_date,
+        **{
+            row["linked_activity_id"]: row
+            for row in event_rows
+            if row and row["linked_activity_id"]
+        },
     }
 
     planned: list[dict] = []
@@ -1716,15 +1876,17 @@ def get_week(
     for row in planned_rows:
         assert row is not None
         entry = _planned_summary(row)
+        in_effect = ftp_on_date.get(row["scheduled_date"])
         if (
-            current_ftp
+            in_effect
             and entry.get("spec", {}).get("ftp")
-            and entry["spec"]["ftp"] != current_ftp["value_watts"]
+            and entry["spec"]["ftp"] != in_effect["value_watts"]
         ):
             entry["stale_ftp"] = (
-                f"written against {entry['spec']['ftp']} W; the current FTP is "
-                f"{current_ftp['value_watts']} W ({current_ftp['effective_date']}). Update the "
-                "spec before rendering, or it prescribes the old intensity."
+                f"written against {entry['spec']['ftp']} W; the FTP in effect on "
+                f"{row['scheduled_date']} is {in_effect['value_watts']} W "
+                f"({in_effect['effective_date']}). Update the spec before rendering, or it "
+                "prescribes the wrong intensity."
             )
         planned.append(entry)
         if (
@@ -1769,7 +1931,7 @@ def get_week(
             }
         )
 
-    total_tss = sum((entry.get("load") or {}).get("tss") or 0.0 for entry in activities)
+    aggregate = _aggregate_load(activities)
     planned_tss = sum(entry.get("planned_tss") or 0.0 for entry in planned)
     return {
         "start": first.isoformat(),
@@ -1782,7 +1944,17 @@ def get_week(
             "planned_sessions": len(planned),
             "activities": len(activities),
             "planned_tss": round(planned_tss, 1),
-            "actual_tss": round(total_tss, 1),
+            "actual_tss": aggregate["total_tss"],
+            "activities_scored": aggregate["scored"],
+            "activities_unscored": aggregate["unscored"],
+            "by_method": aggregate["by_method"],
+            # planned_tss is always power-based, so a like-for-like reading of
+            # the two numbers depends on knowing what actual_tss is made of.
+            **{
+                key: aggregate[key]
+                for key in ("mixed_methods_warning", "unscored_warning")
+                if key in aggregate
+            },
         },
         "deviations": {
             "planned_not_ridden": not_ridden,
@@ -1824,6 +1996,19 @@ def compute_load(
     never a zero. A zero would be indistinguishable from a rest day.
     """
     sport = _one_of(sport, SPORTS, "sport")
+    if activity_ids is not None and not activity_ids:
+        # An empty list is a filter that matched nothing, not an absent filter.
+        # Falling through to "no id clause" scored the athlete's entire history
+        # and returned it as this selection's total — a plausible wrong number,
+        # which is worse than an empty one.
+        return {
+            "count": 0,
+            "activities": [],
+            "by_method": {},
+            "total_tss": 0.0,
+            "unscored": 0,
+            "note": "activity_ids was an empty list, so nothing was selected.",
+        }
     clauses = ["athlete_id = ?"]
     params: list[Any] = [athlete_id]
     if activity_ids:
@@ -1862,25 +2047,7 @@ def compute_load(
                 }
             )
 
-    by_method: dict[str, int] = {}
-    for entry in rows_out:
-        by_method[entry["method"]] = by_method.get(entry["method"], 0) + 1
-    scored = [entry["tss"] for entry in rows_out if entry["tss"] is not None]
-
-    result: dict[str, Any] = {
-        "count": len(rows_out),
-        "activities": rows_out,
-        "by_method": by_method,
-        "total_tss": round(sum(scored), 1),
-        "unscored": len(rows_out) - len(scored),
-    }
-    if by_method.get("hr") and (by_method.get("power") or by_method.get("power_avg")):
-        result["mixed_methods_warning"] = (
-            "This total adds power TSS and hrTSS together. They are different quantities on "
-            "the same scale — read the total as an order of magnitude, and compare like with "
-            "like when judging whether a week was harder than the last."
-        )
-    return result
+    return {"count": len(rows_out), "activities": rows_out, **_aggregate_load(rows_out)}
 
 
 def get_form(
@@ -2003,6 +2170,24 @@ def _planned_blocks(spec: dict) -> list[dict]:
     return blocks
 
 
+def _compliance_verdict(
+    alignment: str, comparisons: list[dict], deviating: list[dict], unverifiable: list[dict]
+) -> str:
+    """One word for the session: what the comparison actually established.
+
+    `unverifiable` is its own answer. A ride with no power in any lap says
+    nothing about whether the targets were held, and calling that either
+    `as_prescribed` or `deviated` asserts something the data cannot support.
+    """
+    if alignment != "by_lap":
+        return "no_block_data"
+    if comparisons and len(unverifiable) == len(comparisons):
+        return "unverifiable"
+    if deviating:
+        return "deviated"
+    return "as_prescribed"
+
+
 def compliance_report(
     planned_workout_id: int,
     activity_id: int | None = None,
@@ -2029,7 +2214,14 @@ def compliance_report(
     average ridden as steady tempo.
 
     A tolerance of 5% of the target either side counts as on target — a
-    trainer holds a watt target far more tightly than a road ever will. A
+    trainer holds a watt target far more tightly than a road ever will. Note
+    that this is **not** the band `render_garmin` writes to the head unit,
+    which is 2% for intervals, 5% at the easy end, and whatever
+    `garmin_target_band_pct` says when the spec sets it. The two are measuring
+    different things: the rendered band is what the athlete was told to hold,
+    this one is how far off a lap average has to be before it is worth
+    mentioning. An athlete riding the top edge of a 2% displayed band is inside
+    this tolerance and reads as on target, which is the intended answer. A
     recovery, warmup or cooldown block ridden below its target is reported as
     `easier_than_target` and does not count against compliance: that target is
     a ceiling, and spinning easier than prescribed on a recovery is the session
@@ -2124,12 +2316,16 @@ def compliance_report(
     # right watts was reported as prescribed, which is the opposite of what
     # happened.
     off_target = [entry for entry in comparisons if entry["verdict"] in ("under", "over")]
+    unverifiable = [entry for entry in comparisons if entry["verdict"] in UNVERIFIABLE_VERDICTS]
+    # `no_power` is not a deviation: the lap recorded no watts, so the target
+    # was neither hit nor missed. Counting it made an HR-only ride — ridden for
+    # exactly the right durations — come back as a failed session.
     deviating = [
         entry
         for entry in comparisons
-        if entry["verdict"] not in ("on_target", "easier_than_target", "no_target")
+        if entry["verdict"] not in COMPLIANT_VERDICTS
+        and entry["verdict"] not in UNVERIFIABLE_VERDICTS
     ]
-    unverifiable = [entry for entry in comparisons if entry["verdict"] == "no_power"]
     return {
         "ok": True,
         "planned_workout_id": planned_workout_id,
@@ -2169,11 +2365,7 @@ def compliance_report(
         "deviating_blocks": len(deviating),
         "unverifiable_blocks": len(unverifiable),
         "sentences": summary_sentences,
-        "verdict": (
-            "no_block_data"
-            if alignment != "by_lap"
-            else ("as_prescribed" if not deviating else "deviated")
-        ),
+        "verdict": _compliance_verdict(alignment, comparisons, deviating, unverifiable),
     }
 
 

@@ -813,3 +813,219 @@ def test_a_restore_of_something_that_is_not_an_export_refuses_rather_than_crashi
     with pytest.raises(coach.CoachError, match="not a row object"):
         coach.import_data({"tables": {"athlete": ["oops"]}}, force=True)
     assert coach.list_activities()["count"] == 1, "the delete sweep must be rolled back"
+
+
+# --------------------------------------------------------------------------
+# defects found in code review of the pull request, each pinned
+# --------------------------------------------------------------------------
+
+
+def test_totals_do_not_count_an_unscored_ride_as_zero():
+    """A null TSS means the ride could not be scored, not that it was easy.
+
+    Folding it to zero made a week with unscored rides read as a light week —
+    the same mistake as treating a rest day and an unmeasured ride alike.
+    """
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities(
+        [
+            RIDE,
+            {
+                "activityId": 5002,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-06 08:00:00",
+                "duration": 7200.0,
+            },
+        ]
+    )
+    listing = coach.list_activities()
+    assert listing["scored"] == 1
+    assert listing["unscored"] == 1
+    assert "understates" in listing["unscored_warning"]
+    assert listing["total_tss"] == pytest.approx(64.6, abs=0.05)
+
+
+def test_a_week_total_says_what_it_is_made_of():
+    """planned_tss is always power-based, so actual_tss has to declare itself."""
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.log_hr(threshold_hr=170, effective_date="2026-06-01")
+    coach.import_activities(
+        [
+            RIDE,
+            {
+                "activityId": 5003,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-06 08:00:00",
+                "duration": 3600.0,
+                "averageHR": 150,
+            },
+        ]
+    )
+    totals = coach.get_week("2026-07-01", "2026-07-12", today="2026-07-20")["totals"]
+    assert totals["by_method"] == {"power": 1, "hr": 1}
+    assert (
+        "not comparable" in totals["mixed_methods_warning"]
+        or "different quantities" in (totals["mixed_methods_warning"])
+    )
+    assert totals["activities_scored"] == 2
+
+
+def test_a_ride_with_no_power_in_any_lap_is_unverifiable_not_deviated():
+    """`no_power` says nothing about whether the target was held.
+
+    Counting it as a deviation made an HR-only ride, ridden for exactly the
+    right durations, come back as a failed session.
+    """
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities(
+        [{**RIDE, "activityId": 6001, "avgPower": None, "normPower": None, "duration": 1200.0}]
+    )
+    spec = {
+        "name": "2x10",
+        "ftp": 266,
+        "blocks": [
+            {"type": "steady", "duration": 600, "power_pct": 90, "role": "interval"},
+            {"type": "steady", "duration": 600, "power_pct": 90, "role": "interval"},
+        ],
+    }
+    coach.import_activity_laps(
+        {"lapDTOs": [{"duration": 600.0, "averageHR": 150}, {"duration": 600.0, "averageHR": 152}]},
+        garmin_activity_id="6001",
+    )
+    saved = coach.save_planned_workouts([{"spec": spec, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.link_activity(planned_id, garmin_activity_id="6001")
+
+    report = coach.compliance_report(planned_id)
+    assert report["unverifiable_blocks"] == 2
+    assert report["deviating_blocks"] == 0
+    assert report["verdict"] == "unverifiable"
+
+
+def test_a_ride_linked_to_a_plan_outside_the_window_is_not_unplanned():
+    """A Sunday session ridden Monday, linked, then read in the Monday week.
+
+    The link lives on the planned workout, so looking only at plans scheduled
+    inside the window reported the ride as unplanned with the link sitting in
+    the database the whole time.
+    """
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities([RIDE])  # 2026-07-05
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-04"}])
+    coach.link_activity(saved["planned_workouts"][0]["id"], garmin_activity_id="5001")
+
+    week = coach.get_week("2026-07-05", "2026-07-11", today="2026-07-20")
+    assert week["deviations"]["ridden_not_planned"] == []
+
+
+def test_a_race_linked_to_an_event_outside_the_window_is_not_unplanned():
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities([RIDE])
+    event = coach.add_event("Club 100", "2026-07-04", priority="B")["stored"]
+    coach.record_race_result(event["id"], garmin_activity_id="5001", force=True)
+
+    week = coach.get_week("2026-07-05", "2026-07-11", today="2026-07-20")
+    assert week["deviations"]["ridden_not_planned"] == []
+
+
+def test_a_ride_with_an_unknown_sport_can_still_be_auto_linked():
+    """NULL sport means Garmin sent no type, not that it was not a bike.
+
+    Excluding it reported "no cycling activity stored on that date" for a ride
+    sitting in the log on exactly that date.
+    """
+    coach.import_activities([{k: v for k, v in RIDE.items() if k != "activityType"}])
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    result = coach.link_activity(saved["planned_workouts"][0]["id"], auto=True)
+    assert result["linked"] is True
+    assert result["activity"]["sport"] is None
+
+
+def test_a_sport_filter_reports_the_unknown_rides_it_hid():
+    coach.import_activities([{k: v for k, v in RIDE.items() if k != "activityType"}])
+    listing = coach.list_activities(sport="cycling")
+    assert listing["count"] == 0
+    assert listing["excluded_unknown_sport"] == 1
+    assert "carries no sport" in listing["excluded_unknown_sport_note"]
+
+
+def test_a_debrief_added_later_does_not_resurrect_an_abandoned_race():
+    """Filing a debrief months on must not rewrite a DNF into a finish."""
+    event = coach.add_event("Club 100", "2026-07-04", priority="B")["stored"]
+    coach.update_event(event["id"], status="abandoned")
+    result = coach.record_race_result(event["id"], debrief="cracked at km 90")
+    assert result["stored"]["status"] == "abandoned"
+    assert result["stored"]["debrief"] == "cracked at km 90"
+    assert "stays abandoned" in result["status_unchanged"]
+
+
+def test_a_result_on_an_upcoming_event_still_completes_it():
+    event = coach.add_event("Club 100", "2026-07-04", priority="B")["stored"]
+    result = coach.record_race_result(event["id"], finish_time="3:00:00")
+    assert result["stored"]["status"] == "completed"
+
+
+def test_an_explicit_status_still_wins():
+    event = coach.add_event("Club 100", "2026-07-04", priority="B")["stored"]
+    coach.update_event(event["id"], status="abandoned")
+    result = coach.record_race_result(event["id"], status="completed")
+    assert result["stored"]["status"] == "completed"
+
+
+def test_a_future_dated_ftp_does_not_make_this_week_stale():
+    """log_ftp has no future-date guard, and a scheduled test result or a typo
+    made every correctly-written session this week report stale_ftp against a
+    number not yet in force."""
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.log_ftp(value_watts=300, effective_date="2026-12-01")
+    coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-08-05"}])
+    week = coach.get_week("2026-08-01", "2026-08-10", today="2026-08-02")
+    assert "stale_ftp" not in week["planned_workouts"][0]
+
+
+def test_a_genuinely_stale_spec_is_still_flagged():
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-08-05"}])
+    coach.log_ftp(value_watts=290, effective_date="2026-08-01")
+    week = coach.get_week("2026-08-01", "2026-08-10", today="2026-08-02")
+    assert "written against 266 W" in week["planned_workouts"][0]["stale_ftp"]
+
+
+def test_an_empty_activity_id_filter_selects_nothing():
+    """Falsy-checking the list dropped the clause and scored the whole history —
+    a plausible wrong number, which is worse than an empty one."""
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities([RIDE])
+    result = coach.compute_load(activity_ids=[])
+    assert result["count"] == 0
+    assert result["total_tss"] == 0.0
+    assert "empty list" in result["note"]
+
+
+def test_a_populated_activity_id_filter_still_works():
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities([RIDE])
+    stored = coach.list_activities()["activities"][0]
+    assert coach.compute_load(activity_ids=[stored["id"]])["count"] == 1
+
+
+def test_an_estimated_threshold_hr_stays_an_open_gap():
+    """resolve_hr substitutes 92% of max HR, so testing the resolved dict closed
+    the gap the moment a max HR existed — the athlete was never asked for a
+    measured LTHR, and every hrTSS stayed pinned to the estimate."""
+    coach.log_hr(max_hr=190, effective_date="2026-06-01")
+    gaps = {gap["field"]: gap for gap in coach.get_profile()["gaps"]}
+    assert "threshold_hr" in gaps
+    assert "estimated at 175 bpm" in gaps["threshold_hr"]["matters_for"]
+
+
+def test_a_measured_threshold_closes_the_gap():
+    coach.log_hr(threshold_hr=170, max_hr=190, effective_date="2026-06-01")
+    assert "threshold_hr" not in {gap["field"] for gap in coach.get_profile()["gaps"]}
+
+
+def test_the_truncated_flag_is_not_true_for_an_exact_fit():
+    coach.import_activities([RIDE])
+    assert coach.list_activities(limit=1)["truncated"] is False
+    coach.import_activities([{**RIDE, "activityId": 5009, "startTimeLocal": "2026-07-06 08:00:00"}])
+    assert coach.list_activities(limit=1)["truncated"] is True

@@ -230,3 +230,59 @@ def test_laps_are_never_rejected_only_thinned():
 def test_a_bike_lap_reads_its_cadence_field():
     row = normalize_lap({"duration": 600.0, "averageBikingCadenceInRevPerMinute": 92.0}, 1)
     assert row["avg_cadence"] == 92.0
+
+
+# --------------------------------------------------------------------------
+# ISO-8601 with a UTC offset — found in code review
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("2026-08-20T07:12:33+02:00", "2026-08-20T07:12:33"),
+        ("2026-08-20T07:12:33.0+02:00", "2026-08-20T07:12:33"),
+        ("2026-08-20T07:12:33-05:00", "2026-08-20T07:12:33"),
+        ("2026-08-20T07:12:33Z", "2026-08-20T07:12:33"),
+        ("2026-08-20 07:12:33", "2026-08-20T07:12:33"),
+        ("2026-08-20", "2026-08-20T00:00:00"),
+    ],
+)
+def test_a_timestamp_with_an_offset_is_read_rather_than_dropped(value, expected):
+    """Stripping fractional seconds left "+02:00" attached and every pattern
+    failed, so both start times came back None and the whole ride was rejected
+    as having no readable start — a ride lost to a timezone suffix."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp(value) == expected
+
+
+def test_a_local_time_with_an_offset_keeps_its_wall_clock():
+    """The point of a local start time is the day the athlete believes they
+    rode; converting it to UTC would move an evening ride onto the next day."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp("2026-08-20T22:00:00+02:00") == "2026-08-20T22:00:00"
+
+
+def test_a_gmt_time_with_an_offset_is_converted_to_the_instant():
+    """`startTimeGMT` names an instant, so an offset on it means something."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp("2026-08-20T07:12:33+02:00", to_utc=True) == "2026-08-20T05:12:33"
+    assert _timestamp("2026-08-20 07:12:33", to_utc=True) == "2026-08-20T07:12:33"
+
+
+def test_an_activity_timed_only_in_offset_form_is_imported():
+    row, reason = normalize_activity(
+        {
+            "activityId": 77,
+            "activityType": {"typeKey": "virtual_ride"},
+            "startTimeLocal": "2026-08-20T22:00:00+02:00",
+            "startTimeGMT": "2026-08-20T20:00:00+00:00",
+            "duration": 3600.0,
+        }
+    )
+    assert reason is None
+    assert row["local_date"] == "2026-08-20"
+    assert row["start_time_utc"] == "2026-08-20T20:00:00"

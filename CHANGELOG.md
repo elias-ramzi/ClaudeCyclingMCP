@@ -69,6 +69,58 @@ Found by an adversarial review of the new code before it shipped; each is pinned
 - **`import_data` refuses a malformed row** instead of raising `AttributeError` across the tool
   boundary after its delete sweep.
 
+#### Found in code review of the pull request
+
+Ten confirmed correctness bugs, each reproduced before fixing and pinned by a test.
+
+- **Four tool schemas rejected the numeric forms the coach layer was built to accept.**
+  `garmin_activity_id` was typed `str | None` on `link_activity`, `annotate_activity`,
+  `import_activity_laps` and `record_race_result`, and `finish_time` as `str | None` — but Garmin's
+  `activityId` is a JSON number and pydantic does not coerce one to a string, so those calls failed
+  schema validation before any code ran. `record_race_result`'s docstring promised `finish_time`
+  takes seconds; that form was unreachable over the wire.
+- **`_timestamp` could not read an ISO timestamp with a UTC offset.**
+  `"2026-08-20T07:12:33+02:00"` returned `None`, and an activity carrying that form on both start
+  times was rejected as having no readable start — a ride lost to a timezone suffix. It now parses
+  offsets, keeping the wall clock for a local time and converting for `startTimeGMT`.
+- **Weekly and listing totals folded a null TSS to zero and merged power TSS with hrTSS silently.**
+  A week with three unscored rides read as a light week, and `get_week` set the merged figure beside
+  an always-power-based `planned_tss`. One shared aggregator now reports `scored`, `unscored` and
+  `by_method` with both warnings, wherever a total appears.
+- **`compliance_report` counted `no_power` blocks as deviations**, so an HR-only ride with the right
+  lap count and durations came back `deviated` while the same blocks were also counted as
+  unverifiable. They now count toward neither, and a session where every block is unverifiable
+  gets its own verdict rather than a guess in either direction.
+- **`get_week` reported a cross-window linked ride as unplanned.** `link_activity` permits a Sunday
+  session ridden Monday, but only plans scheduled inside the window were consulted — so the ride
+  showed as "ridden with nothing planned for it" with the link in the database the whole time.
+  Links and event links are now looked up by activity, regardless of date.
+- **A ride with an unknown sport could never auto-link and vanished from cycling filters.** NULL
+  sport means Garmin sent no activity type, not that the ride was not a bike; `link_activity(auto)`
+  reported "no cycling activity stored on that date" for a ride sitting on exactly that date. Auto
+  matching now offers unknowns, and a sport filter reports the unknowns it hid instead of dropping
+  them in silence.
+- **`record_race_result` silently flipped an abandoned or DNS event back to completed.** Adding a
+  debrief months later rewrote the outcome. `status` omitted now means "leave it alone"; only an
+  event still `upcoming` is completed by filing a result.
+- **A future-dated FTP marked the current week's plans stale.** The check took the latest entry with
+  no date bound, so a scheduled test result — or a typo — told the coach to rewrite correct specs
+  against a number not yet in force. Each session is now checked against the FTP in effect on its
+  own date.
+- **`compute_load(activity_ids=[])` scored the entire history.** An empty list is a filter that
+  matched nothing, not an absent filter; it returned the athlete's whole log as the selection's
+  total. It now returns zero rows and says why.
+- **An estimated threshold HR hid the `threshold_hr` onboarding gap.** The check ran on the resolved
+  figure, which substitutes 92% of max HR, so once a max HR existed the athlete was never asked for
+  a measured LTHR again and every hrTSS stayed pinned to the estimate.
+
+Also, from the same review: corrupted stored JSON now reports as an error rather than a polite
+refusal; `list_activities` no longer claims `truncated` on an exact fit; `link_activity` reads a
+planned duration without expanding a 1 Hz power series; and the `server_info`, `get_skill` and
+`compliance_report` docstrings were corrected where they had drifted from the behaviour — including
+an explicit note that compliance's 5% tolerance is deliberately not the band `render_garmin` writes
+to the head unit.
+
 ### Notes
 
 Ingestion is model-mediated by design: Claude fetches from the Garmin MCP and passes the JSON here

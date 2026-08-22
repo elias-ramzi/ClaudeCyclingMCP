@@ -217,6 +217,12 @@ understates a variable ride.
 **Without power**, the fallback is hrTSS: the same formula with `avg HR / threshold HR` replacing
 the power ratio.
 
+**Every total says what it is made of.** `list_activities`, `get_week` and `compute_load` all report
+`scored`, `unscored` and `by_method` beside the number, with a warning when the total mixes power
+TSS and hrTSS, and another when unscored rides mean it understates the period. A null TSS is never
+folded to zero on the way into a total — a week with three unscored rides must not read as a light
+week.
+
 **The two are not comparable, and each row says which it is.** hrTSS:
 
 - cannot see variability — thirty sprints and a steady tempo ride at the same average HR score
@@ -281,11 +287,18 @@ produces confident claims about the wrong intervals, and lap counts rarely match
 athlete pressing lap at a junction, or a head unit auto-lapping every 5 km, breaks it. The laps come
 back as they are, with the totals compared and the mismatch stated.
 
-A block within 5% of target counts as on target. A recovery, warmup or cooldown ridden *below*
-target is `easier_than_target` and not a miss: that target is a ceiling. A block **cut short** is a
-deviation even when the watts were right — `off_target_blocks` counts wrong power,
-`deviating_blocks` adds short and long, and `verdict` follows the latter. `unverifiable_blocks` is
-blocks that recorded no power at all: missing data, not a failed session.
+A block within 5% of target counts as on target — deliberately not the band `render_garmin` writes
+to the head unit (2% for intervals, 5% at the easy end, or `garmin_target_band_pct`). The two
+measure different things: the rendered band is what the athlete was told to hold, this one is how
+far off a lap average has to be before it is worth mentioning.
+
+A recovery, warmup or cooldown ridden *below* target is `easier_than_target` and not a miss: that
+target is a ceiling. A block **cut short** is a deviation even when the watts were right —
+`off_target_blocks` counts wrong power, `deviating_blocks` adds short and long, and `verdict`
+follows the latter. `unverifiable_blocks` is blocks that recorded no power at all; they count toward
+neither, because a lap with no watts says nothing about whether the target was held. When *every*
+block is unverifiable the verdict is `unverifiable` — an HR-only ride is not evidence that the
+session was ridden correctly.
 
 The laps are returned whenever any are stored, mismatch included — that is precisely the case where
 nothing could be compared and the caller has to look at them.

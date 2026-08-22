@@ -752,9 +752,11 @@ def server_info() -> str:
     is a build fingerprint — a tool that exists in one release and not another
     dates a session precisely — but only if you can see it alongside a version.
 
-    It also answers instantly and touches nothing, so a reply is proof the
-    server is alive and a non-reply is not about this server being slow: no
-    tool here has ever taken more than a few milliseconds.
+    It answers instantly, so a reply is proof the server is alive and a
+    non-reply is not about this server being slow: no tool here has ever taken
+    more than a few milliseconds. It is very nearly side-effect free — it stats
+    the coaching database and, if one is there, opens it read-only to read the
+    schema version. It never creates it.
 
     "database" reports the coaching store: its path, whether it exists yet, and
     its schema version. Reading it does not create it — a tool whose job is to
@@ -784,12 +786,17 @@ def server_info() -> str:
 
 @app.tool()
 def get_skill(name: str | None = None) -> str:
-    """Fetch a bundled procedure for uploading a workout to a platform.
+    """Fetch a bundled procedure by name: the two upload flows, or coaching.
 
-    Read this before uploading, scheduling, or exporting a rendered cycling
-    workout — a .zwo to MyWhoosh, or a Garmin Connect payload to a watch or
-    head unit. The procedures cover FTP sourcing, the upload call, verifying
-    the stored result, and the traps that fail silently.
+    Read `garmin-upload` or `mywhoosh-upload` before uploading, scheduling or
+    exporting a rendered cycling workout — a .zwo to MyWhoosh, or a Garmin
+    Connect payload to a watch or head unit. They cover FTP sourcing, the
+    upload call, verifying the stored result, and the traps that fail silently.
+
+    Read `coaching` when the athlete is talking about their training rather
+    than about one workout file: what to do this week, a session they missed, a
+    race they are building toward. It covers the onboarding interview, the
+    weekly loop, and the adaptation rules.
 
     Call this whenever you are asked to follow, use, or run one of this
     server's skills by name — for example "use the mywhoosh-upload skill" — or
@@ -805,9 +812,10 @@ def get_skill(name: str | None = None) -> str:
     Neither route lets a model retrieve a procedure it has just been asked for,
     which is what this tool is for.
 
-    Both skills stop and ask before doing anything irreversible — a MyWhoosh
-    export spends a finite slot credit — so follow them as written rather than
-    summarising them.
+    The upload skills stop and ask before doing anything irreversible — a
+    MyWhoosh export spends a finite slot credit — and `coaching` proposes a
+    week rather than pushing it. Follow them as written rather than summarising
+    them.
     """
     skills = load_skills()
     if not skills:
@@ -874,6 +882,19 @@ def _coach(function, **kwargs) -> str:
     """
     try:
         result = function(**kwargs)
+    except json.JSONDecodeError as exc:
+        # A ValueError subclass, so the clause below would render corrupted
+        # stored JSON — a spec_json this server wrote and can no longer read —
+        # as an ordinary refusal. It is not one: nothing the caller passed is
+        # wrong, and the database needs looking at.
+        return _dump(
+            {
+                "ok": False,
+                "error": f"stored JSON in the coaching database could not be parsed: {exc}",
+                "database": db_status(),
+                "hint": "Restore from an export_data backup, or repair the row by hand.",
+            }
+        )
     except (CoachError, StoreError, GarminPayloadError, ValueError) as exc:
         return _dump({"ok": False, "error": str(exc)})
     except sqlite3.Error as exc:
@@ -1143,10 +1164,13 @@ def list_events(when: str = "all", status: str | None = None, today: str | None 
 def record_race_result(
     event_id: int,
     activity_id: int | None = None,
-    garmin_activity_id: str | None = None,
-    finish_time: str | None = None,
+    # str | int, because Garmin's activityId is a JSON number and pydantic does
+    # not coerce one to a string: a str-only schema rejected the call before any
+    # code here ran. Same for finish_time, whose docstring promises seconds.
+    garmin_activity_id: str | int | None = None,
+    finish_time: str | float | None = None,
     debrief: str | None = None,
-    status: str = "completed",
+    status: str | None = None,
     force: bool = False,
 ) -> str:
     """Close out a race: link the ride, store the time, write the debrief.
@@ -1159,8 +1183,13 @@ def record_race_result(
     stops being flagged as unplanned training. It still counts in full toward
     load and CTL — the athlete's body did not know it was a race.
 
-    `finish_time` takes "4:32:10" or seconds. The **debrief is the point**: what
-    the pacing was, what was eaten and when, where it went wrong, what to change.
+    Omit `status` and an event still marked `upcoming` becomes `completed`,
+    while one already marked `abandoned` or `dns` **keeps that** — adding a
+    debrief months later must not quietly rewrite a race the athlete did not
+    finish into one they did. Pass `status` explicitly to change it.
+
+    `finish_time` takes "4:32:10" or a number of seconds. The **debrief is the
+    point**: what the pacing was, what was eaten and when, what went wrong.
     Write it from the ride data plus what the athlete says, in their terms, and
     store it while it is fresh. A year later it is the only part of this record
     that still teaches anything.
@@ -1218,7 +1247,7 @@ def import_activities(payload: list | dict | str) -> str:
 def import_activity_laps(
     payload: list | dict | str,
     activity_id: int | None = None,
-    garmin_activity_id: str | None = None,
+    garmin_activity_id: str | int | None = None,
 ) -> str:
     """Store one activity's splits, in execution order. Pass get_activity_splits output.
 
@@ -1247,7 +1276,7 @@ def import_activity_laps(
 @app.tool()
 def annotate_activity(
     activity_id: int | None = None,
-    garmin_activity_id: str | None = None,
+    garmin_activity_id: str | int | None = None,
     rpe: int | None = None,
     feel: str | None = None,
     note: str | None = None,
@@ -1309,7 +1338,7 @@ def list_activities(
 def link_activity(
     planned_workout_id: int,
     activity_id: int | None = None,
-    garmin_activity_id: str | None = None,
+    garmin_activity_id: str | int | None = None,
     auto: bool = False,
 ) -> str:
     """Attach the ride that happened to the session that was planned.
@@ -1335,7 +1364,9 @@ def link_activity(
 
 @app.tool()
 def save_planned_workouts(workouts: list[dict]) -> str:
-    """Store planned sessions. Each item is {"spec": ..., "scheduled_date": "YYYY-MM-DD", "note": ...}.
+    """Store planned sessions, one item per session.
+
+    Each item is {"spec": ..., "scheduled_date": "YYYY-MM-DD", "note": ...}.
 
     The spec is exactly the document render_garmin and render_zwo consume — call
     spec_schema if the format is not already familiar. It is stored verbatim, so
@@ -1504,13 +1535,20 @@ def compliance_report(planned_workout_id: int, activity_id: int | None = None) -
     separate an interval session ridden properly from the same average ridden
     as steady tempo. Say which of the two you are looking at.
 
-    A block within 5% of its target counts as on target. A recovery, warmup or
-    cooldown ridden *below* target is `easier_than_target` and not a miss —
+    A block within 5% of its target counts as on target. That is deliberately
+    not the band `render_garmin` shows on the head unit (2% for intervals, 5%
+    easy): the rendered band is what the athlete was told to hold, this is how
+    far off an average has to be before it is worth mentioning.
+
+    A recovery, warmup or cooldown ridden *below* target is `easier_than_target`
+    and not a miss —
     that target is a ceiling. But a block cut short **is** a deviation even
     when the watts were right: `off_target_blocks` counts wrong power,
     `deviating_blocks` adds short and long, and `verdict` follows the latter.
-    `unverifiable_blocks` is blocks that recorded no power — missing data
-    rather than a failed session.
+    `unverifiable_blocks` is blocks that recorded no power; they count toward
+    neither, because a lap with no watts says nothing about whether the target
+    was held. When every block is unverifiable the verdict is `unverifiable` —
+    an HR-only ride is not evidence the session was ridden correctly.
 
     Read `sentences` first: it is the report in order, already phrased.
     """

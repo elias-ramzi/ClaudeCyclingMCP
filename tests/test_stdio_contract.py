@@ -349,3 +349,60 @@ def test_every_coach_tool_answers_over_stdio(coach_client):
     assert coach_client.call("list_events")["ok"] is True
     assert coach_client.call("export_data")["ok"] is True
     assert coach_client.call("get_skill", name="coaching")["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "tool,arguments",
+    [
+        ("annotate_activity", {"garmin_activity_id": 5001, "rpe": 7}),
+        ("import_activity_laps", {"garmin_activity_id": 5001, "payload": {"lapDTOs": [{}]}}),
+    ],
+)
+def test_a_numeric_garmin_id_is_accepted_by_the_tool_schema(coach_client, tool, arguments):
+    """Garmin's activityId is a JSON number and pydantic does not coerce one to
+    a string, so a `str | None` schema rejected the call before any coach code
+    ran — the id form the repo's own fixtures use was unreachable over the wire.
+    """
+    coach_client.call(
+        "import_activities",
+        payload=[{**RIDE, "activityId": 5001}],
+    )
+    result = coach_client.call(tool, **arguments)
+    assert "_error" not in result, result
+    assert result["ok"] is True, result
+
+
+def test_a_numeric_finish_time_is_accepted_by_the_tool_schema(coach_client):
+    """The docstring promises "4:32:10" or seconds; seconds must reach the code."""
+    event = coach_client.call(
+        "add_event", name="Numeric finish", event_date="2026-07-04", priority="C"
+    )
+    result = coach_client.call(
+        "record_race_result", event_id=event["stored"]["id"], finish_time=16330
+    )
+    assert "_error" not in result, result
+    assert result["stored"]["finish_time"] == "4:32:10"
+
+
+def test_a_numeric_id_links_a_planned_session(coach_client):
+    coach_client.call("import_activities", payload=[{**RIDE, "activityId": 5001}])
+    saved = coach_client.call(
+        "save_planned_workouts",
+        workouts=[
+            {
+                "spec": {
+                    "name": "Linked",
+                    "ftp": 266,
+                    "blocks": [{"type": "steady", "duration": 3600, "power_pct": 65}],
+                },
+                "scheduled_date": "2026-07-05",
+            }
+        ],
+    )
+    result = coach_client.call(
+        "link_activity",
+        planned_workout_id=saved["planned_workouts"][0]["id"],
+        garmin_activity_id=5001,
+    )
+    assert "_error" not in result, result
+    assert result["linked"] is True
