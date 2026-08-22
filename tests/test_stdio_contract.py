@@ -429,3 +429,22 @@ def test_split_summaries_are_refused_at_the_tool_boundary(coach_client):
     )
     assert result["ok"] is False
     assert "get_activity_splits" in result["error"]
+
+
+def test_clearing_a_text_field_survives_the_schema(coach_client):
+    """`clear` is a list of names over the wire. A schema that rejected it, or
+    coerced it to a string, would leave the only erase path unreachable — which
+    is exactly how the str-only garmin_activity_id bugs shipped."""
+    coach_client.call("update_profile", constraints="broken collarbone — no outdoor riding")
+    result = coach_client.call("update_profile", clear=["constraints"])
+    assert "_error" not in result, result
+    assert result["ok"] is True
+    assert result["cleared_fields"] == ["constraints"]
+    assert result["athlete"]["constraints"] is None
+
+
+def test_clearing_a_field_the_tool_does_not_own_is_a_refusal_over_the_wire(coach_client):
+    result = coach_client.call("update_profile", clear=["debrief"])
+    assert "_error" not in result
+    assert result["ok"] is False
+    assert "cannot clear 'debrief'" in result["error"]

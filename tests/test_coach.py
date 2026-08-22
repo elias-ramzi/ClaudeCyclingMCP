@@ -1729,6 +1729,19 @@ def test_laps_that_really_do_not_add_up_are_still_reported():
     )
     assert "belong to a different ride" in result["warning"]
     assert "laps_missing_duration" not in result
+    assert "see warning" in result["duration_check"]
+
+
+def test_laps_that_do_add_up_say_so_rather_than_saying_nothing():
+    """A missing `warning` cannot distinguish a sum that matched from one that
+    was never made, and the tool docstring promises which it was."""
+    coach.import_activities([RIDE])  # 4200 s
+    result = coach.import_activity_laps(
+        {"lapDTOs": [{"lapIndex": 1, "duration": 2100.0}, {"lapIndex": 2, "duration": 2100.0}]},
+        garmin_activity_id="5001",
+    )
+    assert "warning" not in result
+    assert result["duration_check"] == "the 2 laps sum to 4200 s against the activity's 4200 s."
 
 
 def test_relinking_a_completed_session_does_not_warn_about_completing_it():
@@ -1765,3 +1778,238 @@ def test_a_colon_less_utc_offset_keeps_the_instant_it_carries():
     assert stored["start_time_local"] == "2026-08-20T23:12:33"
     assert stored["start_time_utc"] == "2026-08-20T21:12:33"
     assert stored["local_date"] == "2026-08-20"
+
+
+# --------------------------------------------------------------------------
+# review round 4 — two of these are overcorrections by the round 3 fixes
+# --------------------------------------------------------------------------
+
+
+def test_a_sentinel_dated_ride_does_not_take_the_batch_down_with_it():
+    """The offset conversion raised OverflowError on the zero-date sentinel, so
+    one corrupt row aborted the whole import call. A bad row is rejected with a
+    reason; it never costs the rides beside it."""
+    result = coach.import_activities(
+        [
+            {"activityId": 8001, "startTimeGMT": "0001-01-01T00:00:00+0200", "duration": 3600.0},
+            RIDE,
+        ]
+    )
+    assert result["inserted"] == 1
+    assert result["rejected"] == 1
+    assert result["rejections"][0]["index"] == 0
+    assert "start time" in result["rejections"][0]["reason"]
+    assert [entry["garmin_activity_id"] for entry in result["activities"]["inserted"]] == ["5001"]
+
+
+def test_timed_laps_that_already_exceed_the_ride_still_warn():
+    """The round-3 fix suppressed the cross-check whenever any lap lacked a
+    duration — but the untimed laps can only *add* time, so a partial sum
+    already past the ride's duration is a mismatch nothing missing explains.
+    A wrong-ride import passed in silence."""
+    coach.import_activities([RIDE])  # 4200 s
+    result = coach.import_activity_laps(
+        {
+            "lapDTOs": [
+                {"lapIndex": 1, "duration": 5000.0},
+                {"lapIndex": 2},
+                {"lapIndex": 3, "duration": 5000.0},
+            ]
+        },
+        garmin_activity_id="5001",
+    )
+    assert result["laps_missing_duration"] == 1
+    assert "already exceeds it" in result["duration_check"]
+    assert "belong to a different ride" in result["warning"]
+    assert "2 timed laps sum to 10000 s but the activity is 4200 s" in result["warning"]
+
+
+def test_a_shortfall_with_untimed_laps_is_still_not_a_mismatch():
+    """The other direction of the same inference, and the part of the round-3
+    fix that was right: the missing laps could be the shortfall."""
+    coach.import_activities([RIDE])  # 4200 s
+    result = coach.import_activity_laps(
+        {"lapDTOs": [{"lapIndex": 1, "duration": 1200.0}, {"lapIndex": 2}]},
+        garmin_activity_id="5001",
+    )
+    assert result["laps_missing_duration"] == 1
+    assert "could be those laps rather than a gap" in result["duration_check"]
+    assert "warning" not in result
+
+
+def test_get_form_says_how_many_rides_it_could_not_score():
+    """An unscored ride steps its day as a rest day, so a season with a dozen
+    produces a CTL indistinguishable from detraining — silently, until now."""
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities(
+        [
+            RIDE,
+            {
+                "activityId": 8100,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-06 07:00:00",
+                "duration": 7200.0,
+            },
+            {
+                "activityId": 8101,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-07 07:00:00",
+                "duration": 5400.0,
+            },
+        ]
+    )
+    form = coach.get_form("2026-07-05", "2026-07-08")
+    assert form["unscored"] == 2
+    assert "2 activities could not be scored" in form["unscored_warning"]
+    assert "stepped as though it were a rest day" in form["unscored_warning"]
+    assert "CTL and ATL read low" in form["unscored_warning"]
+
+
+def test_get_form_says_nothing_when_every_ride_scored():
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities([RIDE])
+    form = coach.get_form("2026-07-05", "2026-07-08")
+    assert "unscored" not in form
+    assert "unscored_warning" not in form
+
+
+def test_a_backdated_resting_hr_does_not_promise_zones_it_withholds():
+    """The note ended "the zones below are the ones in force on …" while the
+    zones gate — a resting HR says nothing about threshold — left the response
+    without any. A model relaying it fabricates the zones or reports the
+    contradiction."""
+    coach.log_hr(resting_hr=48, effective_date="2026-08-01")
+    result = coach.log_hr(resting_hr=52, effective_date="2026-01-01")
+
+    assert result["is_current"] is False
+    assert "backdated" in result["note"]
+    assert "zones below" not in result["note"]
+    assert "in_effect_today" in result["note"]
+    assert "hr_zones" not in result
+
+
+def test_a_backdated_threshold_still_points_at_the_zones_it_returns():
+    coach.log_hr(threshold_hr=168, effective_date="2026-08-01")
+    result = coach.log_hr(threshold_hr=160, effective_date="2026-01-01")
+    assert "zones below are the ones in force on 2026-01-01" in result["note"]
+    assert result["hr_zones"], "the note points at these"
+
+
+# --- clearing a stored text field ----------------------------------------
+
+
+def test_a_stored_constraint_can_be_retired_explicitly():
+    """Blank is ignored by design, which left no way at all to say the
+    collarbone healed — so every future plan routed around an injury that was
+    over, or the coach wrote "none" and downstream read a constraint."""
+    coach.update_profile(constraints="broken collarbone — no outdoor riding")
+    result = coach.update_profile(clear=["constraints"])
+
+    assert result["cleared_fields"] == ["constraints"]
+    assert "only way to empty a stored text field" in result["cleared_note"]
+    assert result["athlete"]["constraints"] is None
+    assert coach.get_profile()["athlete"]["constraints"] is None
+
+
+def test_clearing_one_field_leaves_the_others_alone():
+    coach.update_profile(availability="Tue, Thu, Sat", constraints="shift work until March")
+    result = coach.update_profile(clear=["constraints"], equipment="Kickr")
+    assert result["updated_fields"] == ["constraints", "equipment"]
+    assert result["athlete"]["availability"] == "Tue, Thu, Sat"
+    assert result["athlete"]["equipment"] == "Kickr"
+    assert result["athlete"]["constraints"] is None
+
+
+def test_blank_and_cleared_and_omitted_do_three_different_things():
+    coach.update_profile(availability="Tue, Thu, Sat", constraints="shift work", equipment="Kickr")
+    result = coach.update_profile(availability="", clear=["constraints"])
+
+    assert result["athlete"]["availability"] == "Tue, Thu, Sat", "blank leaves it alone"
+    assert result["athlete"]["constraints"] is None, "clear empties it"
+    assert result["athlete"]["equipment"] == "Kickr", "omitted leaves it alone"
+    assert result["cleared_fields"] == ["constraints"]
+    assert result["ignored_blank_fields"] == ["availability"]
+    assert "clear=['availability']" in result["ignored_blank_note"]
+
+
+def test_a_field_given_both_blank_and_clear_is_cleared_once():
+    """Not a contradiction — the blank is a no-op — but the response must not
+    name the same field as both ignored and erased."""
+    coach.update_profile(constraints="shift work")
+    result = coach.update_profile(constraints="", clear=["constraints"])
+    assert result["cleared_fields"] == ["constraints"]
+    assert "ignored_blank_fields" not in result
+    assert result["athlete"]["constraints"] is None
+
+
+def test_a_field_given_both_new_text_and_clear_is_refused():
+    coach.update_profile(constraints="shift work")
+    with pytest.raises(coach.CoachError, match="both new text and a request to clear"):
+        coach.update_profile(constraints="travelling in June", clear=["constraints"])
+    assert coach.get_profile()["athlete"]["constraints"] == "shift work"
+
+
+def test_clearing_a_field_the_tool_does_not_own_is_refused():
+    event = coach.add_event("Club 100", "2026-07-04", priority="B", note="church")["stored"]
+    with pytest.raises(coach.CoachError, match="cannot clear 'debrief' here"):
+        coach.update_event(event["id"], clear=["debrief"])
+    with pytest.raises(coach.CoachError, match="cannot clear 'name' here"):
+        coach.update_event(event["id"], clear=["name"])
+    stored = coach.list_events()["events"][0]
+    assert (stored["name"], stored["note"]) == ("Club 100", "church")
+
+
+def test_a_debrief_can_be_cleared_off_the_wrong_race():
+    event = coach.add_event("Club 100", "2026-07-04", priority="B", status="completed")["stored"]
+    coach.record_race_result(event["id"], debrief="filed against the wrong race")
+    result = coach.record_race_result(event["id"], clear=["debrief"])
+
+    assert result["cleared_fields"] == ["debrief"]
+    assert result["stored"]["debrief"] is None
+    assert "No debrief stored" in result["missing"]
+
+
+def test_clearing_a_debrief_does_not_complete_an_upcoming_race():
+    """Erasing is a change, and still not a result. Reading "did anything
+    change" instead of "was a result given" would undo round 3's fix."""
+    event = coach.add_event("Club 100", "2026-09-04", priority="A")["stored"]
+    coach.update_event(event["id"], note="ignore me")
+    result = coach.record_race_result(event["id"], clear=["debrief"])
+    assert result["stored"]["status"] == "upcoming"
+    assert result["cleared_fields"] == ["debrief"]
+
+
+def test_an_annotation_and_a_session_note_can_be_cleared_too():
+    coach.import_activities([RIDE])
+    coach.annotate_activity(garmin_activity_id="5001", note="stored on the wrong ride", feel="ok")
+    annotated = coach.annotate_activity(garmin_activity_id="5001", clear=["note"])
+    assert annotated["cleared_fields"] == ["note"]
+    assert annotated["stored"]["note"] is None
+    assert annotated["stored"]["feel"] == "ok", "clearing one leaves the other"
+
+    saved = coach.save_planned_workouts(
+        [{"spec": SPEC, "scheduled_date": "2026-07-05", "note": "outdoors if dry"}]
+    )
+    planned_id = saved["planned_workouts"][0]["id"]
+    updated = coach.update_planned_workout(planned_id, clear=["note"])
+    assert updated["cleared_fields"] == ["note"]
+    assert updated["planned_workout"]["note"] is None
+
+
+def test_clear_takes_a_list_and_refuses_anything_else():
+    with pytest.raises(coach.CoachError, match="clear must be a list"):
+        coach.update_profile(clear={"constraints": True})
+
+
+def test_a_ride_with_no_duration_says_the_laps_could_not_be_checked():
+    """The other side of the same gate: with no ride duration there is nothing
+    to compare against, and the untimed-laps sentence would refer to an "it"
+    that does not exist."""
+    _ride_with_no_duration(activity_id=8200)
+    result = coach.import_activity_laps(
+        {"lapDTOs": [{"lapIndex": 1, "duration": 1200.0}, {"lapIndex": 2}]},
+        garmin_activity_id="8200",
+    )
+    assert "the activity carries no duration" in result["duration_check"]
+    assert result["laps_missing_duration"] == 1
+    assert "warning" not in result

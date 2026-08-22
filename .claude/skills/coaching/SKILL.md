@@ -67,7 +67,10 @@ Roughly this order, because each answer changes what is worth asking next:
    HR strap or wrist. This decides whether outdoor sessions can carry watt
    targets at all. → `update_profile`.
 4. **Constraints.** Injuries, travel, shift work, anything the plan must route
-   around. → `update_profile`.
+   around. → `update_profile`. When one ends — the collarbone heals, the travel
+   is over — retire it with `update_profile(clear=["constraints"])`. Do not
+   write "none": that is a constraint string, and every plan afterwards routes
+   around it. Blank text is ignored by design, so `clear` is the only erase.
 5. **Objectives.** What are they training for, when is it, how long and how
    hilly, and how much it matters (A/B/C). Ask about past editions of the same
    event too — those go in as events with status `completed`.

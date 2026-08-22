@@ -78,11 +78,16 @@ _INT_FIELDS = {"avg_hr", "max_hr"}
 # A fractional-seconds field, with whatever follows it (an offset, or nothing).
 _FRACTION = re.compile(r"^(.*?)\.(\d+)(.*)$")
 
-# A trailing UTC offset, colon or no colon. `strftime("%z")` writes "+0200",
-# which `fromisoformat` refuses before 3.11 — and which a fallback that strips
-# it turns into an instant two hours from the truth. A date cannot match this:
-# "2026-08-20" has no two digits left after the sign and the day.
-_OFFSET = re.compile(r"([+-])(\d{2}):?(\d{2})$")
+# A trailing UTC offset in any legal ISO-8601 spelling: "+02:00", "+0200",
+# "+02". `strftime("%z")` writes the middle one and `fromisoformat` refuses it
+# before 3.11 — and a fallback that strips an offset turns it into an instant
+# two hours from the truth. The minute field is optional because the hour-only
+# form was the fourth shape of that same defect to be found; matching the shape
+# is what lets `_from_patterns` reject anything it still cannot apply. With the
+# minutes optional this *can* match inside a bare date — "2026-08-20" ends in
+# "-20" — so it is never read on its own: `_split_offset` requires a time in
+# front of it.
+_OFFSET = re.compile(r"([+-])(\d{2})(?::?(\d{2}))?$")
 
 
 class GarminPayloadError(ValueError):
@@ -266,7 +271,14 @@ def _timestamp(value: Any, to_utc: bool = False) -> str | None:
         seconds = float(value) / 1000.0
         if seconds < 10**8:
             return None
-        return (datetime(1970, 1, 1) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            moment = datetime(1970, 1, 1) + timedelta(seconds=seconds)
+        except (OverflowError, OSError, ValueError):
+            # Same rule as the offset conversion below: a number too large to
+            # be a date is an unreadable timestamp, not a reason to abort the
+            # import call and lose every valid ride beside it.
+            return None
+        return moment.strftime("%Y-%m-%dT%H:%M:%S")
     if not isinstance(value, str):
         return None
 
@@ -285,7 +297,9 @@ def _timestamp(value: Any, to_utc: bool = False) -> str | None:
     if iso.endswith(("Z", "z")):
         iso = iso[:-1] + "+00:00"
     iso = _pad_fraction(iso)
-    iso = _OFFSET.sub(r"\1\2:\3", iso)
+    body, offset = _split_offset(iso)
+    if offset is not None:
+        iso = body + offset
     try:
         parsed = datetime.fromisoformat(iso)
     except ValueError:
@@ -295,31 +309,71 @@ def _timestamp(value: Any, to_utc: bool = False) -> str | None:
     if parsed is None:
         return None
     if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc) if to_utc else parsed.replace(tzinfo=None)
+        try:
+            parsed = parsed.astimezone(timezone.utc) if to_utc else parsed.replace(tzinfo=None)
+        except (OverflowError, OSError, ValueError):
+            # A sentinel date with an offset — "0001-01-01T00:00:00+0200", the
+            # zero date some exporters write — cannot be moved to UTC without
+            # leaving the representable range. A payload is data, not input the
+            # caller controls: raising here aborted the whole import call and
+            # took every valid ride in the batch with it. An unconvertible
+            # timestamp is an unreadable one, and the per-row rejection path
+            # already says so with a reason.
+            return None
     return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _split_offset(iso: str) -> tuple[str, str | None]:
+    """A timestamp split into its datetime part and its UTC offset as `+HH:MM`.
+
+    The offset is only read off a string that carries a time. Without that
+    guard the hour-only form matches inside a bare date — "2026-08-20" ends in
+    "-20" — and would turn a date into an instant twenty hours away.
+    """
+    match = _OFFSET.search(iso)
+    if match is None:
+        return iso, None
+    body = iso[: match.start()]
+    if "T" not in body:
+        return iso, None
+    return body, f"{match.group(1)}{match.group(2)}:{match.group(3) or '00'}"
 
 
 def _from_patterns(iso: str) -> datetime | None:
     """The shapes `fromisoformat` will not take, with any UTC offset preserved.
 
-    The offset is split off and reattached rather than truncated away. A
-    fallback that silently drops "+02:00" answers with a real-looking instant
-    two hours from the truth, and nothing downstream can tell — which is worse
-    than this function returning None and the activity being rejected.
+    The offset is split off and reattached rather than truncated away, and
+    anything still attached that this function cannot account for is a
+    rejection rather than a truncation. That rule is the point: a fallback that
+    silently drops "+02:00" answers with a real-looking instant two hours from
+    the truth and nothing downstream can tell, and four rounds of review found
+    four spellings of the same offset doing exactly that, one at a time.
+    Rejecting costs one row, which `import_activities` reports with a reason.
     """
-    offset = None
-    match = _OFFSET.search(iso)
-    if match is not None:
-        iso = iso[: match.start()]
-        sign = -1 if match.group(1) == "-" else 1
-        offset = timezone(sign * timedelta(hours=int(match.group(2)), minutes=int(match.group(3))))
-    body = iso.replace("T", " ").split(".")[0].strip()
+    body, offset = _split_offset(iso)
+    tzinfo = None
+    if offset is not None:
+        sign = -1 if offset[0] == "-" else 1
+        try:
+            tzinfo = timezone(sign * timedelta(hours=int(offset[1:3]), minutes=int(offset[4:6])))
+        except ValueError:
+            # "+99:00" is not a UTC offset. Refuse rather than drop it.
+            return None
+
+    # Drop a fractional-seconds field, and *only* a fractional-seconds field.
+    # Truncating at the dot is what discarded offsets for four rounds; if what
+    # follows the dot is not digits alone, something is still attached that
+    # this function has not accounted for.
+    head, dot, tail = body.partition(".")
+    if dot and not tail.isdigit():
+        return None
+
     for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            parsed = datetime.strptime(body, pattern)
+            parsed = datetime.strptime(head.replace("T", " ").strip(), pattern)
         except ValueError:
             continue
-        return parsed if offset is None else parsed.replace(tzinfo=offset)
+        return parsed if tzinfo is None else parsed.replace(tzinfo=tzinfo)
     return None
 
 

@@ -429,3 +429,142 @@ def test_the_fallback_never_drops_a_utc_offset(monkeypatch):
     assert garmin_import._timestamp("2026-08-20T23:12:33.5+0200") == "2026-08-20T23:12:33"
     assert garmin_import._timestamp("2026-08-20T23:12:33Z", to_utc=True) == "2026-08-20T23:12:33"
     assert garmin_import._timestamp("2026-08-20") == "2026-08-20T00:00:00"
+
+
+# --------------------------------------------------------------------------
+# review round 4 — the offset class, closed
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0001-01-01T00:00:00+0200",  # the zero-date sentinel some exporters write
+        "0001-01-01T00:00:00.5+02:00",
+        "9999-12-31T23:59:59-0500",
+        10**20,  # epoch milliseconds far outside any representable date
+    ],
+)
+def test_an_unrepresentable_instant_is_refused_not_raised(value):
+    """`astimezone` raises OverflowError at the edges of the range. Import
+    handles a bad row by rejecting it with a reason; an exception aborts the
+    whole call instead and takes every valid ride in the batch with it."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp(value, to_utc=True) is None
+
+
+def test_a_sentinel_timestamp_is_a_rejection_reason_not_an_exception():
+    """`normalize_activity` reports a bad row; it never raises. The offset
+    conversion did, which killed the caller's whole batch."""
+    from cycling_mcp.garmin_import import normalize_activity
+
+    row, reason = normalize_activity(
+        {"activityId": 4242, "startTimeGMT": "0001-01-01T00:00:00+0200", "duration": 3600.0}
+    )
+    assert row is None
+    assert "start time" in reason
+
+
+def test_a_sentinel_utc_time_still_keeps_a_readable_local_one():
+    """The local wall clock needs no conversion, so it survives — the row is
+    stored with a null UTC time rather than discarded."""
+    from cycling_mcp.garmin_import import normalize_activity
+
+    row, reason = normalize_activity(
+        {
+            "activityId": 4243,
+            "startTimeGMT": "0001-01-01T00:00:00+0200",
+            "startTimeLocal": "0001-01-01T00:00:00+0200",
+            "duration": 3600.0,
+        }
+    )
+    assert reason is None
+    assert row["start_time_utc"] is None
+    assert row["start_time_local"] == "0001-01-01T00:00:00"
+
+
+@pytest.mark.parametrize(
+    "value,to_utc,expected",
+    [
+        ("2026-08-20T23:12:33.5+02", True, "2026-08-20T21:12:33"),
+        ("2026-08-20T23:12:33+02", True, "2026-08-20T21:12:33"),
+        ("2026-08-20T23:12:33.5+02", False, "2026-08-20T23:12:33"),
+        ("2026-08-20T23:12:33-05", True, "2026-08-21T04:12:33"),
+    ],
+)
+def test_an_hour_only_offset_is_applied(value, to_utc, expected):
+    """The fourth spelling of the same offset, found one at a time across four
+    rounds: "+02" is legal ISO-8601 and `_OFFSET` wanted four digits."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp(value, to_utc=to_utc) == expected
+
+
+def test_the_hour_only_form_does_not_turn_a_date_into_an_offset():
+    """Making the minutes optional lets the pattern match inside "2026-08-20",
+    whose tail is "-20". `_split_offset` requires a time in front of it."""
+    from cycling_mcp.garmin_import import _split_offset, _timestamp
+
+    assert _split_offset("2026-08-20") == ("2026-08-20", None)
+    assert _timestamp("2026-08-20", to_utc=True) == "2026-08-20T00:00:00"
+    assert _timestamp("2026-08-20") == "2026-08-20T00:00:00"
+
+
+def _strict_fromisoformat(monkeypatch):
+    """Make `fromisoformat` refuse everything, which is what 3.10 does to the
+    offset and fraction shapes below. The declared floor is the only version
+    that reaches the pattern fallback for these."""
+    from datetime import datetime as real_datetime
+
+    from cycling_mcp import garmin_import
+
+    class Strict(real_datetime):
+        @classmethod
+        def fromisoformat(cls, value):
+            raise ValueError("simulating Python 3.10")
+
+    monkeypatch.setattr(garmin_import, "datetime", Strict)
+    return garmin_import
+
+
+def test_the_fallback_applies_an_hour_only_offset(monkeypatch):
+    garmin_import = _strict_fromisoformat(monkeypatch)
+    assert garmin_import._timestamp("2026-08-20T23:12:33.5+02", to_utc=True) == (
+        "2026-08-20T21:12:33"
+    )
+    assert garmin_import._timestamp("2026-08-20T23:12:33.5+02") == "2026-08-20T23:12:33"
+
+
+def test_the_fallback_rejects_a_trailing_offset_it_cannot_apply(monkeypatch):
+    """The class fix: rather than truncating at the dot and silently dropping
+    whatever followed, anything still attached is a rejection. Worst case one
+    row is refused with a reason, which import_activities already reports."""
+    garmin_import = _strict_fromisoformat(monkeypatch)
+    for value in (
+        "2026-08-20T23:12:33.5+2:00",  # one-digit hour: not an offset this reads
+        "2026-08-20T23:12:33.500x",
+        "2026-08-20T23:12:33+99:00",  # 99 hours is not a UTC offset
+    ):
+        assert garmin_import._timestamp(value, to_utc=True) is None, value
+
+
+def test_the_fallback_still_reads_the_shapes_it_always_did(monkeypatch):
+    garmin_import = _strict_fromisoformat(monkeypatch)
+    assert garmin_import._timestamp("2026-08-20 23:12:33") == "2026-08-20T23:12:33"
+    assert garmin_import._timestamp("2026-08-20") == "2026-08-20T00:00:00"
+    assert garmin_import._timestamp("2026-08-20T23:12:33Z", to_utc=True) == "2026-08-20T23:12:33"
+    assert garmin_import._timestamp("2026-08-20T23:12:33.5+0200", to_utc=True) == (
+        "2026-08-20T21:12:33"
+    )
+
+
+def test_the_lap_columns_and_the_lap_aliases_stay_in_step():
+    """The INSERT writes `row.get(field)`, so a key drifted between these two
+    lists stores NULL with no test failing — drop `avg_power` and every block
+    of every session compares as `no_power`. The activities pair has the same
+    pinning test one table over."""
+    from cycling_mcp import coach
+    from cycling_mcp.garmin_import import _LAP_ALIASES
+
+    assert set(coach._LAP_OUT_FIELDS) == {"lap_index"} | set(_LAP_ALIASES)

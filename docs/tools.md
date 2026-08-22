@@ -24,7 +24,7 @@ and what it holds.
 | Tool | Does |
 |---|---|
 | `get_profile` | Athlete, current FTP/weight/HR, and a `gaps` list naming everything still unknown. The onboarding agenda. |
-| `update_profile` | Partial update of the athlete fields: availability, equipment, constraints. |
+| `update_profile` | Partial update of the athlete fields: availability, equipment, constraints. Blank text is ignored; `clear=[...]` erases. |
 | `log_ftp` | Append a dated FTP, or a 20-minute test converted at 0.95 with the method recorded. |
 | `log_weight` · `log_hr` | Append a dated weight, or threshold / max / resting heart rate. |
 | `get_zones` | Power and HR zones from the figures in effect on a date — not necessarily today's. |

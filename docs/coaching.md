@@ -346,10 +346,21 @@ linking the Sunday spin after a Saturday race, which then makes the A-event look
 
 `record_race_result` completes an event still marked `upcoming` — but only when the call carries a
 result. A bare call writes nothing, so a retry or an existence probe cannot close a race with no
-time, no ride and no debrief. And an empty string is never an erase: across every stored free-text
-field — debrief, event and session notes, `feel`, the profile fields — blank text leaves what is
-stored alone and the response names the field it ignored. A stored value is replaced by better
-text, never by nothing.
+time, no ride and no debrief.
+
+### Blank text, and the one way to erase
+
+An empty string is never an erase. Across every stored free-text field — debrief, event and session
+notes, `feel`, the profile fields — blank text leaves what is stored alone and the response names
+the field it ignored. A stray empty form field cannot destroy a debrief.
+
+Erasing is a verb instead: `clear=["constraints"]` on the same tool empties the named fields and
+reports `cleared_fields`. It exists because "leave it alone" is the wrong answer when a note has
+stopped being true — a healed collarbone sitting in `constraints` routes every future plan around
+an injury that is over, and writing "none" leaves a constraint string downstream reads as real.
+Each tool clears only its own free-text fields; naming anything else is refused rather than
+quietly ignored, because a caller clearing the wrong field is destroying something. An event's
+name is not clearable: an event without one is not a record.
 
 ## Nulls the coach layer refuses to round off
 
@@ -359,6 +370,14 @@ and `compute_load`, `compliance_report` says it could not be checked rather than
 shortfall against the plan, and `import_activity_laps` reports how many laps carry no time instead
 of accusing a ride's own splits of belonging to a different ride. Same rule as a null TSS: a zero
 is indistinguishable from a real zero, and a fabricated deviation is worse than no answer.
+
+Suppressing a check is not the same as having no information, though. Untimed laps stop a *shortfall*
+being called a mismatch — the missing laps could be it — but an **overshoot** is still reported,
+because untimed laps can only add time. `import_activity_laps` always returns `duration_check`
+saying which comparison it made, since a missing warning otherwise reads as a verified sum. The same one-directional honesty runs through the totals: a
+null TSS is never summed as zero, and `_aggregate_load`, `get_week` and `get_form` each say how many
+rides they could not score, because a `get_form` curve built past a dozen unscored rides looks
+exactly like detraining.
 
 ## Schema and migrations
 

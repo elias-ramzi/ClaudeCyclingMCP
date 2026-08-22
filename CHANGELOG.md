@@ -280,6 +280,62 @@ eagerly, so `get_profile` issues three queries where it issued five and `log_hr`
 four; the identity-set block classification is gone, superseded by the partition; and
 `_pad_fraction`'s docstring no longer claims a 3-digit fraction comes back unchanged.
 
+#### Found in the fourth review round
+
+Eight, down from ten. Two are **overcorrections by the round-3 fixes** — a suppression that went
+one case too wide — and one is a capability that round 3 removed without replacing.
+
+- **A sentinel date with an offset took the whole import batch down.**
+  `"0001-01-01T00:00:00+0200"` — the zero-date some exporters write — made the UTC conversion raise
+  `OverflowError`, and `import_activities` reports a bad row with a reason rather than by throwing,
+  so one corrupt row aborted the call and lost every valid ride beside it. Newly reachable, because
+  round 3 started reattaching the offsets the old fallback stripped. The conversion and the
+  epoch-milliseconds branch beside it now return None, and the row is rejected with a reason.
+- **An untimed lap silenced a provable wrong-ride warning.** *(Overcorrection.)* Round 3 stopped a
+  lap with no duration being read as zero and blamed for a gap — right — but suppressed the
+  cross-check entirely, including when the timed laps *already exceed* the ride. Untimed laps can
+  only add time, so that direction is a mismatch nothing missing can explain, and a genuine
+  wrong-ride import passed in silence. The shortfall direction stays suppressed; the overshoot
+  warns again; a ride with no duration of its own says so instead of comparing against nothing;
+  and `duration_check` is now always returned, because the absence of a `warning` could not
+  distinguish a sum that matched from one that was never made.
+- **`get_form` read unscored rides as rest days, silently.** The last consumer of a null TSS without
+  unscored accounting: a ride with no power and no heart rate never entered the series, so its day
+  stepped as a rest day and a season with a dozen of them produced a CTL indistinguishable from
+  detraining. It now reports `unscored` and the shared `_unscored_warning`, and still invents no
+  load.
+- **There was no way at all to clear a stored free-text field.** Blank-means-ignored closed the
+  accidental-erase hole and left no deliberate one: a healed injury sitting in `constraints` routed
+  every future plan around an injury that was over, and the workaround — writing "none" — is a
+  constraint string downstream reads as real. Every update tool now takes `clear=["field", ...]`,
+  which NULLs the named fields and reports `cleared_fields`. Blank still means "leave it alone";
+  the erase is a verb, not a magic value. A field the tool does not own is refused (raised), as is
+  a field given both new text and a clear; an event's name is not clearable at all. Clearing a
+  debrief is explicitly *not* a result, so it cannot complete an upcoming race.
+- **`log_hr`'s backdating note promised zones the response withheld.** *(Overcorrection.)* Round 3
+  gated `hr_zones` on the entry carrying a threshold or a max HR, but left the note ending "the
+  zones below are the ones in force on …" — so a backdated resting-HR entry pointed at zones that
+  were not there. The backdating warning stays unconditional; only the sentence pointing at the
+  zones is now conditioned on the same gate that emits them.
+- **On Python 3.10 an hour-only offset still stored a wrong instant.** `"…33.5+02"` was the fourth
+  spelling of one defect fixed one shape at a time across four rounds, so this fixes the class:
+  `_OFFSET` matches every legal spelling (`+02:00`, `+0200`, `+02`) and normalises to one, and the
+  pattern fallback now **rejects** any input still carrying a trailing offset it cannot apply
+  instead of truncating at the dot. No future offset shape can silently corrupt an instant; the
+  worst case is a rejected row with a reason. The widened pattern can match inside a bare date
+  ("2026-08-20" ends in "-20"), so an offset is only read when a time precedes it — pinned by test.
+- **The lap column list and the lap alias table were unpinned.** The INSERT writes `row.get(field)`,
+  so a key drifted between the two silently stores NULL: drop `avg_power` and every block of every
+  session compares as `no_power`. The activities pair got this test in round 3; the laps pair has
+  the mirror of it now.
+- **The laps tool docstring omitted the untimed-laps branch**, so a model could read a missing
+  `warning` as "sum verified" when the response said it had not been checked. Both branches are
+  documented, in the post-fix behaviour.
+
+Also from that review: `docs/coaching.md`, `docs/tools.md` and the `coaching` skill document the
+clear verb and the one-directional lap check; `_unscored_warning` takes the clause its third caller
+needed; and `get_form`'s docstrings on both layers say what an unscored ride does to the curve.
+
 ### Notes
 
 Ingestion is model-mediated by design: Claude fetches from the Garmin MCP and passes the JSON here

@@ -946,6 +946,7 @@ def update_profile(
     availability: str | None = None,
     equipment: str | None = None,
     constraints: str | None = None,
+    clear: list[str] | None = None,
 ) -> str:
     """Set athlete fields. Anything omitted is left as it was.
 
@@ -960,6 +961,12 @@ def update_profile(
     - `constraints` — injuries, travel, shift work, anything the plan has to
       route around.
 
+    Empty text is ignored, never stored: passing `constraints=""` leaves the
+    stored constraint exactly as it was. To retire one that has stopped being
+    true — the collarbone healed — pass `clear=["constraints"]`, which empties
+    it and reports `cleared_fields`. Do **not** write "none" instead: that is a
+    constraint string, and every plan afterwards routes around it.
+
     Returns the stored row. FTP, weight and HR are not here: they are dated
     history, not profile fields — use log_ftp / log_weight / log_hr.
     """
@@ -971,6 +978,7 @@ def update_profile(
         availability=availability,
         equipment=equipment,
         constraints=constraints,
+        clear=clear,
     )
 
 
@@ -1127,6 +1135,7 @@ def update_event(
     priority: str | None = None,
     status: str | None = None,
     note: str | None = None,
+    clear: list[str] | None = None,
 ) -> str:
     """Change an event's details: a moved date, a corrected profile, a dropped priority.
 
@@ -1134,6 +1143,9 @@ def update_event(
     and `dns` (did not start). Use record_race_result rather than this to close
     out a race that was ridden — it links the activity and stores the debrief,
     which this deliberately will not touch.
+
+    A blank `note` is ignored rather than stored; `clear=["note"]` empties it.
+    The name is not clearable — an event without one is not a record.
     """
     return _coach(
         coach.update_event,
@@ -1145,6 +1157,7 @@ def update_event(
         priority=priority,
         status=status,
         note=note,
+        clear=clear,
     )
 
 
@@ -1178,6 +1191,7 @@ def record_race_result(
     debrief: str | None = None,
     status: str | None = None,
     force: bool = False,
+    clear: list[str] | None = None,
 ) -> str:
     """Close out a race: link the ride, store the time, write the debrief.
 
@@ -1197,7 +1211,9 @@ def record_race_result(
 
     An empty `debrief` is not an erase instruction. Blank text never overwrites
     what is stored — pass the corrected text instead — and the response names
-    any field that was ignored for that reason.
+    any field that was ignored for that reason. To empty a debrief filed
+    against the wrong race, pass `clear=["debrief"]`; that is an erase, not a
+    result, so it never completes an upcoming event.
 
     `finish_time` takes "4:32:10" or a number of seconds. The **debrief is the
     point**: what the pacing was, what was eaten and when, what went wrong.
@@ -1214,6 +1230,7 @@ def record_race_result(
         debrief=debrief,
         status=status,
         force=force,
+        clear=clear,
     )
 
 
@@ -1272,9 +1289,22 @@ def import_activity_laps(
     its rows do not line up with a plan's blocks and comparing against them
     would produce confident statements about the wrong thing.
 
-    Re-importing replaces the stored laps rather than doubling them. Warns when
-    the laps do not sum to the activity's duration, which usually means they
-    belong to a different ride.
+    Re-importing replaces the stored laps rather than doubling them.
+
+    `duration_check` always says what the lap sum was compared against, because
+    the absence of a `warning` cannot distinguish a sum that matched from one
+    that was never made:
+
+    * every lap timed — the sum is compared with the activity's duration, and a
+      gap either way also returns `warning`, which usually means the splits
+      belong to a different ride;
+    * some lap carries no duration — `laps_missing_duration` says how many, and
+      a *shortfall* is not reported as a mismatch, because the missing laps
+      could account for it. An **overshoot** still returns `warning`: untimed
+      laps can only add time, so a partial sum already past the ride's duration
+      is a mismatch nothing missing can explain;
+    * the activity itself carries no duration — nothing to compare against, and
+      `duration_check` says so.
     """
     return _coach(
         coach.import_activity_laps,
@@ -1291,6 +1321,7 @@ def annotate_activity(
     rpe: int | None = None,
     feel: str | None = None,
     note: str | None = None,
+    clear: list[str] | None = None,
 ) -> str:
     """Attach the subjective read to a ride: RPE 1-10, how it felt, free text.
 
@@ -1306,7 +1337,8 @@ def annotate_activity(
 
     Empty text is never an erase instruction: a blank `feel` or `note` leaves
     the stored one alone and is named in the response. Pass the replacement
-    text to change it.
+    text to change it, or `clear=["note"]` to empty one stored against the
+    wrong ride.
     """
     return _coach(
         coach.annotate_activity,
@@ -1315,6 +1347,7 @@ def annotate_activity(
         rpe=rpe,
         feel=feel,
         note=note,
+        clear=clear,
     )
 
 
@@ -1418,6 +1451,7 @@ def update_planned_workout(
     note: str | None = None,
     spec: dict | None = None,
     linked_activity_id: int | None = None,
+    clear: list[str] | None = None,
 ) -> str:
     """Change a planned session: status, date, push target, note, or the spec itself.
 
@@ -1431,7 +1465,8 @@ def update_planned_workout(
     the athlete's life, and that is the thing to fix.
 
     Replacing `spec` re-validates it and refuses an invalid one, exactly as
-    save_planned_workouts does.
+    save_planned_workouts does. A blank `note` is ignored rather than stored;
+    `clear=["note"]` empties it.
     """
     return _coach(
         coach.update_planned_workout,
@@ -1442,6 +1477,7 @@ def update_planned_workout(
         note=note,
         spec=spec,
         linked_activity_id=linked_activity_id,
+        clear=clear,
     )
 
 
@@ -1524,6 +1560,10 @@ def get_form(start: str, end: str, seed_ctl: float = 0.0, seed_atl: float = 0.0)
     are still climbing out of zero and `warmup_incomplete` says so — an athlete
     whose first import is three weeks old has a CTL that describes the import
     date, not them.
+
+    A ride with no power and no heart rate cannot be scored and adds nothing,
+    so its day steps as a rest day. `unscored_warning` says how many did that:
+    read it before calling a falling CTL detraining.
 
     **Cross-check against the Garmin MCP's `get_training_load_trend`.** Garmin
     computes from everything it holds, this from what was imported, and it uses
