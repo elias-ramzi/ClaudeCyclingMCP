@@ -54,13 +54,15 @@ jobs:
       - name: Verify the skills are in the wheel
         run: |
           set -euo pipefail
-          for skill in garmin-upload mywhoosh-upload; do
+          # Every skill the repo ships, not a list written out here — a second
+          # copy is a second thing to forget when one is added.
+          for skill in $(ls .claude/skills); do
             if ! unzip -l dist/*.whl | grep -q "cycling_mcp/_skills/$skill/SKILL.md"; then
               echo "::error::$skill is missing from the built wheel"
               exit 1
             fi
           done
-          echo "OK: both skills are packaged"
+          echo "OK: every skill in .claude/skills is packaged"
 
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1

@@ -88,4 +88,32 @@ def test_plugin_skills_path_resolves():
     skills = (ROOT / plugin["skills"]).resolve()
     assert skills.is_dir(), skills
     found = sorted(p.name for p in skills.iterdir() if p.is_dir())
-    assert found == ["garmin-upload", "mywhoosh-upload"]
+    assert found == ["coaching", "garmin-upload", "mywhoosh-upload"]
+
+
+def test_the_mcpb_manifest_lists_the_tools_the_server_registers():
+    """The bundle's manifest is what a Claude Desktop user reads before installing.
+
+    Nothing enforces it at pack time, so a tool added without touching the
+    manifest ships a description of a server that no longer exists. This is the
+    only thing that would notice.
+    """
+    from cycling_mcp.server import app
+
+    manager = getattr(app, "_tool_manager", None)
+    if manager is None:
+        pytest.skip("installed MCP SDK does not expose a tool manager to introspect")
+
+    manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
+    listed = sorted(tool["name"] for tool in manifest["tools"])
+    registered = sorted(tool.name for tool in manager.list_tools())
+    assert listed == registered
+
+
+def test_the_mcpb_manifest_lists_every_bundled_skill_as_a_prompt():
+    from cycling_mcp.skills import load_skills
+
+    manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
+    listed = sorted(prompt["name"] for prompt in manifest["prompts"])
+    bundled = sorted(skill.name for skill in load_skills(ROOT / ".claude" / "skills"))
+    assert listed == bundled

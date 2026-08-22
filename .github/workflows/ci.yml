@@ -55,14 +55,21 @@ jobs:
           VIRTUAL_ENV=/tmp/smoke uv pip install dist/*.whl
       - name: Server starts, tools and skills are served
         run: |
+          set -euo pipefail
+          # Read from the repo rather than hardcoding: a list written out here
+          # is a second place to remember, and adding a skill broke this job
+          # rather than the change that should have carried it.
+          EXPECTED_SKILLS=$(ls .claude/skills | sort | paste -sd, -)
           cd /tmp
-          /tmp/smoke/bin/python - <<'PY'
+          EXPECTED_SKILLS="$EXPECTED_SKILLS" /tmp/smoke/bin/python - <<'PY'
           import asyncio
+          import os
           from cycling_mcp.skills import load_skills
           from cycling_mcp.server import app, _register_skill_prompts
 
+          expected = os.environ["EXPECTED_SKILLS"].split(",")
           skills = [s.name for s in load_skills()]
-          assert skills == ['garmin-upload', 'mywhoosh-upload'], skills
+          assert skills == expected, f"wheel serves {skills}, repo has {expected}"
           assert _register_skill_prompts() == skills
 
           # Check the invariants this job exists for — that a wheel installed
@@ -72,7 +79,11 @@ jobs:
           REQUIRED = {'validate_spec', 'describe_spec', 'render_zwo', 'render_garmin',
                       'check_garmin_payload', 'verify_garmin_upload',
                       'verify_mywhoosh_import', 'verify_mywhoosh_library_entry',
-                      'spec_schema', 'get_skill', 'server_info'}
+                      'spec_schema', 'get_skill', 'server_info',
+                      # One per coach area, so a wheel that packaged the
+                      # renderers and dropped the coach layer fails here.
+                      'get_profile', 'import_activities', 'save_planned_workouts',
+                      'get_week', 'compute_load', 'get_form'}
 
           async def main():
               names = {t.name for t in await app.list_tools()}

@@ -7,7 +7,342 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **A coach layer.** The server now keeps the athlete's file in a local SQLite database at
+  `~/.claude-cycling/coach.db` (override with `CLAUDE_CYCLING_DB`), created on the first coaching
+  call. It holds the profile, append-only dated FTP / weight / HR history, objectives, a normalised
+  cache of imported Garmin activities with their raw payloads, optional per-lap splits, and planned
+  sessions stored as specs. Twenty-three new tools cover profile and history, events, activities,
+  planning, analysis and backup — see [docs/coaching.md](docs/coaching.md).
+- **Deterministic training analysis.** `compute_load` (power TSS against the FTP in effect on each
+  ride's own date, with an hrTSS fallback that is flagged as one), `get_form` (CTL/ATL/TSB on the
+  standard 42/7-day constants, TSB as yesterday's balance), `compliance_report` (planned blocks
+  against the executed laps, phrased as sentences), and `get_week` (plan against reality, with the
+  deviations both ways).
+- **A `coaching` skill**, bundled alongside `garmin-upload` and `mywhoosh-upload`. Generic — it
+  carries no athlete's facts. Covers the onboarding interview, driven by whatever the profile is
+  still missing rather than by a hardcoded script; the weekly loop; the adaptation rules; and the
+  rule that sessions are always proposed, never pushed.
+- **`server_info` now reports the database** — path, whether it exists, and its schema version —
+  without creating it.
+
+### Changed
+
+- **The purity note is narrower and true.** It said "this server is pure: no network, no
+  credentials, no uploads", and the only filesystem access was an `out_path` write. It now says
+  "no network, no credentials, no uploads; filesystem access is limited to this server's own
+  database and to explicit out_path writes". No network call or credential was added; a note that
+  has drifted from the behaviour is worse than no note.
+- **`render_garmin`, `render_zwo` and `check_garmin_payload` docstrings** point at the coach layer:
+  a stored planned session's spec is directly renderable, `get_week` flags one written against an
+  FTP that has since moved, and a verified upload should be recorded with
+  `update_planned_workout(status="pushed")`. No rendering behaviour changed.
+
+### Fixed
+
+Found by an adversarial review of the new code before it shipped; each is pinned by a test.
+
+- **A partial `log_hr` entry no longer shadows the figures already on file.** HR resolved the latest
+  *row*, so logging a resting HR on its own erased the threshold recorded months earlier — and every
+  no-power ride then came back unscored, with the reason "no threshold HR is on file". Each figure
+  now resolves independently and keeps the date it came from.
+- **A backdated `log_ftp` / `log_weight` / `log_hr` returns the row it actually wrote.** All three
+  re-read by date after inserting, so correcting an FTP to three weeks ago returned the *other*
+  entry as `stored` while returning zones computed from the new value — a response that contradicted
+  itself. They now read back by row id, report `is_current`, and compare `change` against the entry
+  the new one replaces rather than the globally latest.
+- **A database that cannot be opened is an answer, not a traceback.** `sqlite3.Error` is not an
+  `OSError`, so the `StoreError` path was unreachable, and the cleanup `ROLLBACK` raised over the top
+  of the real cause — pointing `CLAUDE_CYCLING_DB` at a non-database file reported "cannot rollback"
+  instead of "file is not a database".
+- **`compliance_report` no longer calls a session `as_prescribed` when a block was cut short.** Only
+  wrong-power blocks counted; an interval abandoned half-way at exactly the right watts passed.
+  `deviating_blocks` now covers short and long as well, and drives the verdict.
+- **`compliance_report` returns the laps on a count mismatch**, as its docstring already promised.
+  That is the one case where nothing could be compared and the laps are all the caller has.
+- **A thinner re-import cannot reclassify a ride's sport.** `sport` is derived, so it was never null
+  and the "a null never overwrites a stored value" rule did not cover it: re-importing a summary
+  without a type key rewrote a `virtual_ride` to `"other"`, dropping the ride out of every cycling
+  filter while `sub_sport` still said otherwise. A payload with no type now stores a null sport and
+  flags `no_sport_type`.
+- **`import_data` refuses a malformed row** instead of raising `AttributeError` across the tool
+  boundary after its delete sweep.
+
+#### Found in code review of the pull request
+
+Ten confirmed correctness bugs, each reproduced before fixing and pinned by a test.
+
+- **Four tool schemas rejected the numeric forms the coach layer was built to accept.**
+  `garmin_activity_id` was typed `str | None` on `link_activity`, `annotate_activity`,
+  `import_activity_laps` and `record_race_result`, and `finish_time` as `str | None` — but Garmin's
+  `activityId` is a JSON number and pydantic does not coerce one to a string, so those calls failed
+  schema validation before any code ran. `record_race_result`'s docstring promised `finish_time`
+  takes seconds; that form was unreachable over the wire.
+- **`_timestamp` could not read an ISO timestamp with a UTC offset.**
+  `"2026-08-20T07:12:33+02:00"` returned `None`, and an activity carrying that form on both start
+  times was rejected as having no readable start — a ride lost to a timezone suffix. It now parses
+  offsets, keeping the wall clock for a local time and converting for `startTimeGMT`.
+- **Weekly and listing totals folded a null TSS to zero and merged power TSS with hrTSS silently.**
+  A week with three unscored rides read as a light week, and `get_week` set the merged figure beside
+  an always-power-based `planned_tss`. One shared aggregator now reports `scored`, `unscored` and
+  `by_method` with both warnings, wherever a total appears.
+- **`compliance_report` counted `no_power` blocks as deviations**, so an HR-only ride with the right
+  lap count and durations came back `deviated` while the same blocks were also counted as
+  unverifiable. They now count toward neither, and a session where every block is unverifiable
+  gets its own verdict rather than a guess in either direction.
+- **`get_week` reported a cross-window linked ride as unplanned.** `link_activity` permits a Sunday
+  session ridden Monday, but only plans scheduled inside the window were consulted — so the ride
+  showed as "ridden with nothing planned for it" with the link in the database the whole time.
+  Links and event links are now looked up by activity, regardless of date.
+- **A ride with an unknown sport could never auto-link and vanished from cycling filters.** NULL
+  sport means Garmin sent no activity type, not that the ride was not a bike; `link_activity(auto)`
+  reported "no cycling activity stored on that date" for a ride sitting on exactly that date. Auto
+  matching now offers unknowns, and a sport filter reports the unknowns it hid instead of dropping
+  them in silence.
+- **`record_race_result` silently flipped an abandoned or DNS event back to completed.** Adding a
+  debrief months later rewrote the outcome. `status` omitted now means "leave it alone"; only an
+  event still `upcoming` is completed by filing a result.
+- **A future-dated FTP marked the current week's plans stale.** The check took the latest entry with
+  no date bound, so a scheduled test result — or a typo — told the coach to rewrite correct specs
+  against a number not yet in force. Each session is now checked against the FTP in effect on its
+  own date.
+- **`compute_load(activity_ids=[])` scored the entire history.** An empty list is a filter that
+  matched nothing, not an absent filter; it returned the athlete's whole log as the selection's
+  total. It now returns zero rows and says why.
+- **An estimated threshold HR hid the `threshold_hr` onboarding gap.** The check ran on the resolved
+  figure, which substitutes 92% of max HR, so once a max HR existed the athlete was never asked for
+  a measured LTHR again and every hrTSS stayed pinned to the estimate.
+
+Also, from the same review: corrupted stored JSON now reports as an error rather than a polite
+refusal; `list_activities` no longer claims `truncated` on an exact fit; `link_activity` reads a
+planned duration without expanding a 1 Hz power series; and the `server_info`, `get_skill` and
+`compliance_report` docstrings were corrected where they had drifted from the behaviour — including
+an explicit note that compliance's 5% tolerance is deliberately not the band `render_garmin` writes
+to the head unit.
+
+#### Consolidation, from the same review
+
+Structural cleanups with no intended behaviour change, except where noted.
+
+- **One resolver for every dated figure.** FTP, weight and each HR field went through two diverging
+  copies of the same latest-else-earliest rule; there is now one, and a `History` object that loads
+  the tiny history tables once per request and resolves in memory. `get_form` over 200 activities
+  went from 852 queries to 10, and `compute_load` from 1007 to 10 — measured, and now pinned by a
+  test that fails if the count scales with the number of rides. Reads also name their columns, so
+  `raw_json` is no longer hauled back for every row of a query that never looks at it.
+- **One TSS formula and one duration formatter.** `metrics.py` scored a plan and `training.py`
+  scored a ride with separate copies of `duration_h x IF^2 x 100`, and `compliance_report`'s whole
+  job is to set those two numbers side by side — two copies that drifted by a rounding choice would
+  have made every comparison a report on the arithmetic.
+- **One FTP plausibility band.** It was 50–600 in the validator and 40–700/80–500 in the store, so a
+  550 W FTP was queried when stored and accepted when rendered. Both now read `FTP_PLAUSIBLE_W` and
+  `FTP_USUAL_W` from `spec.py`. The two layers still *act* differently on the same numbers, which is
+  the point: the renderer warns, the store refuses to persist. The validator's warning band is
+  consequently 80–500 rather than 50–600.
+- **The backdated-entry logic is shared by all three loggers.** Only `log_ftp` reported `is_current`
+  and what superseded it; logging last month's weigh-in still handed back today's W/kg, and a
+  threshold HR from March still returned zones as though they were in force. `log_hr` answers per
+  field, because a backdated resting HR supersedes nothing about the threshold.
+- **Import data-quality flags are persisted** (schema v3, `activities.flags_json`) and returned as
+  `flags` on every read. They were computed at import and reported once, so no later read could see
+  that a ride's date came from UTC or its sport was unknown. They are now derived from the **stored
+  row** rather than from the payload that arrived — deriving them from the payload would stamp
+  `no_normalized_power` on a ride whose NP came from an earlier detailed fetch, which is the mistake
+  the null-preserving merge exists to prevent, one column over.
+- **Payload errors raise instead of returning `{"ok": False}`.** Those dicts survived only because
+  `_coach` spread the result after its own `ok` key; reordering that line would have reported a
+  failure as a success. `_coach` now raises if a result carries an `ok` of its own.
+
+The three numeric coercers were **not** merged, despite looking alike: `verify._number` rejects
+strings because a string in a DTO is a shape error, `verify._as_number` parses them but must not
+touch commas (it reads a page, where "1,234" is one thousand), and `garmin_import._number` reads a
+decimal comma because a European-locale export writes 232,5. Folding them together picks one
+behaviour for all three. Each now says so, and a test pins the differences.
+
+#### Found in the second review round
+
+Twelve more, each reproduced before fixing and pinned by a test. Four are regressions from the
+round-1 fixes above — a generalisation that stopped one line short — and are marked as such.
+
+- **`record_race_result` with no fields crashed on an empty UPDATE.** *(Regression.)* Making
+  `status` mean "leave it alone" let `updates` be empty, and unlike every sibling updater there was
+  no guard: `UPDATE events SET , updated_at = ?` is not a statement, and `_coach` reported the
+  syntax error as database corruption.
+- **A thin re-import could move a ride to the UTC day, with the flag suppressed.** *(Regression.)*
+  `local_date` was merged as an ordinary field, so a payload with no `startTimeLocal` brought a
+  UTC-derived date that overrode the stored one — while `start_time_local` still said otherwise and
+  no flag was raised, because the flag reads the start times. A 22:00 UTC-5 ride moved to the next
+  day, and the week showed a missed session and an unplanned ride on consecutive days. The date is
+  now derived from the merged row by the same function the flag reads.
+- **One clean block certified the untestable ones.** *(Regression.)* `unverifiable` was returned
+  only when *every* block was, so a warmup with power in front of five no-power intervals came back
+  `as_prescribed`. And a `free` block counted as evidence of compliance, so any plan containing one
+  could never report `unverifiable` at all. Any unverifiable block now earns the verdict.
+- **Duration deviations vanished on blocks with no power.** *(Regression.)* The drift check promoted
+  only an already-clean verdict, so an HR-only ride abandoned block by block reported nothing wrong.
+  Power and duration are now judged separately — every block carries a `verdict` and a
+  `duration_verdict` — because duration is verifiable without a power meter.
+- **On Python 3.10 a timestamp could be stored two hours wrong.** `fromisoformat` there wants
+  exactly 3 or 6 fractional digits, so `"…33.5+02:00"` fell to the fallback, which truncates at the
+  dot and took the UTC offset with it. Wrong and plausible is worse than the rejection this
+  replaced, and 3.10 is the declared floor. Reproduced on a real 3.10; the fraction is now padded
+  before parsing.
+- **`link_activity` silently rewrote a `skipped` session to `completed`.** Linking a ride is
+  evidence about the ride, not a reversal of a decision the coach made. It now auto-completes only
+  from `planned` or `pushed` and reports when it did not.
+- **`compute_load` still dropped unknown-sport rides under a sport filter**, recreating the
+  missed-session narrative one function over from where it was fixed. All three queries now share
+  one sport-filter helper.
+- **`get_week`'s `planned_tss` folded an unparseable spec to a silent zero** — the null-folds-to-zero
+  pattern `_aggregate_load` exists to stop, surviving on the planned side of the same summary. One
+  corrupt spec made a week read as over-performed; planned sessions now get the same scored/unscored
+  accounting as the actuals.
+- **`log_hr`'s estimation note overwrote the backdated-entry note**, so backfilling a max HR returned
+  zones with no statement that they are not the ones in force. It is a separate key now.
+- **`update_planned_workout` returned its refusal inside an `ok: true` envelope** — the defect class
+  the "a refusal is raised" rule exists to prevent, invisible to the new `_coach` guard because that
+  keys on the literal `"ok"`. It raises.
+- **`compute_load(activity_ids=[])` returned a different shape** from the normal path, which spreads
+  the aggregator. It now spreads it too, so the two cannot drift.
+- **`link_activity` ranked a candidate with no duration as a perfect match**, presenting it ahead of
+  a near-exact one in the ambiguous list. Missing durations sort last.
+
+Also from that review: `get_week` now uses the `History` already in scope instead of re-reading
+`ftp_history` per planned row; `_latest` delegates to the shared resolver; the test-only `_flags`
+key is gone, leaving one flag channel; the import dedup query names its columns and no longer
+serialises a payload it is about to discard; `get_week`'s event lookup drops a no-op overlay;
+`log_hr` and `get_zones` load each history table once; and `FTP_LIMITS`/`FTP_USUAL` no longer alias
+the shared constants under second names.
+
+#### Found in the third review round
+
+Ten more, each reproduced before fixing and pinned by a test that asserts the shape of the output
+rather than a count — the worst bug of this round survived a test that checked only how many rides
+came back. Most are siblings of a round-2 fix, in the function the fix did not reach, so each was
+fixed as a pattern across the module rather than at the cited line.
+
+- **An idempotent re-import answered `unchanged: [null]`.** *(Regression.)* The dedup query was
+  narrowed to the import fields, which do not include `garmin_activity_id`, while the unchanged
+  branch still projected the row through the wider read list — and a projection fills a column it
+  cannot see with None. Every data-quality caveat on an unchanged ride was anchored to no
+  identifiable activity, and its `rpe`, `feel` and `note` came back null too. Every read of an
+  activity row now uses the one column list, and a test pins that it covers the import fields.
+- **An empty string erased a stored debrief, event name, session note, annotation or profile
+  field.** `debrief=""` passed the `is not None` guard, `_text("")` returned None, and the UPDATE
+  wrote NULL over the field the docstring calls the only part of a race record still useful a year
+  later. One rule now covers every free-text update field: blank text never overwrites a stored
+  value, the response names any field ignored for that reason, and a call carrying nothing else
+  refuses with that reason rather than "pass at least one field".
+- **`log_hr` returned estimated zones and a false note over a measured threshold.** The zones keyed
+  off what *this* entry carried, so an athlete with 165 bpm on file who logged a max HR got zones
+  computed from 92% of it and "No threshold HR on file" — beside an `in_effect_today` in the same
+  response saying the threshold is measured and 165. Zones now come from the figures in force on the
+  entry's own date, and the estimation note only when that resolved threshold is itself an estimate.
+- **A bare `record_race_result` completed an upcoming race with nothing in it.** *(Regression.)*
+  The auto-complete ran before the empty-updates guard added in round 2, so a partial retry or an
+  existence probe closed the race with no time, no ride and no debrief. Completion now needs a call
+  that actually carries a result, and the no-op path returns the same shape — debrief nudge included
+  — as a real one instead of hand-building its own.
+- **Evidence-free blocks still counted toward `as_prescribed`.** *(Regression.)* Round 2 replaced a
+  closed-world classification with three positive buckets, so a block that was in none of them — a
+  free block whose lap carried no duration — was silently evidence that the session went to plan,
+  and a verdict added later would have been too. `classify_block` now partitions every
+  `(verdict, duration_verdict)` pair into exactly one of compliant / deviating / unverifiable,
+  treats an unknown duration as unverifiable, and raises on a verdict nothing recognises.
+  `compliance_report` reports `compliant_blocks` alongside the other two.
+- **A NULL ride duration was printed as "0:00" and reported as a deviation.** *(Regression of the
+  same null-folds-to-zero pattern round 2 fixed in `planned_tss`.)* `compliance_report` said "rode
+  0:00" and then "The ride was 1:00:00 shorter than planned" about a ride whose duration is simply
+  not stored; `get_week` and `compute_load` printed a zero-length ride. One formatter now prints
+  "unknown" wherever a duration may be null, and the comparison says it could not be made rather
+  than inventing a shortfall.
+- **NULL lap durations triggered the "splits belong to a different ride" warning.** Each contributed
+  zero to the lap total, so the sum fell short of the ride and the tool accused the ride's own
+  splits. It now counts the untimed laps and says the cross-check was not made.
+- **On Python 3.10 a colon-less UTC offset still stored an instant hours wrong.** `"…33.5+0200"` —
+  what `strftime("%z")` writes — was the third shape of the same defect patched in three rounds. The
+  offset colon is now normalised alongside the existing `Z` and fraction rewrites, and the fallback
+  splits any offset off and reapplies it instead of truncating at the dot: no path can drop an
+  offset any more.
+- **`link_activity` contradicted itself on a completed session.** Re-linking one to the correct ride
+  — the routine mislink correction — warned that "linking did not mark it completed" about a session
+  already completed, and invited a pointless status update. The note is now scoped to statuses that
+  are coaching decisions, and the two near-identical UPDATE statements are one.
+- **`get_week` printed a NULL ride duration as "0:00"** in the sentence a model relays, rather than
+  saying the length is unknown.
+
+Also from that review: `AUTO_COMPLETABLE_STATUSES` is used at all three sites that spelled out
+`('planned', 'pushed')`; the unknown-sport count and its snapshot-before-splice dance are one helper
+shared by `list_activities` and `compute_load`; the planned and actual sides of a week share one
+unscored-total warning; `History` reads each history table on first use rather than all three
+eagerly, so `get_profile` issues three queries where it issued five and `log_hr` one where it issued
+four; the identity-set block classification is gone, superseded by the partition; and
+`_pad_fraction`'s docstring no longer claims a 3-digit fraction comes back unchanged.
+
+#### Found in the fourth review round
+
+Eight, down from ten. Two are **overcorrections by the round-3 fixes** — a suppression that went
+one case too wide — and one is a capability that round 3 removed without replacing.
+
+- **A sentinel date with an offset took the whole import batch down.**
+  `"0001-01-01T00:00:00+0200"` — the zero-date some exporters write — made the UTC conversion raise
+  `OverflowError`, and `import_activities` reports a bad row with a reason rather than by throwing,
+  so one corrupt row aborted the call and lost every valid ride beside it. Newly reachable, because
+  round 3 started reattaching the offsets the old fallback stripped. The conversion and the
+  epoch-milliseconds branch beside it now return None, and the row is rejected with a reason.
+- **An untimed lap silenced a provable wrong-ride warning.** *(Overcorrection.)* Round 3 stopped a
+  lap with no duration being read as zero and blamed for a gap — right — but suppressed the
+  cross-check entirely, including when the timed laps *already exceed* the ride. Untimed laps can
+  only add time, so that direction is a mismatch nothing missing can explain, and a genuine
+  wrong-ride import passed in silence. The shortfall direction stays suppressed; the overshoot
+  warns again; a ride with no duration of its own says so instead of comparing against nothing;
+  and `duration_check` is now always returned, because the absence of a `warning` could not
+  distinguish a sum that matched from one that was never made.
+- **`get_form` read unscored rides as rest days, silently.** The last consumer of a null TSS without
+  unscored accounting: a ride with no power and no heart rate never entered the series, so its day
+  stepped as a rest day and a season with a dozen of them produced a CTL indistinguishable from
+  detraining. It now reports `unscored` and the shared `_unscored_warning`, and still invents no
+  load.
+- **There was no way at all to clear a stored free-text field.** Blank-means-ignored closed the
+  accidental-erase hole and left no deliberate one: a healed injury sitting in `constraints` routed
+  every future plan around an injury that was over, and the workaround — writing "none" — is a
+  constraint string downstream reads as real. Every update tool now takes `clear=["field", ...]`,
+  which NULLs the named fields and reports `cleared_fields`. Blank still means "leave it alone";
+  the erase is a verb, not a magic value. A field the tool does not own is refused (raised), as is
+  a field given both new text and a clear; an event's name is not clearable at all. Clearing a
+  debrief is explicitly *not* a result, so it cannot complete an upcoming race.
+- **`log_hr`'s backdating note promised zones the response withheld.** *(Overcorrection.)* Round 3
+  gated `hr_zones` on the entry carrying a threshold or a max HR, but left the note ending "the
+  zones below are the ones in force on …" — so a backdated resting-HR entry pointed at zones that
+  were not there. The backdating warning stays unconditional; only the sentence pointing at the
+  zones is now conditioned on the same gate that emits them.
+- **On Python 3.10 an hour-only offset still stored a wrong instant.** `"…33.5+02"` was the fourth
+  spelling of one defect fixed one shape at a time across four rounds, so this fixes the class:
+  `_OFFSET` matches every legal spelling (`+02:00`, `+0200`, `+02`) and normalises to one, and the
+  pattern fallback now **rejects** any input still carrying a trailing offset it cannot apply
+  instead of truncating at the dot. No future offset shape can silently corrupt an instant; the
+  worst case is a rejected row with a reason. The widened pattern can match inside a bare date
+  ("2026-08-20" ends in "-20"), so an offset is only read when a time precedes it — pinned by test.
+- **The lap column list and the lap alias table were unpinned.** The INSERT writes `row.get(field)`,
+  so a key drifted between the two silently stores NULL: drop `avg_power` and every block of every
+  session compares as `no_power`. The activities pair got this test in round 3; the laps pair has
+  the mirror of it now.
+- **The laps tool docstring omitted the untimed-laps branch**, so a model could read a missing
+  `warning` as "sum verified" when the response said it had not been checked. Both branches are
+  documented, in the post-fix behaviour.
+
+Also from that review: `docs/coaching.md`, `docs/tools.md` and the `coaching` skill document the
+clear verb and the one-directional lap check; `_unscored_warning` takes the clause its third caller
+needed; and `get_form`'s docstrings on both layers say what an unscored ride does to the curve.
+
+### Notes
+
+Ingestion is model-mediated by design: Claude fetches from the Garmin MCP and passes the JSON here
+unchanged. The import tools accept Garmin's own shapes — a bare list, a single activity, a wrapper
+dict, the nested `summaryDTO` form, a JSON string — rather than a clean typed schema, because a
+schema would make the model retype every number on the way through, and a mistyped average power is
+a training load that is wrong and looks entirely reasonable.
 
 ## [0.2.0] - 2026-08-21
 

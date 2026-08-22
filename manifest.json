@@ -4,7 +4,7 @@
   "display_name": "ClaudeCyclingMCP",
   "version": "0.1.0",
   "description": "Describe a structured cycling session once; render it to a MyWhoosh .zwo and a Garmin Connect workout.",
-  "long_description": "Writing a structured bike session means either clicking blocks around in a graphical editor or hand-writing XML — and the two platforms want different formats, so the same session gets built twice.\n\nThis server takes one flat, hand-editable workout spec and emits both files. Power is written in watts or % FTP; steady blocks, ramps, free rides and repeated sets are all supported, along with per-block cadence and on-screen messages.\n\n**Pure and offline.** Every tool is deterministic: no network calls, no credentials, no uploads. `describe_spec` returns a block table with computed watts and estimated IF/TSS so a session can be checked before it is rendered, and `verify_garmin_upload` compares an uploaded workout against what was actually sent.\n\n**Uploading lives in the bundled skills**, because it needs auth, a browser, and a human in the loop — a MyWhoosh export spends a finite slot credit. The skills ship as MCP prompts, so they are available from the prompt menu as soon as the server is connected.",
+  "long_description": "Writing a structured bike session means either clicking blocks around in a graphical editor or hand-writing XML — and the two platforms want different formats, so the same session gets built twice.\n\nThis server takes one flat, hand-editable workout spec and emits both files. Power is written in watts or % FTP; steady blocks, ramps, free rides and repeated sets are all supported, along with per-block cadence and on-screen messages.\n\n**Offline.** No network calls, no credentials, no uploads; filesystem access is limited to the server's own coaching database and to explicit out_path writes. `describe_spec` returns a block table with computed watts and estimated IF/TSS so a session can be checked before it is rendered, and `verify_garmin_upload` compares an uploaded workout against what was actually sent.\n\n**Uploading lives in the bundled skills**, because it needs auth, a browser, and a human in the loop — a MyWhoosh export spends a finite slot credit. The skills ship as MCP prompts, so they are available from the prompt menu as soon as the server is connected.\n\n**A coach layer on top.** The server keeps the athlete's file — profile, dated FTP/weight/HR history, objectives, imported Garmin activities and planned sessions — in a local SQLite database at ~/.claude-cycling/coach.db, and computes training load, CTL/ATL/TSB and plan-versus-actual compliance from it. It never talks to Garmin itself: the model fetches from the Garmin MCP and passes the payload through unchanged.",
   "author": {
     "name": "Elias Ramzi",
     "url": "https://github.com/elias-ramzi"
@@ -65,15 +65,107 @@
     },
     {
       "name": "server_info",
-      "description": "Identify this server: version, where it is loaded from, and what it serves"
+      "description": "Identify this server: version, where it is loaded from, what it serves, and where its coaching database lives"
     },
     {
       "name": "get_skill",
-      "description": "Fetch a bundled upload procedure by name"
+      "description": "Fetch a bundled procedure by name — the two upload flows, or coaching"
     },
     {
       "name": "spec_schema",
       "description": "Return the workout spec's JSON schema and authoring notes"
+    },
+    {
+      "name": "get_profile",
+      "description": "Read the athlete's file: profile, current FTP/weight/HR, and what is still unknown"
+    },
+    {
+      "name": "update_profile",
+      "description": "Set athlete fields: availability, equipment, constraints"
+    },
+    {
+      "name": "log_ftp",
+      "description": "Append a dated FTP, or a 20-minute test converted at the 0.95 convention"
+    },
+    {
+      "name": "log_weight",
+      "description": "Append a dated weight in kilograms"
+    },
+    {
+      "name": "log_hr",
+      "description": "Append dated heart-rate figures: threshold, maximum, resting"
+    },
+    {
+      "name": "get_zones",
+      "description": "Power and HR zones from the figures in effect on a date"
+    },
+    {
+      "name": "add_event",
+      "description": "Record a race or objective — what the training is for"
+    },
+    {
+      "name": "update_event",
+      "description": "Change an event's date, profile, priority or status"
+    },
+    {
+      "name": "list_events",
+      "description": "Every objective, with the next A-event and the weeks to it"
+    },
+    {
+      "name": "record_race_result",
+      "description": "Close out a race: link the ride, store the finish time and the debrief"
+    },
+    {
+      "name": "import_activities",
+      "description": "Store raw Garmin MCP activity output, idempotent on activityId"
+    },
+    {
+      "name": "import_activity_laps",
+      "description": "Store one ride's splits in execution order"
+    },
+    {
+      "name": "annotate_activity",
+      "description": "Attach RPE, feel and notes to a ride"
+    },
+    {
+      "name": "list_activities",
+      "description": "Stored activities in a date range, with computed training load"
+    },
+    {
+      "name": "link_activity",
+      "description": "Attach the ride that happened to the session that was planned"
+    },
+    {
+      "name": "save_planned_workouts",
+      "description": "Store planned sessions as validated, renderable specs"
+    },
+    {
+      "name": "update_planned_workout",
+      "description": "Change a planned session: status, date, push target, or its spec"
+    },
+    {
+      "name": "get_week",
+      "description": "Plan against reality for a date range, and where they diverge"
+    },
+    {
+      "name": "compute_load",
+      "description": "Training load per ride, against the FTP in effect on its own date"
+    },
+    {
+      "name": "get_form",
+      "description": "CTL, ATL and TSB across a date range from the stored activities"
+    },
+    {
+      "name": "compliance_report",
+      "description": "What was prescribed against what was ridden, block by block"
+    },
+    {
+      "name": "export_data",
+      "description": "Dump the coaching database as JSON with a digest of the content"
+    },
+    {
+      "name": "import_data",
+      "description": "Restore the coaching database, refusing to overwrite by default"
     }
   ],
   "prompts": [
@@ -88,6 +180,12 @@
       "description": "Build a cycling workout and import it into MyWhoosh through the browser",
       "arguments": ["session"],
       "text": "Follow the \"mywhoosh-upload\" procedure, using this server's tools. The full instructions are served by the server at run time; the session to build is ${arguments.session}."
+    },
+    {
+      "name": "coaching",
+      "description": "Coach an athlete: onboarding, the weekly plan, adaptation, the race debrief",
+      "arguments": ["session"],
+      "text": "Follow the \"coaching\" procedure, using this server's tools. The full instructions are served by the server at run time; what the athlete asked is ${arguments.session}."
     }
   ],
   "compatibility": {

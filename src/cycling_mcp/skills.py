@@ -23,6 +23,17 @@ _KEY_LINE = re.compile(r"^([A-Za-z_][\w-]*):[ \t]*(.*)$")
 _BLOCK_SCALARS = {">", ">-", ">+", "|", "|-", "|+"}
 
 
+# What the prompt's `session` argument means, and what to do without one. Both
+# read from optional frontmatter, because they are wrong for a skill that is
+# not about building one workout — a coaching prompt told to "ask what session
+# to build" starts in the wrong place entirely.
+DEFAULT_PROMPT_INPUT = "The session to build is"
+DEFAULT_PROMPT_FALLBACK = (
+    "Ask what session to build if that is not already clear from the "
+    "conversation, and confirm the FTP before rendering."
+)
+
+
 @dataclass(frozen=True)
 class Skill:
     """One bundled skill: its frontmatter identity plus the instruction body."""
@@ -30,6 +41,8 @@ class Skill:
     name: str
     description: str
     body: str
+    prompt_input: str = DEFAULT_PROMPT_INPUT
+    prompt_fallback: str = DEFAULT_PROMPT_FALLBACK
 
 
 def _skills_dir() -> Path:
@@ -109,7 +122,13 @@ def parse_skill(text: str) -> Skill | None:
     name, description = fields.get("name"), fields.get("description")
     if not name or not description or not body:
         return None
-    return Skill(name=name, description=description, body=body)
+    return Skill(
+        name=name,
+        description=description,
+        body=body,
+        prompt_input=fields.get("prompt_input") or DEFAULT_PROMPT_INPUT,
+        prompt_fallback=fields.get("prompt_fallback") or DEFAULT_PROMPT_FALLBACK,
+    )
 
 
 def load_skills(directory: Path | None = None) -> list[Skill]:
@@ -149,14 +168,16 @@ def build_skill_message(skill: Skill, session: str | None = None) -> str:
     A prompt arrives as an ordinary user message, so without this framing the
     model can mistake a procedure for reference material and summarise it
     instead of following it.
+
+    A skill can override what its argument means, and what to do without one,
+    through `prompt_input` and `prompt_fallback` in its frontmatter. The
+    defaults are written for the upload skills; a coaching prompt that opened
+    by asking which workout to build would start in the wrong place.
     """
     if session and session.strip():
-        scope = f"The session to build is: {session.strip()}"
+        scope = f"{skill.prompt_input}: {session.strip()}"
     else:
-        scope = (
-            "Ask what session to build if that is not already clear from the "
-            "conversation, and confirm the FTP before rendering."
-        )
+        scope = skill.prompt_fallback
     return (
         f'Follow the "{skill.name}" procedure below, using this server\'s tools.\n'
         f"{scope}\n\n---\n\n{skill.body}"

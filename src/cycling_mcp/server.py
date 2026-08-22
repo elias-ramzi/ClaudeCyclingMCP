@@ -1,14 +1,24 @@
 """MCP server: author a cycling workout once, render it for both platforms.
 
-Every tool here is pure and deterministic. Nothing in this server makes a
-network call, reads credentials, or uploads anything. Uploading needs auth and
-a human in the loop, so it lives in the bundled skills instead — see
-`.claude/skills/garmin-upload` and `.claude/skills/mywhoosh-upload`.
+Two layers. The renderers and verifiers are pure and deterministic — a spec in,
+a file or a comparison out, nothing stored. The coach layer above them keeps the
+athlete's file in a local SQLite database: profile, dated FTP/weight/HR history,
+objectives, imported activities, planned sessions, and the load arithmetic over
+all of it.
+
+Neither layer makes a network call or holds a credential. Activities reach this
+server because the model fetched them from the Garmin MCP and passed them in;
+uploads leave it the same way, through the bundled skills, with a human in the
+loop — see `.claude/skills/garmin-upload`, `mywhoosh-upload` and `coaching`.
+
+Filesystem access is limited to the coaching database and to explicit `out_path`
+writes. `server_info` reports where that database is.
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,7 +28,9 @@ try:  # mcp SDK 2.x
 except ImportError:  # mcp SDK 1.x, where the same class is called FastMCP
     from mcp.server.fastmcp import FastMCP as _Server
 
-from . import __version__
+from . import __version__, coach
+from .coach import CoachError
+from .garmin_import import GarminPayloadError
 from .metrics import compute_metrics, describe
 from .render_garmin import render_garmin as _render_garmin
 from .render_zwo import render_zwo as _render_zwo
@@ -26,6 +38,7 @@ from .render_zwo import zwo_filename
 from .skills import Skill, _skills_dir, build_skill_message, load_skills
 from .spec import FTP_SOURCES, SpecError, load_spec
 from .spec import validate_spec as _validate_spec
+from .store import StoreError, db_status
 from .verify import (
     compare_library_entry,
     compare_mywhoosh_import,
@@ -353,6 +366,12 @@ def render_zwo(spec: dict, out_path: str | None = None) -> str:
     "xml_js_literal" is the same XML as a ready-made JavaScript string literal.
     Use it rather than interpolating "xml" into a template literal: a backtick
     or a "${" in a workout name or message would otherwise break the script.
+
+    A planned session stored by save_planned_workouts holds this same spec
+    verbatim: pass its `spec` straight here, no translation. After a verified
+    import, record it with update_planned_workout(status="pushed",
+    pushed_to="mywhoosh") — otherwise nothing distinguishes a session that
+    reached the trainer from one that was only written down.
     """
     try:
         workout = load_spec(spec)
@@ -420,6 +439,13 @@ def render_garmin(spec: dict, out_path: str | None = None) -> str:
 
     Pass out_path to also write the payload as JSON to disk. That path is
     resolved on the machine running this server; a failed write says so.
+
+    A planned session stored by save_planned_workouts holds this same spec
+    verbatim: pass its `spec` straight here, no translation. Check
+    get_week for a `stale_ftp` flag first — a session written against an FTP
+    that has since moved renders watts for the athlete they used to be. After a
+    verified upload, record it with update_planned_workout(status="pushed",
+    pushed_to="garmin").
     """
     try:
         workout = load_spec(spec)
@@ -513,6 +539,10 @@ def check_garmin_payload(
     names the step and field, rather than only saying that something differs.
 
     Pure comparison, no network access.
+
+    When the payload came from a stored planned session, this is also the step
+    that catches a spec edited in the database but not re-rendered: pass the
+    stored `spec` and the diff names the field.
     """
     actual = payload_digest(payload)
     result: dict[str, Any] = {
@@ -722,9 +752,18 @@ def server_info() -> str:
     is a build fingerprint — a tool that exists in one release and not another
     dates a session precisely — but only if you can see it alongside a version.
 
-    It also answers instantly and touches nothing, so a reply is proof the
-    server is alive and a non-reply is not about this server being slow: no
-    tool here has ever taken more than a few milliseconds.
+    It answers instantly, so a reply is proof the server is alive and a
+    non-reply is not about this server being slow: no tool here has ever taken
+    more than a few milliseconds. It is very nearly side-effect free — it stats
+    the coaching database and, if one is there, opens it read-only to read the
+    schema version. It never creates it.
+
+    "database" reports the coaching store: its path, whether it exists yet, and
+    its schema version. Reading it does not create it — a tool whose job is to
+    describe the world must not change it, or "exists: true" would only ever
+    mean "you asked". A null schema_version on a file that exists means the
+    file is there but unreadable, which is worth investigating before writing
+    to it.
     """
     skills = load_skills()
     return _dump(
@@ -736,9 +775,10 @@ def server_info() -> str:
             "skills": [skill.name for skill in skills],
             "skills_dir": str(_skills_dir()),
             "uploads": False,
+            "database": db_status(),
             "note": (
-                "This server is pure: no network, no credentials, no uploads. The only "
-                "filesystem access is writing a rendered file when out_path is given."
+                "No network, no credentials, no uploads; filesystem access is limited to "
+                "this server's own database and to explicit out_path writes."
             ),
         }
     )
@@ -746,12 +786,17 @@ def server_info() -> str:
 
 @app.tool()
 def get_skill(name: str | None = None) -> str:
-    """Fetch a bundled procedure for uploading a workout to a platform.
+    """Fetch a bundled procedure by name: the two upload flows, or coaching.
 
-    Read this before uploading, scheduling, or exporting a rendered cycling
-    workout — a .zwo to MyWhoosh, or a Garmin Connect payload to a watch or
-    head unit. The procedures cover FTP sourcing, the upload call, verifying
-    the stored result, and the traps that fail silently.
+    Read `garmin-upload` or `mywhoosh-upload` before uploading, scheduling or
+    exporting a rendered cycling workout — a .zwo to MyWhoosh, or a Garmin
+    Connect payload to a watch or head unit. They cover FTP sourcing, the
+    upload call, verifying the stored result, and the traps that fail silently.
+
+    Read `coaching` when the athlete is talking about their training rather
+    than about one workout file: what to do this week, a session they missed, a
+    race they are building toward. It covers the onboarding interview, the
+    weekly loop, and the adaptation rules.
 
     Call this whenever you are asked to follow, use, or run one of this
     server's skills by name — for example "use the mywhoosh-upload skill" — or
@@ -767,9 +812,10 @@ def get_skill(name: str | None = None) -> str:
     Neither route lets a model retrieve a procedure it has just been asked for,
     which is what this tool is for.
 
-    Both skills stop and ask before doing anything irreversible — a MyWhoosh
-    export spends a finite slot credit — so follow them as written rather than
-    summarising them.
+    The upload skills stop and ask before doing anything irreversible — a
+    MyWhoosh export spends a finite slot credit — and `coaching` proposes a
+    week rather than pushing it. Follow them as written rather than summarising
+    them.
     """
     skills = load_skills()
     if not skills:
@@ -816,6 +862,805 @@ def spec_schema() -> str:
     Call this before writing a spec by hand if the format is not already known.
     """
     return _dump({"schema": SPEC_SCHEMA, "authoring_notes": _AUTHORING_NOTES})
+
+
+# --------------------------------------------------------------------------
+# the coach layer
+#
+# These read and write the athlete's local database. Everything above this
+# point is pure; everything below stores state. Still no network and no
+# credentials — Claude fetches from the Garmin MCP and passes the result here.
+# --------------------------------------------------------------------------
+
+
+def _coach(function, **kwargs) -> str:
+    """Run a coach operation, turning a refusal into a readable result.
+
+    A refusal here is an answer, not a crash: "that FTP is outside the range I
+    will store" is something the caller acts on, and an exception thrown across
+    the tool boundary arrives as an error string with no structure.
+    """
+    try:
+        result = function(**kwargs)
+    except json.JSONDecodeError as exc:
+        # A ValueError subclass, so the clause below would render corrupted
+        # stored JSON — a spec_json this server wrote and can no longer read —
+        # as an ordinary refusal. It is not one: nothing the caller passed is
+        # wrong, and the database needs looking at.
+        return _dump(
+            {
+                "ok": False,
+                "error": f"stored JSON in the coaching database could not be parsed: {exc}",
+                "database": db_status(),
+                "hint": "Restore from an export_data backup, or repair the row by hand.",
+            }
+        )
+    except (CoachError, StoreError, GarminPayloadError, ValueError) as exc:
+        return _dump({"ok": False, "error": str(exc)})
+    except sqlite3.Error as exc:
+        # A database that cannot be read is the caller's problem to act on —
+        # usually a CLAUDE_CYCLING_DB pointing somewhere unexpected. Thrown
+        # across the tool boundary it arrives as an unstructured error with no
+        # indication of which database it was talking about.
+        return _dump(
+            {
+                "ok": False,
+                "error": f"the coaching database could not be used: {exc}",
+                "database": db_status(),
+            }
+        )
+    if "ok" in result:
+        # Every refusal is raised, so nothing should be setting this itself. A
+        # function that returned {"ok": False} used to work only because the
+        # spread below happened to come last — reorder that line and a failure
+        # is reported as a success.
+        raise RuntimeError(f"{function.__name__} returned its own 'ok' key; it should raise")
+    return _dump({"ok": True, **result})
+
+
+@app.tool()
+def get_profile() -> str:
+    """Read the athlete's file: who they are, current FTP/weight/HR, and what is missing.
+
+    Call this first, every time, before writing a plan or a target. It answers
+    the two questions everything downstream depends on — what is the FTP, and
+    when was it set — and it is cheap.
+
+    The `gaps` list names every field with nothing on file, each with what it
+    is needed for. On a fresh database that list is the whole profile, which is
+    the signal to start an onboarding conversation rather than to report an
+    error. Ask about the gaps a few at a time, in the athlete's own terms, and
+    store answers as they arrive with update_profile / log_ftp / log_weight /
+    log_hr. Do not read the list out as a form.
+
+    Creates the database on first call. See server_info for where it lives.
+    """
+    return _coach(coach.get_profile)
+
+
+@app.tool()
+def update_profile(
+    display_name: str | None = None,
+    height_cm: float | None = None,
+    birth_year: int | None = None,
+    availability: str | None = None,
+    equipment: str | None = None,
+    constraints: str | None = None,
+    clear: list[str] | None = None,
+) -> str:
+    """Set athlete fields. Anything omitted is left as it was.
+
+    The three free-text fields carry most of the weight, so record what was
+    actually said rather than a tidied summary:
+
+    - `availability` — sessions per week, which days, which day the long ride
+      can go on, how long an evening session can run.
+    - `equipment` — trainer and which app, whether there is a power meter
+      outdoors, HR strap or wrist. Whether power exists outdoors decides
+      whether outdoor sessions can carry watt targets at all.
+    - `constraints` — injuries, travel, shift work, anything the plan has to
+      route around.
+
+    Empty text is ignored, never stored: passing `constraints=""` leaves the
+    stored constraint exactly as it was. To retire one that has stopped being
+    true — the collarbone healed — pass `clear=["constraints"]`, which empties
+    it and reports `cleared_fields`. Do **not** write "none" instead: that is a
+    constraint string, and every plan afterwards routes around it.
+
+    Returns the stored row. FTP, weight and HR are not here: they are dated
+    history, not profile fields — use log_ftp / log_weight / log_hr.
+    """
+    return _coach(
+        coach.update_profile,
+        display_name=display_name,
+        height_cm=height_cm,
+        birth_year=birth_year,
+        availability=availability,
+        equipment=equipment,
+        constraints=constraints,
+        clear=clear,
+    )
+
+
+@app.tool()
+def log_ftp(
+    value_watts: float | None = None,
+    twenty_min_watts: float | None = None,
+    effective_date: str | None = None,
+    method: str | None = None,
+    note: str | None = None,
+) -> str:
+    """Record a dated FTP. Give the FTP itself, or a 20-minute test to convert.
+
+    Pass `twenty_min_watts` and the server applies the 0.95 convention and
+    records the method and the arithmetic, so nobody later has to guess whether
+    a stored number was already scaled. Pass `value_watts` for an FTP the
+    athlete states, a ramp-test result, or a Garmin profile figure — and set
+    `method` accordingly ("stated", "ramp_test", "garmin_profile", ...), because
+    those are not equally trustworthy and only the method records which is which.
+
+    **FTP is dated on purpose.** Every training-load number for a ride is
+    computed against the FTP in effect *on that ride's date*, not today's. A
+    single overwritten value silently rescales the athlete's whole history: the
+    same watts against a bigger FTP is a smaller IF, so a block of training
+    shrinks the moment they test better.
+
+    `effective_date` defaults to today. When logging a test, date it to the test
+    — not to when it was mentioned — or every ride in between is scored wrong.
+
+    Returns the stored row and the new power zones. When the value has changed,
+    it also says so: any planned session written in watts against the old FTP
+    now prescribes a different percentage and must be re-rendered before it is
+    pushed.
+    """
+    return _coach(
+        coach.log_ftp,
+        value_watts=value_watts,
+        twenty_min_watts=twenty_min_watts,
+        effective_date=effective_date,
+        method=method,
+        note=note,
+    )
+
+
+@app.tool()
+def log_weight(value_kg: float, effective_date: str | None = None, note: str | None = None) -> str:
+    """Record a dated weight in kilograms. Returns W/kg against the FTP of that date.
+
+    Kilograms, always, and convert before calling rather than after. The range
+    check **cannot** catch a pounds figure: 160 lb is 73 kg, and 160 kg is a
+    real weight for someone, so both readings are inside any range wide enough
+    to be usable. A heavy value comes back with a query attached; everything
+    below it is taken at face value, and every W/kg from a pounds figure is out
+    by a factor of 2.2.
+    """
+    return _coach(coach.log_weight, value_kg=value_kg, effective_date=effective_date, note=note)
+
+
+@app.tool()
+def log_hr(
+    threshold_hr: int | None = None,
+    max_hr: int | None = None,
+    resting_hr: int | None = None,
+    effective_date: str | None = None,
+    method: str | None = None,
+    note: str | None = None,
+) -> str:
+    """Record dated heart-rate figures: threshold, maximum, resting. Any subset.
+
+    Threshold HR (LTHR) is the one that matters — every HR zone is a fraction
+    of it, and it is what a no-power ride's training load is computed against.
+    With only a maximum on file the server estimates threshold at 92% of it and
+    says so; that estimate is wide enough that a measured figure is worth
+    asking for.
+
+    Do not pass an age-predicted maximum (220 minus age) as `max_hr` without
+    saying so in `method`. It is wrong by ten beats either way for most people,
+    and it propagates into every zone boundary.
+    """
+    return _coach(
+        coach.log_hr,
+        threshold_hr=threshold_hr,
+        max_hr=max_hr,
+        resting_hr=resting_hr,
+        effective_date=effective_date,
+        method=method,
+        note=note,
+    )
+
+
+@app.tool()
+def get_zones(as_of: str | None = None) -> str:
+    """Power and HR zones from the figures in effect on a date. Defaults to today.
+
+    Six power zones on the classic %FTP boundaries (55/75/90/105/120), plus
+    sweet spot quoted separately at 88-94% because it straddles two of them.
+    HR zones are the Friel table as fractions of threshold HR — they are not
+    the power zones in another unit, and they do not line up effort for effort,
+    because heart rate lags.
+
+    Pass `as_of` with a ride's date to see the zones that ride was actually
+    performed against. After an FTP change those are not today's zones, and
+    reading an old ride against today's table makes it look easier than it was.
+
+    Call this before quoting any target in watts, and again after any log_ftp.
+    """
+    return _coach(coach.get_zones, as_of=as_of)
+
+
+@app.tool()
+def add_event(
+    name: str,
+    event_date: str,
+    distance_km: float | None = None,
+    elevation_m: float | None = None,
+    priority: str | None = None,
+    status: str | None = None,
+    note: str | None = None,
+) -> str:
+    """Record a race or objective — the thing the training is for.
+
+    An event is not a planned workout: a workout fills a week, an event is what
+    the weeks point at. The next priority-A event is the anchor a plan is built
+    backwards from, so store it before writing any block of training.
+
+    `priority` is A (the objective), B (raced, but trained through) or C (a hard
+    day out). Distance and elevation are what make a session event-specific —
+    2400 m of climbing over 148 km is a different event from a flat 148 km, and
+    the plan should differ.
+
+    Record **past** races too. Their debriefs, stored by record_race_result, are
+    the most specific information available when planning for the same event
+    again.
+    """
+    return _coach(
+        coach.add_event,
+        name=name,
+        event_date=event_date,
+        distance_km=distance_km,
+        elevation_m=elevation_m,
+        priority=priority,
+        status=status,
+        note=note,
+    )
+
+
+@app.tool()
+def update_event(
+    event_id: int,
+    name: str | None = None,
+    event_date: str | None = None,
+    distance_km: float | None = None,
+    elevation_m: float | None = None,
+    priority: str | None = None,
+    status: str | None = None,
+    note: str | None = None,
+    clear: list[str] | None = None,
+) -> str:
+    """Change an event's details: a moved date, a corrected profile, a dropped priority.
+
+    Statuses are `upcoming`, `completed`, `abandoned` (started, did not finish)
+    and `dns` (did not start). Use record_race_result rather than this to close
+    out a race that was ridden — it links the activity and stores the debrief,
+    which this deliberately will not touch.
+
+    A blank `note` is ignored rather than stored; `clear=["note"]` empties it.
+    The name is not clearable — an event without one is not a record.
+    """
+    return _coach(
+        coach.update_event,
+        event_id=event_id,
+        name=name,
+        event_date=event_date,
+        distance_km=distance_km,
+        elevation_m=elevation_m,
+        priority=priority,
+        status=status,
+        note=note,
+        clear=clear,
+    )
+
+
+@app.tool()
+def list_events(when: str = "all", status: str | None = None, today: str | None = None) -> str:
+    """Every stored objective, with the next A-event and how far away it is.
+
+    `when` is "all", "upcoming" or "past". `next_a_event` and
+    `weeks_to_next_a_event` are the periodisation anchor: how many weeks remain
+    decides whether this is base, build or taper, and a null there means there
+    is nothing to build toward — ask.
+
+    Past events carry their `debrief`. Read those before planning for the same
+    race again; an athlete's own account of where they cracked last year beats
+    any general principle about pacing.
+
+    `today` defaults to the server's date; pass the athlete's when they differ.
+    """
+    return _coach(coach.list_events, when=when, status=status, today=today)
+
+
+@app.tool()
+def record_race_result(
+    event_id: int,
+    activity_id: int | None = None,
+    # str | int, because Garmin's activityId is a JSON number and pydantic does
+    # not coerce one to a string: a str-only schema rejected the call before any
+    # code here ran. Same for finish_time, whose docstring promises seconds.
+    garmin_activity_id: str | int | None = None,
+    finish_time: str | float | None = None,
+    debrief: str | None = None,
+    status: str | None = None,
+    force: bool = False,
+    clear: list[str] | None = None,
+) -> str:
+    """Close out a race: link the ride, store the time, write the debrief.
+
+    Refuses to link an activity whose date is not the event's date unless
+    `force` — the realistic mistake is linking the Sunday spin after a Saturday
+    race, which then makes the A-event look like an easy hour.
+
+    Linking changes what get_week reports: a race-day ride tied to an event
+    stops being flagged as unplanned training. It still counts in full toward
+    load and CTL — the athlete's body did not know it was a race.
+
+    Omit `status` and an event still marked `upcoming` becomes `completed` —
+    but only when the call actually carries a result, so a bare call changes
+    nothing at all. One already marked `abandoned` or `dns` **keeps that**:
+    adding a debrief months later must not quietly rewrite a race the athlete
+    did not finish into one they did. Pass `status` explicitly to change it.
+
+    An empty `debrief` is not an erase instruction. Blank text never overwrites
+    what is stored — pass the corrected text instead — and the response names
+    any field that was ignored for that reason. To empty a debrief filed
+    against the wrong race, pass `clear=["debrief"]`; that is an erase, not a
+    result, so it never completes an upcoming event.
+
+    `finish_time` takes "4:32:10" or a number of seconds. The **debrief is the
+    point**: what the pacing was, what was eaten and when, what went wrong.
+    Write it from the ride data plus what the athlete says, in their terms, and
+    store it while it is fresh. A year later it is the only part of this record
+    that still teaches anything.
+    """
+    return _coach(
+        coach.record_race_result,
+        event_id=event_id,
+        activity_id=activity_id,
+        garmin_activity_id=garmin_activity_id,
+        finish_time=finish_time,
+        debrief=debrief,
+        status=status,
+        force=force,
+        clear=clear,
+    )
+
+
+@app.tool()
+def import_activities(payload: list | dict | str) -> str:
+    """Store Garmin activities. Pass the Garmin MCP's output UNCHANGED.
+
+    This server has no network access; you are the transport. Call the Garmin
+    MCP's `get_activities` (or `get_activity` for one ride in detail) and hand
+    the result straight to this tool. It accepts a bare list, a single activity
+    object, a wrapper dict, and the nested `summaryDTO` shape — the field
+    mapping happens here.
+
+    **Do not transcribe the numbers into a tidier shape first.** Every retyped
+    digit is a chance to turn a 198 W normalised power into 189, and the result
+    is a training load that is wrong and looks entirely reasonable. Unknown keys
+    are kept, not rejected; Garmin adds fields without warning.
+
+    Idempotent on `activityId`: re-importing the same payload reports
+    `unchanged`, so syncing an overlapping window every week costs nothing. A
+    stored value is never overwritten with a null, because `get_activities`
+    returns a thinner summary than `get_activity` — without that rule,
+    re-syncing the list after fetching one ride in detail would blank its
+    normalised power while leaving the load number that came from it.
+
+    Returns inserted / updated / unchanged / rejected, with a reason per
+    rejection, and flags worth reading:
+
+    - `local_date_from_utc` — no local start time, so the ride's plan date came
+      from UTC and may be a day out for an early-morning or late-evening ride.
+    - `no_power` / `no_normalized_power` — training load will fall back to
+      average power or to heart rate. compute_load says which, per ride.
+
+    An indoor ride arrives as `virtual_ride` or `indoor_cycling`, not
+    `cycling`; both are stored with `sport: "cycling"` and the raw key in
+    `sub_sport`, so filtering never silently drops a winter's training.
+    """
+    return _coach(coach.import_activities, payload=payload)
+
+
+@app.tool()
+def import_activity_laps(
+    payload: list | dict | str,
+    activity_id: int | None = None,
+    garmin_activity_id: str | int | None = None,
+) -> str:
+    """Store one activity's splits, in execution order. Pass get_activity_splits output.
+
+    Laps are what let compliance_report say "the second block fell to 228 W"
+    instead of "the ride averaged 210 W". A ride summary cannot tell an interval
+    session ridden correctly from the same session ridden as one long tempo;
+    the laps can.
+
+    Use the Garmin MCP's `get_activity_splits`. `get_activity_split_summaries`
+    is refused: it aggregates by split *type* (climb, descent), not by lap, so
+    its rows do not line up with a plan's blocks and comparing against them
+    would produce confident statements about the wrong thing.
+
+    Re-importing replaces the stored laps rather than doubling them.
+
+    `duration_check` always says what the lap sum was compared against, because
+    the absence of a `warning` cannot distinguish a sum that matched from one
+    that was never made:
+
+    * every lap timed — the sum is compared with the activity's duration, and a
+      gap either way also returns `warning`, which usually means the splits
+      belong to a different ride;
+    * some lap carries no duration — `laps_missing_duration` says how many, and
+      a *shortfall* is not reported as a mismatch, because the missing laps
+      could account for it. An **overshoot** still returns `warning`: untimed
+      laps can only add time, so a partial sum already past the ride's duration
+      is a mismatch nothing missing can explain;
+    * the activity itself carries no duration — nothing to compare against, and
+      `duration_check` says so.
+    """
+    return _coach(
+        coach.import_activity_laps,
+        payload=payload,
+        activity_id=activity_id,
+        garmin_activity_id=garmin_activity_id,
+    )
+
+
+@app.tool()
+def annotate_activity(
+    activity_id: int | None = None,
+    garmin_activity_id: str | int | None = None,
+    rpe: int | None = None,
+    feel: str | None = None,
+    note: str | None = None,
+    clear: list[str] | None = None,
+) -> str:
+    """Attach the subjective read to a ride: RPE 1-10, how it felt, free text.
+
+    Store this whenever the athlete says anything about how a session went —
+    "legs were empty", "easiest 3x10 I've done", "cooked by the third one". It
+    is the half of a session no device records and the half that decides the
+    next week: two rides with identical power files, one of which felt
+    catastrophic, call for different plans.
+
+    Particularly valuable when no HRV or readiness data exists. Sensations are
+    then the only fatigue signal there is, and an unrecorded one is gone by the
+    next conversation.
+
+    Empty text is never an erase instruction: a blank `feel` or `note` leaves
+    the stored one alone and is named in the response. Pass the replacement
+    text to change it, or `clear=["note"]` to empty one stored against the
+    wrong ride.
+    """
+    return _coach(
+        coach.annotate_activity,
+        activity_id=activity_id,
+        garmin_activity_id=garmin_activity_id,
+        rpe=rpe,
+        feel=feel,
+        note=note,
+        clear=clear,
+    )
+
+
+@app.tool()
+def list_activities(
+    start: str | None = None,
+    end: str | None = None,
+    sport: str | None = None,
+    include_load: bool = True,
+    limit: int = 200,
+) -> str:
+    """Stored activities in a date range, newest first, with computed training load.
+
+    Dates filter on the ride's **local** date — the day the athlete believes
+    they trained — not the UTC date.
+
+    `sport` filters on the family: "cycling" catches virtual_ride,
+    indoor_cycling, gravel_cycling and the rest, which is the point. The
+    device's own key is in `sub_sport` on every row. A ride whose payload
+    carried no activity type has an *unknown* sport and is excluded — but the
+    exclusion is reported as `excluded_unknown_sport` rather than being
+    silent, because a real session dropping out of a list without a word is how
+    it becomes a missed-session narrative.
+
+    This reads only what has been imported. It is not a view of Garmin: a ride
+    that was never passed to import_activities does not exist here, and its
+    absence looks exactly like a rest day.
+    """
+    return _coach(
+        coach.list_activities,
+        start=start,
+        end=end,
+        sport=sport,
+        include_load=include_load,
+        limit=limit,
+    )
+
+
+@app.tool()
+def link_activity(
+    planned_workout_id: int,
+    activity_id: int | None = None,
+    garmin_activity_id: str | int | None = None,
+    auto: bool = False,
+) -> str:
+    """Attach the ride that happened to the session that was planned.
+
+    Pass an activity, or set `auto` to have the server propose one: same date,
+    cycling, ranked by closeness of duration to the plan. **`auto` links only
+    when there is exactly one candidate.** With two rides on one day it returns
+    both and links nothing, because an automatic match that picks the wrong one
+    produces a compliance report that is confidently about the wrong session,
+    and nothing downstream would ever reveal it.
+
+    Sets the planned session's status to `completed` **only if it was still
+    `planned` or `pushed`**. A session marked `skipped` or `missed` keeps that
+    status and the response says so: linking a ride is evidence about the ride,
+    not a reversal of a decision the coach made. Then call compliance_report.
+    """
+    return _coach(
+        coach.link_activity,
+        planned_workout_id=planned_workout_id,
+        activity_id=activity_id,
+        garmin_activity_id=garmin_activity_id,
+        auto=auto,
+    )
+
+
+@app.tool()
+def save_planned_workouts(workouts: list[dict]) -> str:
+    """Store planned sessions, one item per session.
+
+    Each item is {"spec": ..., "scheduled_date": "YYYY-MM-DD", "note": ...}.
+
+    The spec is exactly the document render_garmin and render_zwo consume — call
+    spec_schema if the format is not already familiar. It is stored verbatim, so
+    a stored session is directly renderable later with no translation step.
+
+    Every spec is validated first. An invalid one is refused rather than stored:
+    a plan that cannot be rendered is not a plan, and the failure would
+    otherwise surface on the morning it was meant to be ridden. Valid items in
+    the same call are still stored, so one bad session does not lose a week.
+    Warnings are stored alongside rather than blocking.
+
+    Write the spec against the **current** FTP — check get_profile first. The
+    spec carries its own `ftp` field, and get_week flags a stored session whose
+    FTP no longer matches, but the flag arrives after the fact.
+
+    Storing is not pushing. Nothing reaches Garmin or MyWhoosh until you render
+    it and follow the upload skill, with the athlete's explicit agreement.
+    """
+    return _coach(coach.save_planned_workouts, workouts=workouts)
+
+
+@app.tool()
+def update_planned_workout(
+    planned_workout_id: int,
+    status: str | None = None,
+    scheduled_date: str | None = None,
+    pushed_to: str | None = None,
+    note: str | None = None,
+    spec: dict | None = None,
+    linked_activity_id: int | None = None,
+    clear: list[str] | None = None,
+) -> str:
+    """Change a planned session: status, date, push target, note, or the spec itself.
+
+    Statuses: `planned` (written, nowhere yet), `pushed` (uploaded and verified
+    — set this with `pushed_to` immediately after a successful upload),
+    `completed` (ridden; normally set by link_activity), `missed` (the athlete
+    could not do it), `skipped` (the coach withdrew it).
+
+    Missed and skipped are not bookkeeping synonyms. One is a plan reality broke,
+    the other a plan you changed; a week of "missed" is a plan that does not fit
+    the athlete's life, and that is the thing to fix.
+
+    Replacing `spec` re-validates it and refuses an invalid one, exactly as
+    save_planned_workouts does. A blank `note` is ignored rather than stored;
+    `clear=["note"]` empties it.
+    """
+    return _coach(
+        coach.update_planned_workout,
+        planned_workout_id=planned_workout_id,
+        status=status,
+        scheduled_date=scheduled_date,
+        pushed_to=pushed_to,
+        note=note,
+        spec=spec,
+        linked_activity_id=linked_activity_id,
+        clear=clear,
+    )
+
+
+@app.tool()
+def get_week(start: str, end: str, today: str | None = None) -> str:
+    """Plan against reality for a date range, and every place they diverge.
+
+    Returns the planned sessions — each with the block table describe_spec
+    produces — every stored activity with its computed load, any events in the
+    window, and two lists of deviation:
+
+    - `planned_not_ridden` — a session whose date has passed with no activity
+      linked and no status explaining it.
+    - `ridden_not_planned` — an activity tied to no planned session. A race-day
+      ride linked to an event is **not** listed here; it was training the plan
+      knew about, and it still counts fully toward load.
+
+    Read this before writing the next week, and before asking the athlete
+    anything: the answer to "did you ride Tuesday?" is already here, and asking
+    a question the data answers wastes their time and yours.
+
+    A planned session written against an FTP that has since changed is flagged
+    `stale_ftp`. Rendering it unedited prescribes the old intensity.
+
+    Deviations are facts, not verdicts. An unplanned three-hour ride with
+    friends is training that happened; what it changes about the coming week is
+    a judgement, and it belongs in the plan, not in a complaint.
+    """
+    return _coach(coach.get_week, start=start, end=end, today=today)
+
+
+@app.tool()
+def compute_load(
+    start: str | None = None,
+    end: str | None = None,
+    activity_ids: list[int] | None = None,
+    sport: str | None = None,
+) -> str:
+    """Training load per activity, each scored against the figures of its own date.
+
+    With power: TSS = duration_h x IF^2 x 100, IF = NP / FTP, using the FTP in
+    effect **on the ride's date**. Where a ride has no normalised power, average
+    power is used and the row is flagged — NP is never below average, so that
+    number understates a variable ride.
+
+    Without power, the fallback is hrTSS: the same formula with
+    (average HR / threshold HR) replacing the power ratio. **Do not compare the
+    two.** hrTSS cannot see variability, so thirty sprints and a steady tempo
+    ride at the same average HR score identically; cardiac drift inflates long
+    rides; and it inherits every error in a threshold HR that is often itself
+    estimated from max HR. `method` on each row says which produced it, and
+    `by_method` counts them — a week's total that mixes both means less than it
+    looks, and the response says so.
+
+    A ride with neither power nor HR returns a null TSS and a reason, never a
+    zero: a zero is indistinguishable from a rest day, and it would drag CTL
+    down as if the athlete had not ridden.
+    """
+    return _coach(coach.compute_load, start=start, end=end, activity_ids=activity_ids, sport=sport)
+
+
+@app.tool()
+def get_form(start: str, end: str, seed_ctl: float = 0.0, seed_atl: float = 0.0) -> str:
+    """CTL / ATL / TSB day by day from the stored activities.
+
+    The standard exponentially weighted model, stepped every calendar day
+    including rest days:
+
+        CTL(d) = CTL(d-1) + (TSS(d) - CTL(d-1)) / 42      fitness
+        ATL(d) = ATL(d-1) + (TSS(d) - ATL(d-1)) / 7       fatigue
+        TSB(d) = CTL(d-1) - ATL(d-1)                      form
+
+    TSB here is **yesterday's** balance — the form carried into a day, before
+    that day's session lands on it. Some tools report same-day CTL - ATL; the
+    two differ by roughly the size of a session, which is the difference
+    between reading a hard Tuesday as fresh and reading it as buried.
+
+    The walk starts at the earliest stored activity so CTL entering the window
+    is built from real history. When that run-up is under 42 days the numbers
+    are still climbing out of zero and `warmup_incomplete` says so — an athlete
+    whose first import is three weeks old has a CTL that describes the import
+    date, not them.
+
+    A ride with no power and no heart rate cannot be scored and adds nothing,
+    so its day steps as a rest day. `unscored_warning` says how many did that:
+    read it before calling a falling CTL detraining.
+
+    **Cross-check against the Garmin MCP's `get_training_load_trend`.** Garmin
+    computes from everything it holds, this from what was imported, and it uses
+    its own load metric rather than TSS. A disagreement is information — usually
+    a gap in what was imported, or rides scored by heart rate here. Find the
+    cause. Do not average two numbers when only one of them can be explained.
+    """
+    return _coach(coach.get_form, start=start, end=end, seed_ctl=seed_ctl, seed_atl=seed_atl)
+
+
+@app.tool()
+def compliance_report(planned_workout_id: int, activity_id: int | None = None) -> str:
+    """What was prescribed against what was ridden, block by block where the laps allow.
+
+    Uses the activity linked to the session unless `activity_id` overrides it.
+    When laps are stored and their count matches the plan's executable blocks —
+    repeats expanded, because three intervals are three laps — each block is
+    compared to its lap and written out as a sentence you can use directly:
+    "the second block fell to 228 W against a 250 W target".
+
+    When the counts differ, **no pairing is invented**. Six laps against nine
+    blocks aligned by position produces confident claims about the wrong
+    intervals, and lap counts rarely match a plan exactly — an athlete pressing
+    lap at a junction, or a head unit auto-lapping every 5 km, breaks it. The
+    laps come back as they are, with the totals compared and the mismatch
+    stated.
+
+    With no laps at all, only duration and average intensity can be compared.
+    That separates a session that was cut short from one that was not; it cannot
+    separate an interval session ridden properly from the same average ridden
+    as steady tempo. Say which of the two you are looking at.
+
+    A block within 5% of its target counts as on target. That is deliberately
+    not the band `render_garmin` shows on the head unit (2% for intervals, 5%
+    easy): the rendered band is what the athlete was told to hold, this is how
+    far off an average has to be before it is worth mentioning.
+
+    A recovery, warmup or cooldown ridden *below* target is `easier_than_target`
+    and not a miss —
+    that target is a ceiling.
+
+    **Each block carries two verdicts**, because one can be knowable while the
+    other is not: `verdict` for power, `duration_verdict` for time. A lap with
+    no watts says nothing about whether a target was held — but if it ran half
+    its planned length, that much *is* known, and it counts as a deviation.
+
+    `off_target_blocks` counts wrong power and `off_duration_blocks` counts
+    short or long. Every block then falls into exactly one of
+    `deviating_blocks`, `unverifiable_blocks` and `compliant_blocks`: a block is
+    unverifiable when its power could not be checked **or** its lap carried no
+    duration at all, and compliant only when everything asked of it was checked
+    and held. The session `verdict` is `deviated` if anything deviated, else
+    `unverifiable` if **any** block could not be checked — one clean warmup in
+    front of five no-power intervals is not evidence the intervals were ridden
+    — else `as_prescribed`.
+
+    A ride with no stored duration is said to be unknown, never rounded to
+    0:00, and no shortfall against the plan is computed from it.
+
+    Read `sentences` first: it is the report in order, already phrased.
+    """
+    return _coach(
+        coach.compliance_report, planned_workout_id=planned_workout_id, activity_id=activity_id
+    )
+
+
+@app.tool()
+def export_data(athlete_id: int | None = None) -> str:
+    """Dump the whole coaching database as JSON, with a digest of the content.
+
+    Every row of every table, `raw_json` included, so a restore loses nothing.
+    Keep the `digest` with the file: it is the only way to tell a complete copy
+    from a truncated one, and import_data will check it.
+
+    Worth doing before anything destructive, and before a schema upgrade.
+    """
+    return _coach(coach.export_data, athlete_id=athlete_id)
+
+
+@app.tool()
+def import_data(data: dict, force: bool = False, expected_digest: str | None = None) -> str:
+    """Restore the database from export_data output. Refuses to overwrite by default.
+
+    A non-empty database is left untouched unless `force` is set — and `force`
+    **deletes every existing row** before inserting. This is a restore, not a
+    merge. Merging two training logs is not something to do implicitly: the same
+    ride under two Garmin ids, or two FTP entries for one date, would change
+    every number computed afterwards without any of it being visible.
+
+    Pass `expected_digest` from the export. A mismatch refuses the restore
+    rather than applying a payload that was truncated or edited in transit —
+    which matters more here than anywhere else in this server, because after an
+    overwrite there is nothing left to compare against.
+
+    Export from a newer schema than this build knows is refused outright.
+    """
+    return _coach(coach.import_data, data=data, force=force, expected_digest=expected_digest)
 
 
 def _register_skill_prompts() -> list[str]:

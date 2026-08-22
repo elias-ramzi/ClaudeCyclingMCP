@@ -9,9 +9,12 @@ from cycling_mcp.skills import build_skill_message, load_skills, parse_frontmatt
 SKILLS_DIR = Path(__file__).resolve().parents[1] / ".claude" / "skills"
 
 
-def test_both_skills_load():
+UPLOAD_SKILLS = ("garmin-upload", "mywhoosh-upload")
+
+
+def test_every_bundled_skill_loads():
     names = [s.name for s in load_skills(SKILLS_DIR)]
-    assert names == ["garmin-upload", "mywhoosh-upload"]
+    assert names == ["coaching", "garmin-upload", "mywhoosh-upload"]
 
 
 def test_frontmatter_name_matches_the_directory():
@@ -32,13 +35,27 @@ def test_descriptions_survive_the_folded_block_scalar():
         assert "\n" not in skill.description
 
 
-def test_descriptions_trigger_beyond_the_word_upload():
+def test_upload_descriptions_trigger_beyond_the_word_upload():
     """They must fire on how someone actually describes wanting a session."""
     for skill in load_skills(SKILLS_DIR):
+        if skill.name not in UPLOAD_SKILLS:
+            continue
         lowered = skill.description.lower()
         assert "create" in lowered
         assert "add" in lowered
         assert "send" in lowered
+
+
+def test_the_coaching_description_triggers_on_talking_about_training():
+    """Nobody asks their coach to "invoke the coaching skill".
+
+    The phrasings below are how the request actually arrives, and each one has
+    to be recognisable in the description or the skill never fires.
+    """
+    skill = next(s for s in load_skills(SKILLS_DIR) if s.name == "coaching")
+    lowered = skill.description.lower()
+    for phrasing in ("this week", "missed", "form", "fatigue", "ftp", "race"):
+        assert phrasing in lowered, phrasing
 
 
 def test_bodies_are_the_instructions_not_the_frontmatter():
@@ -107,7 +124,8 @@ def test_directory_without_a_skill_md_is_skipped(tmp_path):
 
 @pytest.fixture
 def skill():
-    return load_skills(SKILLS_DIR)[0]
+    """An upload skill specifically — the prompt framing differs per skill."""
+    return next(s for s in load_skills(SKILLS_DIR) if s.name == "garmin-upload")
 
 
 def test_message_frames_the_body_as_an_instruction(skill):
@@ -167,7 +185,11 @@ def test_get_skill_lists_when_no_name_given():
 
     result = _json.loads(get_skill())
     assert result["ok"] is True
-    assert sorted(s["name"] for s in result["skills"]) == ["garmin-upload", "mywhoosh-upload"]
+    assert sorted(s["name"] for s in result["skills"]) == [
+        "coaching",
+        "garmin-upload",
+        "mywhoosh-upload",
+    ]
 
 
 def test_get_skill_returns_the_full_procedure():
@@ -200,3 +222,43 @@ def test_unknown_skill_says_what_is_available():
     result = _json.loads(get_skill("nope"))
     assert result["ok"] is False
     assert "mywhoosh-upload" in result["available"]
+
+
+def test_the_coaching_skill_keeps_the_rules_that_are_the_point():
+    """The distilled coaching rules are why this skill exists.
+
+    A rewrite that loses them leaves a skill that reads well and coaches
+    nothing, and nothing else in the repo would notice.
+    """
+    body = next(s for s in load_skills(SKILLS_DIR) if s.name == "coaching").body
+    for rule in (
+        "A missed session is lost",
+        "Quality goes at the end of a long ride",
+        "Check the FTP before you emit a single target",
+        "Always propose. Never push without explicit agreement",
+        "Stop producing weekly plans",
+    ):
+        assert rule in body, rule
+
+
+def test_a_skill_can_say_what_its_prompt_argument_means():
+    """The defaults are written for the upload skills.
+
+    A coaching prompt framed as "ask what session to build" opens in the wrong
+    place — the first move there is to read the athlete's file, not to design a
+    workout.
+    """
+    skills = {skill.name: skill for skill in load_skills(SKILLS_DIR)}
+    coaching = skills["coaching"]
+    assert "get_profile" in build_skill_message(coaching)
+    assert "what session to build" not in build_skill_message(coaching)
+    assert "What the athlete asked: I could not ride Tuesday" in build_skill_message(
+        coaching, "I could not ride Tuesday"
+    )
+
+
+def test_a_skill_without_the_override_keeps_the_upload_framing():
+    skills = {skill.name: skill for skill in load_skills(SKILLS_DIR)}
+    message = build_skill_message(skills["garmin-upload"])
+    assert "Ask what session to build" in message
+    assert "confirm the FTP" in message

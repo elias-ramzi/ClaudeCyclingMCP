@@ -437,11 +437,46 @@ def test_server_info_makes_the_build_sayable():
 
     info = json.loads(server_info())
     assert info["version"] == __version__
-    assert info["skills"] == ["garmin-upload", "mywhoosh-upload"]
+    assert info["skills"] == ["coaching", "garmin-upload", "mywhoosh-upload"]
     assert Path(info["package_path"]).is_dir()
     # Distinguishes a local editable checkout from a uvx cache in one glance.
     assert info["package_path"].endswith("cycling_mcp")
     assert info["uploads"] is False
+
+
+def test_server_info_reports_the_database_without_creating_it(tmp_path, monkeypatch):
+    """The server is no longer stateless, so where the state lives is part of
+    identifying the build. Reporting it must not be what brings it into
+    existence, or "exists" would only ever mean "somebody asked"."""
+    from cycling_mcp.server import server_info
+    from cycling_mcp.store import CURRENT_SCHEMA_VERSION, ENV_DB_PATH
+
+    target = tmp_path / "coach.db"
+    monkeypatch.setenv(ENV_DB_PATH, str(target))
+
+    database = json.loads(server_info())["database"]
+    assert database["path"] == str(target)
+    assert database["exists"] is False
+    assert database["schema_version"] is None
+    assert not target.exists()
+
+    from cycling_mcp.store import open_db
+
+    with open_db():
+        pass
+    database = json.loads(server_info())["database"]
+    assert database["exists"] is True
+    assert database["schema_version"] == CURRENT_SCHEMA_VERSION
+
+
+def test_the_purity_note_still_says_what_is_true():
+    """It used to say "pure". It now writes a database, and a note that has
+    drifted from the behaviour is worse than no note."""
+    from cycling_mcp.server import server_info
+
+    note = json.loads(server_info())["note"].lower()
+    assert "no network" in note and "no credentials" in note
+    assert "out_path" in note and "own database" in note
 
 
 def test_written_files_are_utf8_regardless_of_platform_default(spec, tmp_path):
