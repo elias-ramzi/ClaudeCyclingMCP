@@ -7,7 +7,75 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **A coach layer.** The server now keeps the athlete's file in a local SQLite database at
+  `~/.claude-cycling/coach.db` (override with `CLAUDE_CYCLING_DB`), created on the first coaching
+  call. It holds the profile, append-only dated FTP / weight / HR history, objectives, a normalised
+  cache of imported Garmin activities with their raw payloads, optional per-lap splits, and planned
+  sessions stored as specs. Twenty-three new tools cover profile and history, events, activities,
+  planning, analysis and backup — see [docs/coaching.md](docs/coaching.md).
+- **Deterministic training analysis.** `compute_load` (power TSS against the FTP in effect on each
+  ride's own date, with an hrTSS fallback that is flagged as one), `get_form` (CTL/ATL/TSB on the
+  standard 42/7-day constants, TSB as yesterday's balance), `compliance_report` (planned blocks
+  against the executed laps, phrased as sentences), and `get_week` (plan against reality, with the
+  deviations both ways).
+- **A `coaching` skill**, bundled alongside `garmin-upload` and `mywhoosh-upload`. Generic — it
+  carries no athlete's facts. Covers the onboarding interview, driven by whatever the profile is
+  still missing rather than by a hardcoded script; the weekly loop; the adaptation rules; and the
+  rule that sessions are always proposed, never pushed.
+- **`server_info` now reports the database** — path, whether it exists, and its schema version —
+  without creating it.
+
+### Changed
+
+- **The purity note is narrower and true.** It said "this server is pure: no network, no
+  credentials, no uploads", and the only filesystem access was an `out_path` write. It now says
+  "no network, no credentials, no uploads; filesystem access is limited to this server's own
+  database and to explicit out_path writes". No network call or credential was added; a note that
+  has drifted from the behaviour is worse than no note.
+- **`render_garmin`, `render_zwo` and `check_garmin_payload` docstrings** point at the coach layer:
+  a stored planned session's spec is directly renderable, `get_week` flags one written against an
+  FTP that has since moved, and a verified upload should be recorded with
+  `update_planned_workout(status="pushed")`. No rendering behaviour changed.
+
+### Fixed
+
+Found by an adversarial review of the new code before it shipped; each is pinned by a test.
+
+- **A partial `log_hr` entry no longer shadows the figures already on file.** HR resolved the latest
+  *row*, so logging a resting HR on its own erased the threshold recorded months earlier — and every
+  no-power ride then came back unscored, with the reason "no threshold HR is on file". Each figure
+  now resolves independently and keeps the date it came from.
+- **A backdated `log_ftp` / `log_weight` / `log_hr` returns the row it actually wrote.** All three
+  re-read by date after inserting, so correcting an FTP to three weeks ago returned the *other*
+  entry as `stored` while returning zones computed from the new value — a response that contradicted
+  itself. They now read back by row id, report `is_current`, and compare `change` against the entry
+  the new one replaces rather than the globally latest.
+- **A database that cannot be opened is an answer, not a traceback.** `sqlite3.Error` is not an
+  `OSError`, so the `StoreError` path was unreachable, and the cleanup `ROLLBACK` raised over the top
+  of the real cause — pointing `CLAUDE_CYCLING_DB` at a non-database file reported "cannot rollback"
+  instead of "file is not a database".
+- **`compliance_report` no longer calls a session `as_prescribed` when a block was cut short.** Only
+  wrong-power blocks counted; an interval abandoned half-way at exactly the right watts passed.
+  `deviating_blocks` now covers short and long as well, and drives the verdict.
+- **`compliance_report` returns the laps on a count mismatch**, as its docstring already promised.
+  That is the one case where nothing could be compared and the laps are all the caller has.
+- **A thinner re-import cannot reclassify a ride's sport.** `sport` is derived, so it was never null
+  and the "a null never overwrites a stored value" rule did not cover it: re-importing a summary
+  without a type key rewrote a `virtual_ride` to `"other"`, dropping the ride out of every cycling
+  filter while `sub_sport` still said otherwise. A payload with no type now stores a null sport and
+  flags `no_sport_type`.
+- **`import_data` refuses a malformed row** instead of raising `AttributeError` across the tool
+  boundary after its delete sweep.
+
+### Notes
+
+Ingestion is model-mediated by design: Claude fetches from the Garmin MCP and passes the JSON here
+unchanged. The import tools accept Garmin's own shapes — a bare list, a single activity, a wrapper
+dict, the nested `summaryDTO` form, a JSON string — rather than a clean typed schema, because a
+schema would make the model retype every number on the way through, and a mistyped average power is
+a training load that is wrong and looks entirely reasonable.
 
 ## [0.2.0] - 2026-08-21
 

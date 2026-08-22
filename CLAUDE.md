@@ -4,11 +4,14 @@ Architecture and conventions for anyone — human or agent — working in this r
 
 ## The shape of it
 
-One canonical spec in, two renderers out:
+One canonical spec in, two renderers out — and above that, a coach layer that stores the athlete
+and computes from what they actually rode:
 
 ```
 spec (JSON) → validate → resolved Workout tree ──┬── render_zwo    → .zwo   (MyWhoosh)
                        (power as fractions of FTP)└── render_garmin → JSON   (Garmin)
+
+Garmin MCP ──(the model pastes the JSON)──> coach.py ──> coach.db ──> load · form · compliance
 ```
 
 | Module | Holds |
@@ -18,6 +21,10 @@ spec (JSON) → validate → resolved Workout tree ──┬── render_zwo   
 | `render_zwo.py` | MyWhoosh XML. Hand-built strings, not ElementTree, to control the exact format. |
 | `render_garmin.py` | Garmin `upload_workout` payload. |
 | `verify.py` | compare what a platform stored against what was sent: Garmin's returned payload, and MyWhoosh's scraped builder header. |
+| `store.py` | the SQLite database: where it lives, and the ordered migrations. The only module that touches state. |
+| `garmin_import.py` | normalise raw Garmin MCP payloads into stored rows. Pure — it reads what was pasted in. |
+| `training.py` | zones, TSS (power and HR), CTL/ATL/TSB, block-vs-lap comparison. Pure arithmetic over stored numbers. |
+| `coach.py` | the coaching operations: read and write the athlete's file, compute from it. |
 | `skills.py` | load `.claude/skills/*/SKILL.md` and serve them as MCP prompts. |
 | `server.py` | the MCP tool surface. Thin — logic lives in the modules above. |
 
@@ -56,6 +63,31 @@ description is a check figure. It is carried as message text on both sides.
 **The server never uploads.** No network, no credentials. Uploading lives in the skills, in front of
 a human — a MyWhoosh export spends a finite slot credit.
 
+**Purity is scoped, not absolute.** Renderers, metrics and verification are pure. The coach layer
+writes one SQLite file, at `~/.claude-cycling/coach.db` or `CLAUDE_CYCLING_DB`. Say it that way —
+"no network, no credentials; filesystem access limited to its own database and explicit `out_path`
+writes" — rather than calling the server pure, which stopped being true.
+
+**FTP is dated, and load is resolved per ride.** Every training-load number uses the FTP entry in
+effect on that ride's own date. A "current FTP" column would silently rewrite the athlete's history:
+the same watts against a bigger FTP is a smaller IF, so a block of training shrinks the moment they
+test better. The same holds for weight and HR thresholds.
+
+**Power TSS and hrTSS are different quantities.** Never merge them into one number without saying
+so. Each computed row carries the method that produced it; a ride with neither power nor HR gets a
+null and a reason, never a zero — a zero is indistinguishable from a rest day.
+
+**Import tools take Garmin's own shapes.** Never design a coach tool that requires the model to
+retype numeric fields into a clean schema. Every retyped digit is a corruption opportunity, and a
+mistyped average power is a load that is wrong and looks reasonable. Tolerate the shapes, keep
+unknown keys, and never overwrite a stored value with a null.
+
+**Coaching judgement lives in the `coaching` skill, not in code.** The server stores, computes and
+refuses. What to do about a missed Tuesday is the skill's business.
+
+**Migrations are append-only.** Never edit a migration that has run anywhere — only a version that
+has not been applied ever runs again. Add the next one.
+
 ## The reference workout
 
 Garmin workout id **`1662651131`** was hand-built in the Garmin UI with known inputs, and is what the
@@ -82,6 +114,9 @@ in the API — only upload (creates new), delete, and schedule.
 pytest              # offline, hermetic, no credentials
 pytest -m live      # real Garmin round-trip; needs tokens, cleans up after itself
 ```
+
+Every test that touches the database points `CLAUDE_CYCLING_DB` at a `tmp_path`. A test that writes
+to the real `~/.claude-cycling/coach.db` is a bug: it would mutate the author's own training log.
 
 The live suite uploads a workout, fetches it back, compares against what was sent, checks no target
 was stored as a percentage, and deletes it — including on failure.
