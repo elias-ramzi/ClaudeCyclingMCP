@@ -515,11 +515,19 @@ def check_garmin_payload(
     Pure comparison, no network access.
     """
     actual = payload_digest(payload)
+    step_seconds = total_step_seconds(payload)
     result: dict[str, Any] = {
         "digest": actual,
-        "step_seconds": total_step_seconds(payload),
+        "step_seconds": step_seconds,
         "ui_checklist": ui_checklist(payload),
     }
+    if step_seconds is None:
+        result["could_not_check"] = [
+            "step_seconds: a step has no duration or a repeat no iteration count, so "
+            "the total is unknown rather than zero. A repeat missing "
+            "numberOfIterations is what a dropped conditionTypeId 7 leaves behind — "
+            "fix the payload before uploading."
+        ]
 
     if spec is not None:
         try:
@@ -591,16 +599,25 @@ def verify_garmin_upload(payload: dict, fetched: dict, expected_digest: str | No
         return _dump({"ok": False, "error": "shape_mismatch", "detail": misuse})
 
     problems = compare_upload(payload, fetched)
+    sent_step_seconds = total_step_seconds(payload)
     result: dict[str, Any] = {
         "ok": True,
         "match": not problems,
         "differences": problems,
-        "sent_step_seconds": total_step_seconds(payload),
+        "sent_step_seconds": sent_step_seconds,
         "note": (
             "Garmin's estimated_duration_seconds follows its own rules and can "
             "disagree with the sum of the steps; it is not used for this check."
         ),
     }
+    if sent_step_seconds is None:
+        result["could_not_check"] = [
+            "sent_step_seconds: a step in the sent payload has no duration or a repeat "
+            "no iteration count, so its total is unknown rather than zero — and a "
+            "fetched workout with the same null would compare equal without being "
+            "right. A repeat missing numberOfIterations is what a dropped "
+            "conditionTypeId 7 leaves behind."
+        ]
     if expected_digest is not None:
         # This check is upstream of the round-trip: it asks whether the payload
         # that was sent is the payload that was rendered. A match here plus a
