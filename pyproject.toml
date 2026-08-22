@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-cycling-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Author a structured cycling workout once; render it to MyWhoosh .zwo and Garmin Connect JSON."
 readme = "README.md"
 license = { text = "MIT" }

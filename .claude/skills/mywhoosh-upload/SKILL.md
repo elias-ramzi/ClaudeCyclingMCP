@@ -385,6 +385,15 @@ workout being there:
    knowing precisely what it bought.
 2. The **slot counter has decremented by one**.
 
+**The card's TSS and IF carry a ® — they are TrainingPeaks' metrics, computed
+by MyWhoosh's own model.** They will not match Garmin's figures for the same
+session, and neither is wrong. Do not report a difference between the two
+platforms as a fault.
+
+**The card rounds.** 72.4 shows as `72` and 0.746 as `0.75`, in different
+directions. That is why `verify_mywhoosh_library_entry` compares on tolerances
+rather than equality.
+
 **The card renders the name with a multiplication sign.** An uploaded
 `Tempo-3x14` displays as `Tempo-3×14`, while the editor header showed the ASCII
 form — so the substitution happens at export or at library render. Whether the

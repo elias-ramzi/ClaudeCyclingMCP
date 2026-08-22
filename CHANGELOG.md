@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] - 2026-08-21
+
+Everything below came out of real sessions using the server — four field reports from
+agents that built and uploaded actual workouts. Three of the bugs they found had shipped
+past a green test suite, all three for the same reason: the tests called the Python
+functions, and the bugs only existed once arguments had been through JSON and a client.
+
 ### Changed
 
 - **The README is now an overview, not a manual.** It leads with why the platforms need this —
@@ -226,7 +235,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.1.0] - 2026-08-12
 
-First release.
+First release — cut in the repository but never tagged or published to PyPI, so `0.2.0` is the first version available to install.
 
 ### Added
 
@@ -272,5 +281,6 @@ First release.
 - Whether the MyWhoosh builder's FTP field reflects the athlete's game profile, or is a local preview
   value defaulting to 200 W, is not verified.
 
-[Unreleased]: https://github.com/elias-ramzi/ClaudeCyclingMCP/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/elias-ramzi/ClaudeCyclingMCP/releases/tag/v0.1.0
+[Unreleased]: https://github.com/elias-ramzi/ClaudeCyclingMCP/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/elias-ramzi/ClaudeCyclingMCP/releases/tag/v0.2.0
+[0.1.0]: https://github.com/elias-ramzi/ClaudeCyclingMCP/tree/6610803

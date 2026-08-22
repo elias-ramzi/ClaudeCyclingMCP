@@ -11,7 +11,7 @@
       "name": "claude-cycling-mcp",
       "source": ".",
       "description": "Describe a bike session once; render it to a MyWhoosh .zwo and a Garmin Connect workout. Includes the skills that upload to each platform and verify the result.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "author": {
         "name": "Elias Ramzi",
         "email": "elias.ramzi@gmail.com"

@@ -5,7 +5,7 @@ from .render_garmin import render_garmin
 from .render_zwo import render_zwo, zwo_filename
 from .spec import SpecError, Workout, load_spec, validate_spec
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "SpecError",
