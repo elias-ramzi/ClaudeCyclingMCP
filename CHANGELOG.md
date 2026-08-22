@@ -121,6 +121,45 @@ planned duration without expanding a 1 Hz power series; and the `server_info`, `
 an explicit note that compliance's 5% tolerance is deliberately not the band `render_garmin` writes
 to the head unit.
 
+#### Consolidation, from the same review
+
+Structural cleanups with no intended behaviour change, except where noted.
+
+- **One resolver for every dated figure.** FTP, weight and each HR field went through two diverging
+  copies of the same latest-else-earliest rule; there is now one, and a `History` object that loads
+  the tiny history tables once per request and resolves in memory. `get_form` over 200 activities
+  went from 852 queries to 10, and `compute_load` from 1007 to 10 — measured, and now pinned by a
+  test that fails if the count scales with the number of rides. Reads also name their columns, so
+  `raw_json` is no longer hauled back for every row of a query that never looks at it.
+- **One TSS formula and one duration formatter.** `metrics.py` scored a plan and `training.py`
+  scored a ride with separate copies of `duration_h x IF^2 x 100`, and `compliance_report`'s whole
+  job is to set those two numbers side by side — two copies that drifted by a rounding choice would
+  have made every comparison a report on the arithmetic.
+- **One FTP plausibility band.** It was 50–600 in the validator and 40–700/80–500 in the store, so a
+  550 W FTP was queried when stored and accepted when rendered. Both now read `FTP_PLAUSIBLE_W` and
+  `FTP_USUAL_W` from `spec.py`. The two layers still *act* differently on the same numbers, which is
+  the point: the renderer warns, the store refuses to persist. The validator's warning band is
+  consequently 80–500 rather than 50–600.
+- **The backdated-entry logic is shared by all three loggers.** Only `log_ftp` reported `is_current`
+  and what superseded it; logging last month's weigh-in still handed back today's W/kg, and a
+  threshold HR from March still returned zones as though they were in force. `log_hr` answers per
+  field, because a backdated resting HR supersedes nothing about the threshold.
+- **Import data-quality flags are persisted** (schema v3, `activities.flags_json`) and returned as
+  `flags` on every read. They were computed at import and reported once, so no later read could see
+  that a ride's date came from UTC or its sport was unknown. They are now derived from the **stored
+  row** rather than from the payload that arrived — deriving them from the payload would stamp
+  `no_normalized_power` on a ride whose NP came from an earlier detailed fetch, which is the mistake
+  the null-preserving merge exists to prevent, one column over.
+- **Payload errors raise instead of returning `{"ok": False}`.** Those dicts survived only because
+  `_coach` spread the result after its own `ok` key; reordering that line would have reported a
+  failure as a success. `_coach` now raises if a result carries an `ok` of its own.
+
+The three numeric coercers were **not** merged, despite looking alike: `verify._number` rejects
+strings because a string in a DTO is a shape error, `verify._as_number` parses them but must not
+touch commas (it reads a page, where "1,234" is one thousand), and `garmin_import._number` reads a
+decimal comma because a European-locale export writes 232,5. Folding them together picks one
+behaviour for all three. Each now says so, and a test pins the differences.
+
 ### Notes
 
 Ingestion is model-mediated by design: Claude fetches from the Garmin MCP and passes the JSON here

@@ -183,7 +183,21 @@ def _pick(item: dict, keys: tuple[str, ...]) -> Any:
 
 
 def _number(value: Any) -> float | None:
-    """A float, or None. Booleans are not numbers here, whatever Python thinks."""
+    """A float, or None. Booleans are not numbers here, whatever Python thinks.
+
+    Deliberately not shared with `verify.py`'s two coercers, which look similar
+    and are not interchangeable:
+
+    * `verify._number` rejects strings outright, because a string where an API
+      payload should hold a number is a shape error worth failing on.
+    * `verify._as_number` parses strings but must not touch commas — it reads
+      values scraped off a web page, where "1,234" is one thousand two hundred
+      and thirty-four.
+
+    This one treats a comma as a decimal separator, because a Garmin export
+    made under a European locale writes 232,5 for 232.5. Folding the three into
+    one would silently pick one of those three behaviours for all of them.
+    """
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -342,7 +356,6 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
     if local is None and utc is None:
         return None, f"activity {activity_id} has no readable start time (startTimeLocal/GMT)"
 
-    from_utc = local is None
     local_date = (local or utc or "")[:10]
 
     type_key = _type_key(item)
@@ -379,22 +392,37 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
         else:
             row[field] = number
 
-    flags: list[str] = []
-    if from_utc:
-        flags.append("local_date_from_utc")
-    if type_key is None:
-        flags.append("no_sport_type")
-    if row["duration_s"] is None:
-        flags.append("no_duration")
-    if row["avg_power"] is None and row["normalized_power"] is None:
-        flags.append("no_power")
-    if row["normalized_power"] is None and row["avg_power"] is not None:
-        # Common on a ride recorded without a power meter connected to the
-        # head unit's NP field, and on some third-party uploads. TSS falls back
-        # to average power, which understates a variable ride.
-        flags.append("no_normalized_power")
-    row["_flags"] = flags
+    row["_flags"] = row_flags(row)
     return row, None
+
+
+def row_flags(row: dict) -> list[str]:
+    """What is worth knowing about a stored row's data quality.
+
+    Derived from **the row**, not from the payload that produced it. That
+    distinction is the whole point: `get_activities` returns a thinner summary
+    than `get_activity`, so flagging the payload would stamp
+    `no_normalized_power` onto a ride whose NP is sitting in the database from
+    an earlier detailed fetch — the same mistake the null-preserving merge
+    exists to prevent, one column over.
+    """
+    flags: list[str] = []
+    if not row.get("start_time_local"):
+        # The plan date came from UTC, which is a different day for an
+        # early-morning or late-evening ride.
+        flags.append("local_date_from_utc")
+    if not row.get("sub_sport"):
+        flags.append("no_sport_type")
+    if row.get("duration_s") is None:
+        flags.append("no_duration")
+    if row.get("avg_power") is None and row.get("normalized_power") is None:
+        flags.append("no_power")
+    elif row.get("normalized_power") is None:
+        # Common on a ride recorded without a power meter connected to the head
+        # unit's NP field, and on some third-party uploads. TSS falls back to
+        # average power, which understates a variable ride.
+        flags.append("no_normalized_power")
+    return flags
 
 
 def normalize_lap(item: dict, index: int) -> dict:

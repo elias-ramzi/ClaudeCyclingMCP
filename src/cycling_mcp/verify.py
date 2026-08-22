@@ -130,6 +130,14 @@ def _normalise_fetched(steps: list[dict]) -> list[dict]:
 
 
 def _number(value: Any) -> float | None:
+    """A number from an API payload, or None. Strings are not coerced.
+
+    Strict on purpose: a string where a Garmin DTO should hold a number is a
+    shape problem, and quietly parsing it would hide the very difference this
+    module exists to report. `_as_number` below is the lenient one, for text
+    scraped off a page; `garmin_import._number` is a third, which also reads a
+    decimal comma. The three are not interchangeable — see that one's docstring.
+    """
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -405,6 +413,9 @@ def _as_number(value):
     like a change — which is this check's own failure mode, inverted: it
     reported the header as changed on the exact silent no-op it exists to
     catch. Observed 2026-08-20.
+
+    No comma handling, and that is not an omission: this reads a page, where
+    "1,234" is one thousand two hundred and thirty-four rather than 1.234.
     """
     if value is None or isinstance(value, bool):
         return None

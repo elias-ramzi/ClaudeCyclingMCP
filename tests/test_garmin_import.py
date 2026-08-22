@@ -286,3 +286,22 @@ def test_an_activity_timed_only_in_offset_form_is_imported():
     assert reason is None
     assert row["local_date"] == "2026-08-20"
     assert row["start_time_utc"] == "2026-08-20T20:00:00"
+
+
+def test_the_three_numeric_coercers_stay_different_on_purpose():
+    """They look alike and are not interchangeable.
+
+    Folding them together would pick one behaviour for all three: either a
+    scraped "1,234" becomes 1.234, or a Garmin export written under a European
+    locale loses its decimals, or a string in an API payload stops being the
+    shape error it is.
+    """
+    from cycling_mcp.garmin_import import _number as from_garmin
+    from cycling_mcp.verify import _as_number as from_page
+    from cycling_mcp.verify import _number as from_payload
+
+    assert from_garmin("232,5") == 232.5, "a European-locale export"
+    assert from_page("1,234") is None, "a scraped thousands separator is not 1.234"
+    assert from_payload("72.0") is None, "a string in a DTO is a shape error"
+    assert from_page("72.0") == 72.0
+    assert (from_garmin(72), from_page(72), from_payload(72)) == (72.0, 72.0, 72.0)

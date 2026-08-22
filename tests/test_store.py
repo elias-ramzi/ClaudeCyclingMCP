@@ -98,7 +98,7 @@ def test_the_v1_walk_reports_which_migrations_it_applied(db):
     conn = sqlite3.connect(db, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("BEGIN")
-    assert store.migrate(conn) == [2]
+    assert store.migrate(conn) == [version for version, _ in store.MIGRATIONS if version > 1]
     conn.execute("COMMIT")
     conn.close()
 

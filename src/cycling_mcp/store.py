@@ -226,9 +226,22 @@ def _migrate_2_plan_and_debrief() -> list[str]:
     ]
 
 
+def _migrate_3_import_flags() -> list[str]:
+    """Keep what the import noticed about a ride's data quality.
+
+    `local_date_from_utc`, `no_power`, `no_sport_type` were computed at import
+    and reported once, in the response to that call. Every later read — the
+    week, the load, the compliance report — then saw a row with no indication
+    that its date might be a day out or its sport unknown. A caveat that exists
+    only in a transcript is a caveat nobody has.
+    """
+    return ["ALTER TABLE activities ADD COLUMN flags_json TEXT"]
+
+
 MIGRATIONS: list[tuple[int, Callable[[], list[str]]]] = [
     (1, _migrate_1_training_log),
     (2, _migrate_2_plan_and_debrief),
+    (3, _migrate_3_import_flags),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

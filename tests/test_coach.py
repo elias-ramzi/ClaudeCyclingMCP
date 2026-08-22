@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from cycling_mcp import coach, store
+from cycling_mcp.garmin_import import GarminPayloadError
 
 RIDE = {
     "activityId": 5001,
@@ -214,9 +215,15 @@ def test_a_rejected_item_says_why_and_does_not_stop_the_others():
     assert "no activityId" in result["rejections"][0]["reason"]
 
 
-def test_an_unreadable_payload_is_an_answer_not_a_crash():
-    result = coach.import_activities("last Tuesday's ride")
-    assert result["ok"] is False and "not JSON" in result["error"]
+def test_an_unreadable_payload_is_refused_by_raising():
+    """The tool layer renders every refusal in one place.
+
+    Returning {"ok": False} from here worked only because `_coach` spread the
+    result after its own "ok" — reorder that one line and a failure is reported
+    as a success. The tool-level behaviour is pinned over stdio instead.
+    """
+    with pytest.raises(GarminPayloadError, match="not JSON"):
+        coach.import_activities("last Tuesday's ride")
 
 
 def test_an_indoor_ride_is_filterable_as_cycling():
@@ -585,11 +592,10 @@ def test_compliance_needs_something_to_compare_against():
 
 def test_split_summaries_are_refused_by_the_lap_import():
     coach.import_activities([RIDE])
-    result = coach.import_activity_laps(
-        {"splitSummaries": [{"splitType": "CLIMB"}]}, garmin_activity_id="5001"
-    )
-    assert result["ok"] is False
-    assert "get_activity_splits" in result["error"]
+    with pytest.raises(GarminPayloadError, match="get_activity_splits"):
+        coach.import_activity_laps(
+            {"splitSummaries": [{"splitType": "CLIMB"}]}, garmin_activity_id="5001"
+        )
 
 
 def test_laps_that_do_not_add_up_to_the_ride_are_flagged():
@@ -1029,3 +1035,165 @@ def test_the_truncated_flag_is_not_true_for_an_exact_fit():
     assert coach.list_activities(limit=1)["truncated"] is False
     coach.import_activities([{**RIDE, "activityId": 5009, "startTimeLocal": "2026-07-06 08:00:00"}])
     assert coach.list_activities(limit=1)["truncated"] is True
+
+
+# --------------------------------------------------------------------------
+# the shared machinery, pinned so a future split re-introduces the drift
+# --------------------------------------------------------------------------
+
+
+def test_a_plan_and_a_ride_are_scored_by_the_same_formula():
+    """compliance_report sets these two numbers side by side.
+
+    Two copies of the TSS formula would make that comparison a report on the
+    arithmetic rather than on the session, and the drift would be invisible.
+    """
+    from cycling_mcp.metrics import compute_metrics
+    from cycling_mcp.spec import load_spec
+    from cycling_mcp.training import power_tss
+
+    spec = {
+        "name": "One hour at threshold",
+        "ftp": 250,
+        "blocks": [{"type": "steady", "duration": 3600, "power_pct": 100}],
+    }
+    planned = compute_metrics(load_spec(spec)).tss
+    ridden = power_tss(3600, 250, 250)
+    assert planned == pytest.approx(ridden)
+    assert planned == pytest.approx(100.0)
+
+
+def test_the_ftp_plausibility_band_is_one_set_of_numbers():
+    """It was 50-600 in the validator and 40-700/80-500 in the store, so a
+    550 W FTP was queried when stored and accepted when rendered."""
+    from cycling_mcp import spec as spec_module
+
+    assert coach.FTP_LIMITS is spec_module.FTP_PLAUSIBLE_W
+    assert coach.FTP_USUAL is spec_module.FTP_USUAL_W
+
+
+def test_the_store_refuses_what_the_renderer_merely_warns_about():
+    """The two layers act differently on the same band, on purpose."""
+    from cycling_mcp.spec import validate_spec
+
+    _, errors, warnings = validate_spec(
+        {"name": "x", "ftp": 550, "blocks": [{"type": "steady", "duration": 600, "power_pct": 60}]}
+    )
+    assert errors == []
+    assert any("unusual" in warning for warning in warnings)
+
+    result = coach.log_ftp(value_watts=550)
+    assert result["stored"]["value_watts"] == 550
+    assert any("unusual" in warning for warning in result["warnings"])
+    with pytest.raises(coach.CoachError, match="Check the units"):
+        coach.log_ftp(value_watts=900)
+
+
+def test_history_is_read_once_and_resolved_in_memory():
+    """Scoring a season used to issue up to eight lookups per ride, for the
+    same handful of rows every time."""
+    import sqlite3
+
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.log_hr(threshold_hr=170, max_hr=190, effective_date="2026-01-01")
+    coach.import_activities(
+        [
+            {
+                "activityId": 20000 + index,
+                "activityType": {"typeKey": "virtual_ride"},
+                "startTimeLocal": f"2026-03-{1 + index:02d} 08:00:00",
+                "duration": 3600.0,
+                "normPower": 200.0,
+            }
+            for index in range(20)
+        ]
+    )
+
+    counted = {"n": 0}
+
+    class Counting(sqlite3.Connection):
+        def execute(self, *args, **kwargs):
+            counted["n"] += 1
+            return super().execute(*args, **kwargs)
+
+    real = sqlite3.connect
+    try:
+        sqlite3.connect = lambda *a, **k: real(
+            *a, factory=Counting, **{key: value for key, value in k.items() if key != "factory"}
+        )
+        coach.get_form("2026-03-01", "2026-03-31")
+        queries = counted["n"]
+    finally:
+        sqlite3.connect = real
+
+    # A fixed handful: the migration check, the three history tables, and one
+    # pass over the activities. It must not scale with the number of rides.
+    assert queries < 20, f"{queries} queries for 20 activities — the history is not being reused"
+
+
+def test_a_backdated_weight_says_it_is_not_current():
+    """Only log_ftp used to say so; the same defect wore different units in the
+    other two loggers."""
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.log_weight(72.0, "2026-08-01")
+    result = coach.log_weight(80.0, "2026-01-01")
+    assert result["is_current"] is False
+    assert "72 kg (2026-08-01) still applies" in result["note"]
+    assert result["watts_per_kg_as_of"] == "2026-01-01"
+
+
+def test_a_backdated_threshold_hr_says_which_field_was_superseded():
+    coach.log_hr(threshold_hr=175, effective_date="2026-08-01")
+    result = coach.log_hr(threshold_hr=160, effective_date="2026-01-01")
+    assert result["is_current"] is False
+    assert "threshold_hr" in result["note"]
+
+
+def test_a_backdated_resting_hr_supersedes_nothing_about_the_threshold():
+    """Per field, because a later threshold entry says nothing about resting HR."""
+    coach.log_hr(threshold_hr=175, effective_date="2026-08-01")
+    result = coach.log_hr(resting_hr=45, effective_date="2026-01-01")
+    assert result["is_current"] is True
+
+
+def test_import_flags_are_stored_not_only_reported():
+    """A caveat that exists only in the response to the import call is a caveat
+    nobody has by the time the week is read."""
+    coach.import_activities([{k: v for k, v in RIDE.items() if k != "startTimeLocal"}])
+    stored = coach.list_activities()["activities"][0]
+    assert "local_date_from_utc" in stored["flags"]
+
+
+def test_a_clean_import_stores_an_empty_flag_list():
+    coach.import_activities([RIDE])
+    assert coach.list_activities()["activities"][0]["flags"] == []
+
+
+def test_flags_survive_a_re_import():
+    coach.import_activities([{k: v for k, v in RIDE.items() if k != "startTimeLocal"}])
+    coach.import_activities([{k: v for k, v in RIDE.items() if k != "startTimeLocal"}])
+    assert "local_date_from_utc" in coach.list_activities()["activities"][0]["flags"]
+
+
+def test_a_thinner_re_import_does_not_stamp_a_no_power_flag_on_a_powered_ride():
+    """Flags describe the stored row, not the payload that arrived.
+
+    Deriving them from the payload would stamp `no_normalized_power` on a ride
+    whose NP is sitting in the database from an earlier detailed fetch — the
+    same mistake the null-preserving merge exists to prevent, one column over.
+    """
+    coach.import_activities([RIDE])
+    summary = {k: v for k, v in RIDE.items() if k not in ("normPower", "avgPower")}
+    result = coach.import_activities([summary])
+    assert result["unchanged"] == 1
+    stored = coach.list_activities()["activities"][0]
+    assert stored["flags"] == []
+    assert stored["normalized_power"] == 198.0
+
+
+def test_a_flag_clears_when_the_detail_fetch_fills_the_gap():
+    """The reverse: import the summary first, then the detailed ride."""
+    coach.import_activities([{k: v for k, v in RIDE.items() if k != "normPower"}])
+    assert "no_normalized_power" in coach.list_activities()["activities"][0]["flags"]
+    coach.import_activities([RIDE])
+    assert coach.list_activities()["activities"][0]["flags"] == []

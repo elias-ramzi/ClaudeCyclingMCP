@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
+from .spec import format_duration
+
 # The classic Coggan boundaries, as fractions of FTP. Each entry is
 # (key, label, low, high); the top zone has no upper bound.
 POWER_ZONES: tuple[tuple[str, str, float, float | None], ...] = (
@@ -202,14 +204,26 @@ class Load:
         return result
 
 
-def power_tss(duration_s: float, normalized_power: float, ftp: int) -> float:
-    """TSS = (duration_h) x IF^2 x 100, with IF = NP / FTP.
+def training_stress_score(duration_s: float, intensity_factor: float) -> float:
+    """TSS = duration_h x IF^2 x 100.
 
-    One hour at threshold is 100 by construction. This is the number every
-    other load figure here is calibrated against.
+    The single definition in this package. `metrics.py` scores a *plan* and this
+    module scores a *ride*, and the whole point of `compliance_report` is to set
+    those two numbers side by side — so they must come from one function. Two
+    copies that drift by a rounding choice turn every plan-versus-actual
+    comparison into a report on the arithmetic.
+
+    One hour at threshold is 100 by construction.
     """
-    intensity = normalized_power / ftp
-    return (duration_s / 3600.0) * intensity**2 * 100.0
+    return (duration_s / 3600.0) * intensity_factor**2 * 100.0
+
+
+def power_tss(duration_s: float, normalized_power: float, ftp: int) -> float:
+    """TSS from power: IF is NP / FTP.
+
+    This is the number every other load figure here is calibrated against.
+    """
+    return training_stress_score(duration_s, normalized_power / ftp)
 
 
 def hr_tss(duration_s: float, avg_hr: float, threshold_hr: int) -> float:
@@ -234,8 +248,7 @@ def hr_tss(duration_s: float, avg_hr: float, threshold_hr: int) -> float:
     Use it to keep a no-power ride from vanishing out of the load history, not
     to make fine judgements about it.
     """
-    ratio = avg_hr / threshold_hr
-    return (duration_s / 3600.0) * ratio**2 * 100.0
+    return training_stress_score(duration_s, avg_hr / threshold_hr)
 
 
 def compute_activity_load(
@@ -506,10 +519,12 @@ def compare_block(
 
 
 def _mmss(seconds: float | None) -> str:
+    """A duration for a sentence, or a phrase saying there isn't one.
+
+    Formatting is `spec.format_duration`, so a compliance sentence and the
+    block table it is compared against never disagree about how long ten
+    minutes is.
+    """
     if seconds is None:
         return "an unknown time"
-    minutes, secs = divmod(round(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
+    return format_duration(round(seconds))

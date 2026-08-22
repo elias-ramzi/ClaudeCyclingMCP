@@ -19,14 +19,21 @@ from datetime import date
 from typing import Any
 
 from .garmin_import import (
-    GarminPayloadError,
     as_activity_list,
     as_lap_list,
     normalize_activity,
     normalize_lap,
+    row_flags,
 )
 from .metrics import compute_metrics, describe
-from .spec import SpecError, format_duration, load_spec, parse_duration
+from .spec import (
+    FTP_PLAUSIBLE_W,
+    FTP_USUAL_W,
+    SpecError,
+    format_duration,
+    load_spec,
+    parse_duration,
+)
 from .spec import validate_spec as _validate_spec
 from .store import CURRENT_SCHEMA_VERSION, DEFAULT_ATHLETE_ID, now_utc, open_db
 from .training import (
@@ -64,8 +71,8 @@ SPORTS = ("cycling", "running", "swimming", "other")
 # Plausibility limits. Outside these a value is far more likely to be the wrong
 # unit or the wrong field than a real measurement, and storing it would poison
 # every zone and every load figure computed afterwards.
-FTP_LIMITS = (40, 700)
-FTP_USUAL = (80, 500)
+FTP_LIMITS = FTP_PLAUSIBLE_W
+FTP_USUAL = FTP_USUAL_W
 WEIGHT_LIMITS_KG = (25.0, 300.0)
 # Above this a weight is worth querying as a possible pounds figure. It is a
 # question, not a limit: the two ranges genuinely overlap for adults.
@@ -95,6 +102,7 @@ _ACTIVITY_OUT_FIELDS = (
     "rpe",
     "feel",
     "note",
+    "flags_json",
     "imported_at",
 )
 
@@ -118,7 +126,13 @@ _IMPORT_FIELDS = (
     "normalized_power",
     "calories",
     "source",
+    "flags_json",
 )
+
+#: The activity columns every read needs. Naming them keeps `raw_json` — the
+#: whole Garmin payload, by far the largest column — out of queries that return
+#: hundreds of rows and never look at it.
+_ACTIVITY_SELECT = ", ".join(_ACTIVITY_OUT_FIELDS)
 
 _LAP_OUT_FIELDS = (
     "lap_index",
@@ -150,7 +164,13 @@ def _dict(row: sqlite3.Row | None) -> dict | None:
 
 def _project(row: sqlite3.Row | dict, fields: tuple[str, ...]) -> dict:
     source = row if isinstance(row, dict) else _dict(row) or {}
-    return {field: source.get(field) for field in fields}
+    projected = {field: source.get(field) for field in fields}
+    if "flags_json" in projected:
+        # Handed back parsed. A caller comparing against a list should not have
+        # to know this column holds JSON in a text field.
+        raw = projected.pop("flags_json")
+        projected["flags"] = json.loads(raw) if raw else []
+    return projected
 
 
 def _text(value: Any) -> str | None:
@@ -207,31 +227,134 @@ def _ensure_athlete(conn: sqlite3.Connection, athlete_id: int) -> dict:
     return _dict(row) or {}
 
 
+#: Dated history tables. Named here rather than interpolated from a caller's
+#: argument, so a table name in a query is always one of these.
+_HISTORY_TABLES = ("ftp_history", "weight_history", "hr_history")
+
+
+def _load_history(conn: sqlite3.Connection, athlete_id: int, table: str) -> list[dict]:
+    """Every entry in one dated history table, oldest first.
+
+    Loaded whole. These tables hold one row per FTP test, weigh-in or HR entry
+    — tens of rows for a serious athlete after years — so reading one once per
+    request costs less than the per-activity queries it replaces: scoring a
+    season used to issue up to eight indexed lookups per ride, for the same
+    handful of rows every time.
+    """
+    if table not in _HISTORY_TABLES:
+        raise CoachError(f"unknown history table {table!r}")
+    return [
+        _dict(row) or {}
+        for row in conn.execute(
+            f"SELECT * FROM {table} WHERE athlete_id = ? ORDER BY effective_date, id",
+            (athlete_id,),
+        )
+    ]
+
+
+def _resolve_rows(rows: list[dict], as_of: str | None, column: str | None = None) -> dict | None:
+    """The entry in effect on `as_of`, from an oldest-first list.
+
+    One resolver for every dated figure, because the rule is the same for all
+    of them and two copies of it drift: the latest entry at or before the date,
+    else — when the date precedes all of them — the earliest, flagged
+    `extrapolated_backwards`.
+
+    That fallback is deliberate. A ride from before the first recorded FTP has
+    to be scored against *something*; refusing makes it vanish out of CTL,
+    which reads as a rest week that never happened. The flag says the number is
+    a guess about an athlete who was probably fitter or less fit than it says.
+
+    `column` restricts the search to entries where that field is set, which is
+    what lets a lone resting-HR entry sit in the table without shadowing the
+    threshold recorded before it.
+    """
+    candidates = [row for row in rows if column is None or row.get(column) is not None]
+    if not candidates:
+        return None
+    in_effect = [row for row in candidates if as_of is None or row["effective_date"] <= as_of]
+    if in_effect:
+        return {**in_effect[-1], "extrapolated_backwards": False}
+    return {**candidates[0], "extrapolated_backwards": True}
+
+
+class History:
+    """The athlete's dated figures, read once and resolved in memory.
+
+    Build one at the top of any tool that scores more than a single activity.
+    The alternative — resolving from the database per ride — is what turns a
+    loop over a season into thousands of queries for the same forty rows.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, athlete_id: int) -> None:
+        self.ftp_rows = _load_history(conn, athlete_id, "ftp_history")
+        self.weight_rows = _load_history(conn, athlete_id, "weight_history")
+        self.hr_rows = _load_history(conn, athlete_id, "hr_history")
+
+    def ftp(self, on_date: str | None) -> dict | None:
+        """The FTP in effect on a date. See `resolve_ftp` for why it is dated."""
+        return _resolve_rows(self.ftp_rows, on_date)
+
+    def weight(self, on_date: str | None) -> dict | None:
+        return _resolve_rows(self.weight_rows, on_date)
+
+    def hr(self, on_date: str | None) -> dict | None:
+        """The HR figures in effect on a date, each resolved on its own.
+
+        Threshold, maximum and resting are resolved **per field**, not by
+        taking the latest row wholesale. `log_hr` accepts any subset — logging
+        a resting HR on its own is a normal thing to do — and a row-at-a-time
+        resolution would let that entry shadow the threshold recorded six
+        months earlier. The athlete would then be told they have no threshold
+        HR on file, and every no-power ride would stop being scored, because
+        they mentioned their morning pulse.
+
+        When only a maximum HR is known, threshold is estimated at 92% of it
+        and flagged `threshold_hr_estimated`. That estimate is wide — measured
+        LTHR lands either side of it routinely — so anything computed from it
+        is a direction, not a measurement.
+        """
+        fields = {
+            column: _resolve_rows(self.hr_rows, on_date, column)
+            for column in ("threshold_hr", "max_hr", "resting_hr")
+        }
+        if not any(fields.values()):
+            return None
+
+        entry: dict[str, Any] = {
+            column: (row[column] if row else None) for column, row in fields.items()
+        }
+        # Each figure keeps the date of the entry it actually came from; one
+        # effective_date across three fields from three different days would be
+        # a provenance claim that is not true.
+        entry["effective_dates"] = {
+            column: (row["effective_date"] if row else None) for column, row in fields.items()
+        }
+        entry["extrapolated_backwards"] = any(
+            row["extrapolated_backwards"] for row in fields.values() if row
+        )
+
+        if entry.get("threshold_hr"):
+            entry["threshold_hr_estimated"] = False
+        elif entry.get("max_hr"):
+            entry["threshold_hr"] = round(entry["max_hr"] * LTHR_FROM_MAX_HR)
+            entry["threshold_hr_estimated"] = True
+        else:
+            entry["threshold_hr_estimated"] = False
+        return entry
+
+
 def _latest(
     conn: sqlite3.Connection, table: str, athlete_id: int, as_of: str | None
 ) -> dict | None:
-    """The most recent entry in a dated history table, at or before `as_of`."""
-    if as_of:
-        row = conn.execute(
-            f"SELECT * FROM {table} WHERE athlete_id = ? AND effective_date <= ? "
-            f"ORDER BY effective_date DESC, id DESC LIMIT 1",
-            (athlete_id, as_of),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            f"SELECT * FROM {table} WHERE athlete_id = ? ORDER BY effective_date DESC, id DESC "
-            f"LIMIT 1",
-            (athlete_id,),
-        ).fetchone()
-    return _dict(row)
+    """The most recent entry at or before `as_of`, with no backwards guess.
 
-
-def _earliest(conn: sqlite3.Connection, table: str, athlete_id: int) -> dict | None:
-    row = conn.execute(
-        f"SELECT * FROM {table} WHERE athlete_id = ? ORDER BY effective_date ASC, id ASC LIMIT 1",
-        (athlete_id,),
-    ).fetchone()
-    return _dict(row)
+    This answers "what was on file then", where None means nothing was.
+    `resolve_ftp` is the one that extrapolates.
+    """
+    rows = _load_history(conn, athlete_id, table)
+    in_effect = [row for row in rows if as_of is None or row["effective_date"] <= as_of]
+    return in_effect[-1] if in_effect else None
 
 
 def _row_by_id(conn: sqlite3.Connection, table: str, row_id: int | None) -> dict | None:
@@ -245,38 +368,47 @@ def _row_by_id(conn: sqlite3.Connection, table: str, row_id: int | None) -> dict
     """
     if row_id is None:
         return None
+    if table not in _HISTORY_TABLES:
+        raise CoachError(f"unknown history table {table!r}")
     return _dict(conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone())
 
 
-def _superseded_by(
-    conn: sqlite3.Connection, table: str, athlete_id: int, effective_date: str, row_id: int
-) -> dict | None:
-    """The entry that takes over after `effective_date`, if this one is backdated."""
-    return _dict(
-        conn.execute(
-            f"SELECT * FROM {table} WHERE athlete_id = ? AND id != ? AND "
-            f"(effective_date > ? OR (effective_date = ? AND id > ?)) "
-            f"ORDER BY effective_date ASC, id ASC LIMIT 1",
-            (athlete_id, row_id, effective_date, effective_date, row_id),
-        ).fetchone()
-    )
+def _dated_write_outcome(
+    conn: sqlite3.Connection,
+    table: str,
+    athlete_id: int,
+    effective_date: str,
+    row_id: int,
+    column: str | None = None,
+) -> dict:
+    """What a just-written dated entry means: does it govern today, what did it replace?
 
+    Shared by all three loggers, because a backdated entry is a normal
+    correction in every one of them and only `log_ftp` used to say so. Being
+    handed today's W/kg after logging last month's weigh-in, or zones that are
+    not in force after logging a threshold from March, is the same defect
+    wearing different units.
 
-def _preceding(
-    conn: sqlite3.Connection, table: str, athlete_id: int, effective_date: str, row_id: int
-) -> dict | None:
-    """The entry this one replaces: the latest strictly before it."""
-    return _dict(
-        conn.execute(
-            f"SELECT * FROM {table} WHERE athlete_id = ? AND id != ? AND effective_date <= ? "
-            f"ORDER BY effective_date DESC, id DESC LIMIT 1",
-            (athlete_id, row_id, effective_date),
-        ).fetchone()
-    )
+    `column` narrows both questions to one field, which is what HR needs: a
+    backdated resting HR supersedes nothing about the threshold.
+    """
+    rows = _load_history(conn, athlete_id, table)
+    others = [
+        row
+        for row in rows
+        if row["id"] != row_id and (column is None or row.get(column) is not None)
+    ]
+    later = [row for row in others if (row["effective_date"], row["id"]) > (effective_date, row_id)]
+    earlier = [row for row in others if row["effective_date"] <= effective_date]
+    return {
+        "is_current": not later,
+        "superseded_by": later[0] if later else None,
+        "previous": earlier[-1] if earlier else None,
+    }
 
 
 def resolve_ftp(conn: sqlite3.Connection, athlete_id: int, on_date: str | None) -> dict | None:
-    """The FTP in effect on `on_date` — the entry with the latest date at or before it.
+    """The FTP in effect on `on_date` — the latest entry dated at or before it.
 
     This is the whole reason `ftp_history` is a table and not a column. Scoring
     a March ride against a July FTP inflates nothing and deflates everything:
@@ -284,87 +416,17 @@ def resolve_ftp(conn: sqlite3.Connection, athlete_id: int, on_date: str | None) 
     training silently shrinks the moment the athlete tests better.
 
     A ride *before* the first recorded FTP falls back to that earliest entry,
-    flagged `extrapolated_backwards`. Refusing to score it would be worse — the
-    ride vanishes out of CTL entirely, which reads as a rest week that never
-    happened — but the flag matters, because it is a guess about an athlete who
-    was probably fitter or less fit than the number says.
+    flagged `extrapolated_backwards` — see `_resolve_rows`.
+
+    Scoring more than one activity? Build a `History` once instead; this reads
+    the table on every call.
     """
-    entry = _latest(conn, "ftp_history", athlete_id, on_date)
-    if entry is not None:
-        return {**entry, "extrapolated_backwards": False}
-    earliest = _earliest(conn, "ftp_history", athlete_id)
-    if earliest is None:
-        return None
-    return {**earliest, "extrapolated_backwards": True}
-
-
-def _latest_field(
-    conn: sqlite3.Connection, athlete_id: int, column: str, as_of: str | None
-) -> dict | None:
-    """The most recent `hr_history` row where `column` is set, at or before `as_of`."""
-    clause = "AND effective_date <= ?" if as_of else ""
-    params: tuple = (athlete_id, as_of) if as_of else (athlete_id,)
-    row = conn.execute(
-        f"SELECT * FROM hr_history WHERE athlete_id = ? {clause} AND {column} IS NOT NULL "
-        f"ORDER BY effective_date DESC, id DESC LIMIT 1",
-        params,
-    ).fetchone()
-    if row is not None:
-        return {**(_dict(row) or {}), "extrapolated_backwards": False}
-    row = conn.execute(
-        f"SELECT * FROM hr_history WHERE athlete_id = ? AND {column} IS NOT NULL "
-        f"ORDER BY effective_date ASC, id ASC LIMIT 1",
-        (athlete_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    return {**(_dict(row) or {}), "extrapolated_backwards": True}
+    return _resolve_rows(_load_history(conn, athlete_id, "ftp_history"), on_date)
 
 
 def resolve_hr(conn: sqlite3.Connection, athlete_id: int, on_date: str | None) -> dict | None:
-    """The HR figures in effect on `on_date`, each resolved on its own.
-
-    Threshold, maximum and resting are resolved **per field**, not by taking
-    the latest row wholesale. `log_hr` accepts any subset — logging a resting
-    HR on its own is a normal thing to do — and a row-at-a-time resolution
-    would let that entry shadow the threshold recorded six months earlier. The
-    athlete would then be told they have no threshold HR on file, and every
-    no-power ride would stop being scored, because they mentioned their morning
-    pulse.
-
-    When only a maximum HR is known, threshold is estimated at 92% of it and
-    flagged `threshold_hr_estimated`. That estimate is wide — measured LTHR
-    lands either side of it routinely — so anything computed from it is a
-    direction, not a measurement.
-    """
-    fields = {
-        column: _latest_field(conn, athlete_id, column, on_date)
-        for column in ("threshold_hr", "max_hr", "resting_hr")
-    }
-    if not any(fields.values()):
-        return None
-
-    entry: dict[str, Any] = {
-        column: (row[column] if row else None) for column, row in fields.items()
-    }
-    # Each figure keeps the date of the entry it actually came from; a single
-    # effective_date across three fields from three different days would be a
-    # provenance claim that is not true.
-    entry["effective_dates"] = {
-        column: (row["effective_date"] if row else None) for column, row in fields.items()
-    }
-    entry["extrapolated_backwards"] = any(
-        row["extrapolated_backwards"] for row in fields.values() if row
-    )
-
-    if entry.get("threshold_hr"):
-        entry["threshold_hr_estimated"] = False
-    elif entry.get("max_hr"):
-        entry["threshold_hr"] = round(entry["max_hr"] * LTHR_FROM_MAX_HR)
-        entry["threshold_hr_estimated"] = True
-    else:
-        entry["threshold_hr_estimated"] = False
-    return entry
+    """The HR figures in effect on `on_date`. See `History.hr`."""
+    return History(conn, athlete_id).hr(on_date)
 
 
 def _find_activity(
@@ -396,9 +458,16 @@ def _find_activity(
     raise CoachError("pass either activity_id or garmin_activity_id")
 
 
-def _activity_load(conn: sqlite3.Connection, athlete_id: int, activity: dict) -> Load:
-    ftp = resolve_ftp(conn, athlete_id, activity.get("local_date"))
-    hr = resolve_hr(conn, athlete_id, activity.get("local_date"))
+def _activity_load(history: History, activity: dict) -> Load:
+    """Score one activity against the figures in effect on its own date.
+
+    Takes a `History` rather than a connection: every caller scores a list, and
+    resolving from the database per ride issued the same handful of lookups
+    over and over for the same forty rows.
+    """
+    on_date = activity.get("local_date")
+    ftp = history.ftp(on_date)
+    hr = history.hr(on_date)
     load = compute_activity_load(
         activity,
         ftp["value_watts"] if ftp else None,
@@ -459,6 +528,12 @@ def _aggregate_load(entries: list[dict]) -> dict:
             "compute_load says why, per ride."
         )
     return result
+
+
+def _flags_json(row: dict) -> str | None:
+    """The stored form of an activity's data-quality flags."""
+    flags = row_flags(row)
+    return json.dumps(flags) if flags else None
 
 
 def _spec_of(row: dict) -> dict:
@@ -678,42 +753,51 @@ def log_ftp(
         )
         row_id = cursor.lastrowid
         stored = _row_by_id(conn, "ftp_history", row_id)
-        previous = _preceding(conn, "ftp_history", athlete_id, when.isoformat(), row_id or 0)
-        superseded = _superseded_by(conn, "ftp_history", athlete_id, when.isoformat(), row_id or 0)
+        outcome = _dated_write_outcome(
+            conn, "ftp_history", athlete_id, when.isoformat(), row_id or 0
+        )
 
     result: dict[str, Any] = {
         "stored": stored,
         "zones": power_zones(value),
         "zones_apply_from": when.isoformat(),
+        "is_current": outcome["is_current"],
         "warnings": warnings,
     }
+    previous = outcome["previous"]
     if previous and previous["value_watts"] != value:
         delta = value - previous["value_watts"]
         result["change"] = (
             f"{previous['value_watts']} W ({previous['effective_date']}) -> {value} W "
             f"({when.isoformat()}), {delta:+d} W"
         )
+    superseded = outcome["superseded_by"]
     if superseded:
         # Backdated. The zones above are the ones this entry establishes, which
         # are not today's — saying otherwise would have the athlete training to
         # a number that a later test already replaced.
-        result["is_current"] = False
-        result["note"] = (
-            f"This entry is backdated: {superseded['value_watts']} W "
-            f"({superseded['effective_date']}) still applies from that date onward, so "
-            f"today's zones are unchanged. What this does change is how rides between "
-            f"{when.isoformat()} and {superseded['effective_date']} are scored — "
-            f"recompute with compute_load if that window matters."
+        result["note"] = _backdated_note(
+            when.isoformat(),
+            f"{superseded['value_watts']} W",
+            superseded["effective_date"],
+            "today's zones are unchanged",
         )
-    else:
-        result["is_current"] = True
-        if result.get("change"):
-            result["note"] = (
-                "Zones have moved. Any planned workout written in watts against the old FTP "
-                "now targets a different percentage — re-render before pushing it, and "
-                "recheck the targets in this week's plan."
-            )
+    elif result.get("change"):
+        result["note"] = (
+            "Zones have moved. Any planned workout written in watts against the old FTP "
+            "now targets a different percentage — re-render before pushing it, and "
+            "recheck the targets in this week's plan."
+        )
     return result
+
+
+def _backdated_note(effective_date: str, later_value: str, later_date: str, unchanged: str) -> str:
+    """The same sentence for every dated logger, with the units filled in."""
+    return (
+        f"This entry is backdated: {later_value} ({later_date}) still applies from that date "
+        f"onward, so {unchanged}. What it does change is how the window from {effective_date} "
+        f"to {later_date} is read — recompute with compute_load if that matters."
+    )
 
 
 def log_weight(
@@ -740,12 +824,28 @@ def log_weight(
             "VALUES (?, ?, ?, ?, ?)",
             (athlete_id, value, when.isoformat(), _text(note), now_utc()),
         )
-        stored = _row_by_id(conn, "weight_history", cursor.lastrowid)
+        row_id = cursor.lastrowid
+        stored = _row_by_id(conn, "weight_history", row_id)
+        outcome = _dated_write_outcome(
+            conn, "weight_history", athlete_id, when.isoformat(), row_id or 0
+        )
         ftp = _latest(conn, "ftp_history", athlete_id, when.isoformat())
 
-    result: dict[str, Any] = {"stored": stored}
+    result: dict[str, Any] = {"stored": stored, "is_current": outcome["is_current"]}
     if ftp:
+        # Against the FTP of the weigh-in's own date, so a backdated entry
+        # yields the W/kg the athlete had then rather than a figure mixing two
+        # points in time.
         result["watts_per_kg"] = round(ftp["value_watts"] / value, 2)
+        result["watts_per_kg_as_of"] = when.isoformat()
+    superseded = outcome["superseded_by"]
+    if superseded:
+        result["note"] = _backdated_note(
+            when.isoformat(),
+            f"{superseded['value_kg']:g} kg",
+            superseded["effective_date"],
+            "today's weight is unchanged",
+        )
     if value > POUNDS_SUSPICION_KG:
         result["warning"] = (
             f"{value:g} kg is heavy for a cyclist — check it is not pounds. {value:g} lb would "
@@ -804,10 +904,40 @@ def log_hr(
                 now_utc(),
             ),
         )
-        stored = _row_by_id(conn, "hr_history", cursor.lastrowid)
-        in_effect = resolve_hr(conn, athlete_id, None)
+        row_id = cursor.lastrowid
+        stored = _row_by_id(conn, "hr_history", row_id)
+        # Per field: a backdated resting HR supersedes nothing about the
+        # threshold, so asking the question row-at-a-time would answer it about
+        # figures this entry never touched.
+        outcomes = {
+            column: _dated_write_outcome(
+                conn, "hr_history", athlete_id, when.isoformat(), row_id or 0, column
+            )
+            for column, given in values.items()
+            if given is not None
+        }
+        in_effect = History(conn, athlete_id).hr(None)
 
-    result: dict[str, Any] = {"stored": stored, "in_effect_today": in_effect}
+    superseded_fields = {
+        column: outcome["superseded_by"]
+        for column, outcome in outcomes.items()
+        if outcome["superseded_by"]
+    }
+    result: dict[str, Any] = {
+        "stored": stored,
+        "in_effect_today": in_effect,
+        "is_current": not superseded_fields,
+    }
+    if superseded_fields:
+        result["note"] = (
+            "This entry is backdated for "
+            + ", ".join(
+                f"{column} (a later entry dated {row['effective_date']} still applies)"
+                for column, row in sorted(superseded_fields.items())
+            )
+            + ". The zones below are the ones this entry establishes on "
+            f"{when.isoformat()}, not today's."
+        )
     if values["threshold_hr"]:
         result["hr_zones"] = hr_zones(values["threshold_hr"])
     elif values["max_hr"]:
@@ -1111,7 +1241,7 @@ def record_race_result(
             (*updates.values(), now_utc(), event_id),
         )
         stored = _dict(conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone())
-        load = _activity_load(conn, athlete_id, activity).as_dict() if activity else None
+        load = _activity_load(History(conn, athlete_id), activity).as_dict() if activity else None
 
     result: dict[str, Any] = {"stored": _event_out(stored or {}), "updated_fields": sorted(updates)}
     if "status" not in updates:
@@ -1165,16 +1295,16 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
     no `activityId` or no readable start time is rejected; an unknown extra key
     never is.
     """
-    try:
-        items = as_activity_list(payload)
-    except GarminPayloadError as exc:
-        return {"ok": False, "error": str(exc), "inserted": 0, "updated": 0, "unchanged": 0}
+    # Raised, not returned as {"ok": False}. The tool layer renders every
+    # refusal in one place; a function returning its own ok flag worked only
+    # because the caller happened to spread this dict last, and the next person
+    # to reorder that line would have shipped a failure reported as a success.
+    items = as_activity_list(payload)
 
     inserted: list[dict] = []
     updated: list[dict] = []
     unchanged: list[dict] = []
     rejected: list[dict] = []
-    flagged: list[dict] = []
     stamp = now_utc()
 
     with open_db() as conn:
@@ -1184,9 +1314,7 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
             if row is None:
                 rejected.append({"index": index, "reason": reason})
                 continue
-            flags = row.pop("_flags", [])
-            if flags:
-                flagged.append({"garmin_activity_id": row["garmin_activity_id"], "flags": flags})
+            row.pop("_flags", None)
 
             existing = conn.execute(
                 "SELECT * FROM activities WHERE athlete_id = ? AND garmin_activity_id = ?",
@@ -1195,6 +1323,7 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
             raw = json.dumps(item, sort_keys=True, ensure_ascii=False)
 
             if existing is None:
+                row["flags_json"] = _flags_json(row)
                 columns = [
                     "athlete_id",
                     "garmin_activity_id",
@@ -1217,10 +1346,21 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
                 continue
 
             current = _dict(existing) or {}
+            # The row as it will stand after the merge, so the flags describe
+            # what is stored rather than what this particular payload carried.
+            merged = {
+                **current,
+                **{
+                    field: value
+                    for field, value in row.items()
+                    if value is not None and field in _IMPORT_FIELDS
+                },
+            }
+            merged["flags_json"] = _flags_json(merged)
             changes = {
-                field: row.get(field)
+                field: merged.get(field)
                 for field in _IMPORT_FIELDS
-                if row.get(field) is not None and not _same(row.get(field), current.get(field))
+                if not _same(merged.get(field), current.get(field))
             }
             if not changes:
                 unchanged.append(_project(current, _ACTIVITY_OUT_FIELDS))
@@ -1238,7 +1378,6 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
             updated.append(entry)
 
     result: dict[str, Any] = {
-        "ok": True,
         "seen": len(items),
         "inserted": len(inserted),
         "updated": len(updated),
@@ -1251,6 +1390,11 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
         },
         "rejections": rejected,
     }
+    flagged = [
+        {"garmin_activity_id": entry["garmin_activity_id"], "flags": entry["flags"]}
+        for entry in [*inserted, *updated, *unchanged]
+        if entry.get("flags")
+    ]
     if flagged:
         result["flags"] = flagged
         result["flags_note"] = (
@@ -1283,10 +1427,7 @@ def import_activity_laps(
     `replace=True` (the default) clears the stored laps first, so re-importing
     is idempotent rather than doubling them.
     """
-    try:
-        laps = as_lap_list(payload)
-    except GarminPayloadError as exc:
-        return {"ok": False, "error": str(exc), "stored_laps": 0}
+    laps = as_lap_list(payload)
 
     with open_db() as conn:
         activity = _find_activity(conn, athlete_id, activity_id, garmin_activity_id)
@@ -1313,7 +1454,6 @@ def import_activity_laps(
 
     total = sum(lap["duration_s"] or 0 for lap in stored)
     result: dict[str, Any] = {
-        "ok": True,
         "activity_id": activity["id"],
         "garmin_activity_id": activity["garmin_activity_id"],
         "stored_laps": len(stored),
@@ -1414,7 +1554,7 @@ def list_activities(
         # One more than asked for, so "there is more" is a fact rather than the
         # guess `len(rows) == limit` makes when exactly `limit` rows match.
         rows = conn.execute(
-            f"SELECT * FROM activities WHERE {' AND '.join(clauses)} "
+            f"SELECT {_ACTIVITY_SELECT} FROM activities WHERE {' AND '.join(clauses)} "
             f"ORDER BY local_date DESC, start_time_utc DESC, id DESC LIMIT ?",
             (*params, int(limit) + 1),
         ).fetchall()
@@ -1427,11 +1567,12 @@ def list_activities(
                 f"WHERE {' AND '.join(date_clauses)} AND sport IS NULL",
                 date_params,
             ).fetchone()["n"]
+        history = History(conn, athlete_id) if include_load else None
         activities = []
         for row in rows:
             entry = _project(row, _ACTIVITY_OUT_FIELDS)
-            if include_load:
-                entry["load"] = _activity_load(conn, athlete_id, _dict(row) or {}).as_dict()
+            if history is not None:
+                entry["load"] = _activity_load(history, _dict(row) or {}).as_dict()
             activities.append(entry)
 
     result: dict[str, Any] = {
@@ -1503,8 +1644,8 @@ def link_activity(
             # the log on exactly that date — a missed-session narrative for a
             # session that happened.
             rows = conn.execute(
-                "SELECT * FROM activities WHERE athlete_id = ? AND local_date = ? "
-                "AND (sport = ? OR sport IS NULL) ORDER BY start_time_utc",
+                f"SELECT {_ACTIVITY_SELECT} FROM activities WHERE athlete_id = ? "
+                f"AND local_date = ? AND (sport = ? OR sport IS NULL) ORDER BY start_time_utc",
                 (athlete_id, planned["scheduled_date"], "cycling"),
             ).fetchall()
             for row in rows:
@@ -1555,7 +1696,7 @@ def link_activity(
                 "SELECT * FROM planned_workouts WHERE id = ?", (planned_workout_id,)
             ).fetchone()
         )
-        load = _activity_load(conn, athlete_id, chosen).as_dict()
+        load = _activity_load(History(conn, athlete_id), chosen).as_dict()
 
     result: dict[str, Any] = {
         "linked": True,
@@ -1802,8 +1943,8 @@ def get_week(
         activity_rows = [
             _dict(row)
             for row in conn.execute(
-                "SELECT * FROM activities WHERE athlete_id = ? AND local_date BETWEEN ? AND ? "
-                "ORDER BY local_date, start_time_utc, id",
+                f"SELECT {_ACTIVITY_SELECT} FROM activities WHERE athlete_id = ? "
+                f"AND local_date BETWEEN ? AND ? ORDER BY local_date, start_time_utc, id",
                 (athlete_id, first.isoformat(), last.isoformat()),
             )
         ]
@@ -1814,11 +1955,12 @@ def get_week(
                 (athlete_id, first.isoformat(), last.isoformat()),
             )
         ]
+        history = History(conn, athlete_id)
         activities = []
         for row in activity_rows:
             assert row is not None
             entry = _project(row, _ACTIVITY_OUT_FIELDS)
-            entry["load"] = _activity_load(conn, athlete_id, row).as_dict()
+            entry["load"] = _activity_load(history, row).as_dict()
             activities.append(entry)
 
         # The FTP each session should have been written against: the one in
@@ -2026,12 +2168,14 @@ def compute_load(
 
     rows_out: list[dict] = []
     with open_db() as conn:
+        history = History(conn, athlete_id)
         for row in conn.execute(
-            f"SELECT * FROM activities WHERE {' AND '.join(clauses)} ORDER BY local_date, id",
+            f"SELECT {_ACTIVITY_SELECT} FROM activities WHERE {' AND '.join(clauses)} "
+            f"ORDER BY local_date, id",
             params,
         ):
             activity = _dict(row) or {}
-            load = _activity_load(conn, athlete_id, activity)
+            load = _activity_load(history, activity)
             rows_out.append(
                 {
                     "activity_id": activity["id"],
@@ -2094,14 +2238,16 @@ def get_form(
     methods: dict[str, int] = {}
     earliest: date | None = None
     with open_db() as conn:
+        history = History(conn, athlete_id)
         for row in conn.execute(
-            "SELECT * FROM activities WHERE athlete_id = ? AND local_date <= ? ORDER BY local_date",
+            f"SELECT {_ACTIVITY_SELECT} FROM activities WHERE athlete_id = ? "
+            f"AND local_date <= ? ORDER BY local_date",
             (athlete_id, last.isoformat()),
         ):
             activity = _dict(row) or {}
             day = parse_date(activity["local_date"], "local_date")
             earliest = day if earliest is None else min(earliest, day)
-            load = _activity_load(conn, athlete_id, activity)
+            load = _activity_load(history, activity)
             methods[load.method] = methods.get(load.method, 0) + 1
             if load.tss is not None:
                 daily[day] = daily.get(day, 0.0) + load.tss
@@ -2253,14 +2399,18 @@ def compliance_report(
                 (activity["id"],),
             )
         ]
-        load = _activity_load(conn, athlete_id, activity)
-        ftp_entry = resolve_ftp(conn, athlete_id, activity["local_date"])
+        history = History(conn, athlete_id)
+        load = _activity_load(history, activity)
+        ftp_entry = history.ftp(activity["local_date"])
 
     spec = _spec_of(planned)
     try:
         workout = load_spec(spec)
     except SpecError as exc:
-        return {"ok": False, "errors": exc.errors, "reason": "the stored spec no longer validates"}
+        raise CoachError(
+            "the stored spec no longer validates, so there is nothing to compare against: "
+            + "; ".join(exc.errors)
+        ) from None
     metrics = compute_metrics(workout)
     blocks = _planned_blocks(spec)
 
@@ -2327,7 +2477,6 @@ def compliance_report(
         and entry["verdict"] not in UNVERIFIABLE_VERDICTS
     ]
     return {
-        "ok": True,
         "planned_workout_id": planned_workout_id,
         "activity_id": activity["id"],
         "scheduled_date": planned["scheduled_date"],

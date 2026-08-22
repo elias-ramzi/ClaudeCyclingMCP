@@ -88,6 +88,19 @@ refuses. What to do about a missed Tuesday is the skill's business.
 **Migrations are append-only.** Never edit a migration that has run anywhere — only a version that
 has not been applied ever runs again. Add the next one.
 
+**One resolver for every dated figure, and load the history once.** FTP, weight and each HR field
+go through `_resolve_rows`; a tool that scores more than one activity builds a `History` and
+resolves in memory. Resolving per ride turned a season into ~1000 queries for the same forty rows.
+
+**A refusal is raised, never returned as `{"ok": False}`.** The tool layer renders every one of them
+in a single place. A function returning its own `ok` flag works only until someone reorders the
+spread in `_coach` — `_coach` now raises if a result carries one.
+
+**The three numeric coercers are deliberately different.** `verify._number` rejects strings (a
+string in a DTO is a shape error), `verify._as_number` parses them but must not touch commas (it
+reads a web page, where "1,234" is one thousand), and `garmin_import._number` reads a decimal comma
+(a European-locale export writes 232,5). Merging them picks one behaviour for all three.
+
 ## The reference workout
 
 Garmin workout id **`1662651131`** was hand-built in the Garmin UI with known inputs, and is what the

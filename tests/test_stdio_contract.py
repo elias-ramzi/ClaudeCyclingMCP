@@ -406,3 +406,26 @@ def test_a_numeric_id_links_a_planned_session(coach_client):
     )
     assert "_error" not in result, result
     assert result["linked"] is True
+
+
+def test_an_unreadable_payload_is_still_ok_false_at_the_tool_boundary(coach_client):
+    """The coach function raises; the tool layer is what renders the refusal.
+
+    This is the behaviour a client actually sees, and the reason the function
+    below it no longer returns its own "ok" flag.
+    """
+    result = coach_client.call("import_activities", payload="last Tuesday's ride")
+    assert "_error" not in result
+    assert result["ok"] is False
+    assert "not JSON" in result["error"]
+
+
+def test_split_summaries_are_refused_at_the_tool_boundary(coach_client):
+    coach_client.call("import_activities", payload=[{**RIDE, "activityId": 7100}])
+    result = coach_client.call(
+        "import_activity_laps",
+        payload={"splitSummaries": [{"splitType": "CLIMB"}]},
+        garmin_activity_id=7100,
+    )
+    assert result["ok"] is False
+    assert "get_activity_splits" in result["error"]

@@ -157,6 +157,11 @@ get_activity_splits(1662651131)   →   import_activity_laps(payload=..., garmin
   filter never silently drops a winter of training.
 - **Annotations survive.** RPE, feel and notes belong to this server, not to Garmin, and a re-import
   does not touch them.
+- **The data-quality flags are stored, and describe the row rather than the payload.** A ride whose
+  normalised power arrived in a detailed fetch does not get stamped `no_normalized_power` when the
+  thinner weekly list is re-synced over it — the flags are recomputed from what is stored after the
+  merge, which is the same rule as the null guard, one column over. Every read returns them as
+  `flags`.
 - **A payload with no activity type stores a null sport, not `"other"`.** `sport` is derived, so an
   "unknown" value would not be caught by the null rule above — and a thinner re-import would quietly
   reclassify a `virtual_ride` as unknown, dropping it out of every cycling filter while its
@@ -188,6 +193,12 @@ A ride *before* the earliest recorded FTP is scored against that earliest entry 
 `ftp_extrapolated_backwards`. Refusing to score it would be worse — the ride vanishes out of CTL,
 which reads as a rest week that never happened.
 
+**Every dated figure is resolved by one function.** FTP, weight and each HR field go through the
+same rule — the latest entry at or before the date, else the earliest with `extrapolated_backwards`
+— and a tool that scores more than one activity loads the history once and resolves in memory.
+Scoring 200 rides used to issue over 800 queries for the same handful of rows; it now issues ten
+regardless of how many rides there are.
+
 **HR figures resolve one field at a time.** `log_hr` takes any subset, so logging a resting HR on
 its own is a normal thing to do; resolving the latest *row* would let that entry shadow a threshold
 recorded months earlier, and every no-power ride would stop being scored because the athlete
@@ -196,7 +207,10 @@ mentioned their morning pulse. Each figure keeps the date of the entry it came f
 
 **A backdated entry returns its own row, and says it is not current.** "My FTP test was actually
 three weeks ago" is a normal correction. The response carries the row that was written, the zones it
-establishes, `zones_apply_from`, and `is_current: false` when a later entry still governs today.
+establishes, `zones_apply_from`, and `is_current: false` when a later entry still governs today. All
+three loggers do this — being handed today's W/kg after logging last month's weigh-in is the same
+defect wearing different units — and `log_hr` answers it per field, since a backdated resting HR
+supersedes nothing about the threshold.
 
 `get_zones(as_of="2026-07-05")` returns the zones a ride was actually performed against, which after
 an FTP change is not today's table.
@@ -328,6 +342,7 @@ next migration.
 |---|---|
 | 1 | `athlete`, `ftp_history`, `weight_history`, `hr_history`, `activities`, `activity_laps` |
 | 2 | `events`, `planned_workouts`, and the subjective columns (`rpe`, `feel`, `note`) on `activities` |
+| 3 | `flags_json` on `activities` — the import's data-quality notes, kept rather than reported once |
 
 Every table carries an `athlete_id`, defaulting to `1`. One athlete is the whole use case today; the
 column exists so adding a second is a schema no-op rather than a rewrite.

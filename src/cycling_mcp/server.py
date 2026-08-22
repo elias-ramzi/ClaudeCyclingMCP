@@ -909,6 +909,12 @@ def _coach(function, **kwargs) -> str:
                 "database": db_status(),
             }
         )
+    if "ok" in result:
+        # Every refusal is raised, so nothing should be setting this itself. A
+        # function that returned {"ok": False} used to work only because the
+        # spread below happened to come last — reorder that line and a failure
+        # is reported as a success.
+        raise RuntimeError(f"{function.__name__} returned its own 'ok' key; it should raise")
     return _dump({"ok": True, **result})
 
 

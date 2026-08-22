@@ -24,6 +24,20 @@ SANE_POWER_FRACTION = (0.3, 1.6)
 
 CADENCE_RANGE = (30, 150)
 
+# What an FTP in watts can plausibly be, and the narrower band inside which it
+# needs no second look. Shared with the coach layer so one athlete number is not
+# "unusual" in one module and fine in another — they were 50-600 here and
+# 80-500 there, which meant a 550 W FTP was queried when stored and accepted
+# when rendered.
+#
+# The two layers still act differently on the same numbers, and that is the
+# point of having both: the renderer renders what it is given and warns, because
+# refusing to build a session is not its call. The store *refuses* a figure
+# outside FTP_PLAUSIBLE_W, because persisting one silently rescales every zone
+# and every training-load number computed from it afterwards.
+FTP_PLAUSIBLE_W = (40, 700)
+FTP_USUAL_W = (80, 500)
+
 BLOCK_TYPES = ("steady", "ramp", "free", "repeat")
 ROLES = ("warmup", "interval", "recovery", "cooldown")
 
@@ -504,7 +518,7 @@ def validate_spec(spec: Any) -> tuple[Workout | None, list[str], list[str]]:
         out.error("spec", f"ftp must be a number, got {type(ftp_raw).__name__}")
     elif ftp_raw <= 0:
         out.error("spec", f"ftp is {ftp_raw} — must be greater than zero")
-    elif not (50 <= ftp_raw <= 600):
+    elif not (FTP_USUAL_W[0] <= ftp_raw <= FTP_USUAL_W[1]):
         out.warn("spec", f"ftp of {ftp_raw:g} W is unusual — check it is watts, not a percentage")
         ftp = float(ftp_raw)
     else:
