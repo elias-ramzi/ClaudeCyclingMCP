@@ -155,14 +155,19 @@ def test_a_file_that_is_not_a_database_is_refused_with_the_real_reason(db):
     assert "cannot rollback" not in str(exc.value)
 
 
-def test_an_unwritable_location_is_refused_with_the_path_and_the_env_var(tmp_path, monkeypatch):
-    blocked = tmp_path / "readonly"
-    blocked.mkdir()
-    blocked.chmod(0o500)
-    monkeypatch.setenv(store.ENV_DB_PATH, str(blocked / "coach.db"))
-    try:
-        with pytest.raises(store.StoreError) as exc, store.open_db():
-            pass
-        assert store.ENV_DB_PATH in str(exc.value)
-    finally:
-        blocked.chmod(0o700)
+def test_an_unreachable_location_is_refused_with_the_path_and_the_env_var(tmp_path, monkeypatch):
+    """The parent is a file, so the directory cannot be created.
+
+    Not a chmod: POSIX permission bits do not make a directory unwritable on
+    Windows, so that version of this test passed everywhere except the one
+    place it ran and quietly asserted nothing. A file in the way fails on every
+    platform, and reaches the same code path.
+    """
+    wall = tmp_path / "wall"
+    wall.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv(store.ENV_DB_PATH, str(wall / "sub" / "coach.db"))
+
+    with pytest.raises(store.StoreError) as exc, store.open_db():
+        pass
+    assert store.ENV_DB_PATH in str(exc.value)
+    assert "coach.db" in str(exc.value)
