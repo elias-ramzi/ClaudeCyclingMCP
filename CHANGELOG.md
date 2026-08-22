@@ -160,6 +160,61 @@ touch commas (it reads a page, where "1,234" is one thousand), and `garmin_impor
 decimal comma because a European-locale export writes 232,5. Folding them together picks one
 behaviour for all three. Each now says so, and a test pins the differences.
 
+#### Found in the second review round
+
+Twelve more, each reproduced before fixing and pinned by a test. Four are regressions from the
+round-1 fixes above — a generalisation that stopped one line short — and are marked as such.
+
+- **`record_race_result` with no fields crashed on an empty UPDATE.** *(Regression.)* Making
+  `status` mean "leave it alone" let `updates` be empty, and unlike every sibling updater there was
+  no guard: `UPDATE events SET , updated_at = ?` is not a statement, and `_coach` reported the
+  syntax error as database corruption.
+- **A thin re-import could move a ride to the UTC day, with the flag suppressed.** *(Regression.)*
+  `local_date` was merged as an ordinary field, so a payload with no `startTimeLocal` brought a
+  UTC-derived date that overrode the stored one — while `start_time_local` still said otherwise and
+  no flag was raised, because the flag reads the start times. A 22:00 UTC-5 ride moved to the next
+  day, and the week showed a missed session and an unplanned ride on consecutive days. The date is
+  now derived from the merged row by the same function the flag reads.
+- **One clean block certified the untestable ones.** *(Regression.)* `unverifiable` was returned
+  only when *every* block was, so a warmup with power in front of five no-power intervals came back
+  `as_prescribed`. And a `free` block counted as evidence of compliance, so any plan containing one
+  could never report `unverifiable` at all. Any unverifiable block now earns the verdict.
+- **Duration deviations vanished on blocks with no power.** *(Regression.)* The drift check promoted
+  only an already-clean verdict, so an HR-only ride abandoned block by block reported nothing wrong.
+  Power and duration are now judged separately — every block carries a `verdict` and a
+  `duration_verdict` — because duration is verifiable without a power meter.
+- **On Python 3.10 a timestamp could be stored two hours wrong.** `fromisoformat` there wants
+  exactly 3 or 6 fractional digits, so `"…33.5+02:00"` fell to the fallback, which truncates at the
+  dot and took the UTC offset with it. Wrong and plausible is worse than the rejection this
+  replaced, and 3.10 is the declared floor. Reproduced on a real 3.10; the fraction is now padded
+  before parsing.
+- **`link_activity` silently rewrote a `skipped` session to `completed`.** Linking a ride is
+  evidence about the ride, not a reversal of a decision the coach made. It now auto-completes only
+  from `planned` or `pushed` and reports when it did not.
+- **`compute_load` still dropped unknown-sport rides under a sport filter**, recreating the
+  missed-session narrative one function over from where it was fixed. All three queries now share
+  one sport-filter helper.
+- **`get_week`'s `planned_tss` folded an unparseable spec to a silent zero** — the null-folds-to-zero
+  pattern `_aggregate_load` exists to stop, surviving on the planned side of the same summary. One
+  corrupt spec made a week read as over-performed; planned sessions now get the same scored/unscored
+  accounting as the actuals.
+- **`log_hr`'s estimation note overwrote the backdated-entry note**, so backfilling a max HR returned
+  zones with no statement that they are not the ones in force. It is a separate key now.
+- **`update_planned_workout` returned its refusal inside an `ok: true` envelope** — the defect class
+  the "a refusal is raised" rule exists to prevent, invisible to the new `_coach` guard because that
+  keys on the literal `"ok"`. It raises.
+- **`compute_load(activity_ids=[])` returned a different shape** from the normal path, which spreads
+  the aggregator. It now spreads it too, so the two cannot drift.
+- **`link_activity` ranked a candidate with no duration as a perfect match**, presenting it ahead of
+  a near-exact one in the ambiguous list. Missing durations sort last.
+
+Also from that review: `get_week` now uses the `History` already in scope instead of re-reading
+`ftp_history` per planned row; `_latest` delegates to the shared resolver; the test-only `_flags`
+key is gone, leaving one flag channel; the import dedup query names its columns and no longer
+serialises a payload it is about to discard; `get_week`'s event lookup drops a no-op overlay;
+`log_hr` and `get_zones` load each history table once; and `FTP_LIMITS`/`FTP_USUAL` no longer alias
+the shared constants under second names.
+
 ### Notes
 
 Ingestion is model-mediated by design: Claude fetches from the Garmin MCP and passes the JSON here

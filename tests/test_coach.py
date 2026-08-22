@@ -297,10 +297,12 @@ def test_a_second_session_on_one_day_is_flagged_not_blocked():
 
 
 def test_replacing_a_spec_with_an_invalid_one_changes_nothing():
+    """Raised, not returned. A returned {"updated": False} came back inside the
+    tool layer's {"ok": True, ...} envelope — a failure reported as success."""
     saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
     planned_id = saved["planned_workouts"][0]["id"]
-    result = coach.update_planned_workout(planned_id, spec={"name": "broken"})
-    assert result["updated"] is False
+    with pytest.raises(coach.CoachError, match="nothing was changed"):
+        coach.update_planned_workout(planned_id, spec={"name": "broken"})
     assert coach.get_week("2026-07-01", "2026-07-10")["planned_workouts"][0]["spec"] == SPEC
 
 
@@ -552,7 +554,7 @@ def test_compliance_does_not_count_an_easy_recovery_against_the_athlete():
 
 def test_compliance_notices_a_block_ridden_far_longer_than_planned():
     report = coach.compliance_report(_linked_session_with_laps())
-    assert report["blocks"][7]["verdict"] == "long"
+    assert report["blocks"][7]["duration_verdict"] == "long"
     assert "15:00 ridden against 05:00 planned" in report["blocks"][7]["sentence"]
 
 
@@ -770,8 +772,10 @@ def test_a_block_cut_short_makes_the_session_a_deviation():
     coach.link_activity(planned_id, garmin_activity_id="8001")
 
     report = coach.compliance_report(planned_id)
-    assert [block["verdict"] for block in report["blocks"]] == ["short", "on_target"]
+    assert [block["duration_verdict"] for block in report["blocks"]] == ["short", "on_time"]
+    assert [block["verdict"] for block in report["blocks"]] == ["on_target", "on_target"]
     assert report["off_target_blocks"] == 0, "the power was right"
+    assert report["off_duration_blocks"] == 1
     assert report["deviating_blocks"] == 1
     assert report["verdict"] == "deviated"
 
@@ -1065,11 +1069,30 @@ def test_a_plan_and_a_ride_are_scored_by_the_same_formula():
 
 def test_the_ftp_plausibility_band_is_one_set_of_numbers():
     """It was 50-600 in the validator and 40-700/80-500 in the store, so a
-    550 W FTP was queried when stored and accepted when rendered."""
-    from cycling_mcp import spec as spec_module
+    550 W FTP was queried when stored and accepted when rendered.
 
-    assert coach.FTP_LIMITS is spec_module.FTP_PLAUSIBLE_W
-    assert coach.FTP_USUAL is spec_module.FTP_USUAL_W
+    Asserted on behaviour rather than on a constant, so aliasing the numbers
+    under a second name does not make this pass again.
+    """
+    from cycling_mcp.spec import FTP_PLAUSIBLE_W, FTP_USUAL_W, validate_spec
+
+    just_inside = FTP_USUAL_W[1]
+    just_outside = FTP_USUAL_W[1] + 50
+    for value, expect_warning in ((just_inside, False), (just_outside, True)):
+        _, errors, warnings = validate_spec(
+            {
+                "name": "x",
+                "ftp": value,
+                "blocks": [{"type": "steady", "duration": 600, "power_pct": 60}],
+            }
+        )
+        assert errors == []
+        assert bool([w for w in warnings if "unusual" in w]) is expect_warning
+        stored = coach.log_ftp(value_watts=value, effective_date="2026-01-01")
+        assert bool(stored["warnings"]) is expect_warning
+
+    with pytest.raises(coach.CoachError, match="Check the units"):
+        coach.log_ftp(value_watts=FTP_PLAUSIBLE_W[1] + 100)
 
 
 def test_the_store_refuses_what_the_renderer_merely_warns_about():
@@ -1197,3 +1220,230 @@ def test_a_flag_clears_when_the_detail_fetch_fills_the_gap():
     assert "no_normalized_power" in coach.list_activities()["activities"][0]["flags"]
     coach.import_activities([RIDE])
     assert coach.list_activities()["activities"][0]["flags"] == []
+
+
+# --------------------------------------------------------------------------
+# review round 2 — several of these are regressions from the round 1 fixes
+# --------------------------------------------------------------------------
+
+
+def test_a_bare_race_result_on_a_settled_event_changes_nothing_and_says_so():
+    """Reachable only after status stopped defaulting to "completed".
+
+    With nothing to update, the UPDATE built as "SET , updated_at = ?" and
+    SQLite refused it — which `_coach` then reported as database corruption.
+    """
+    event = coach.add_event("Club 100", "2026-07-04", priority="B")["stored"]
+    coach.update_event(event["id"], status="abandoned")
+    result = coach.record_race_result(event["id"])
+    assert result["updated_fields"] == []
+    assert result["stored"]["status"] == "abandoned"
+    assert "stays abandoned" in result["status_unchanged"]
+
+
+def test_a_thin_re_import_cannot_move_a_ride_to_the_utc_day():
+    """A 22:00 UTC-5 ride is the next day in UTC.
+
+    `local_date` was merged as an ordinary field, so a payload with no
+    `startTimeLocal` brought a UTC-derived date that overrode the stored one —
+    while `start_time_local` still said otherwise and no flag was raised,
+    because the flag reads the start times. The week then showed a missed
+    session and an unplanned ride on consecutive days.
+    """
+    evening = {
+        "activityId": 900,
+        "activityType": {"typeKey": "virtual_ride"},
+        "startTimeLocal": "2026-07-07 22:00:00",
+        "startTimeGMT": "2026-07-08 03:00:00",
+        "duration": 3600.0,
+        "normPower": 200.0,
+    }
+    coach.import_activities([evening])
+    result = coach.import_activities([{k: v for k, v in evening.items() if k != "startTimeLocal"}])
+    assert result["unchanged"] == 1, "nothing about the ride actually changed"
+    stored = coach.list_activities()["activities"][0]
+    assert stored["local_date"] == "2026-07-07"
+    assert stored["start_time_local"] == "2026-07-07T22:00:00"
+    assert stored["flags"] == []
+
+
+def test_a_corrected_start_time_does_move_the_date():
+    """The date is derived, so a genuinely corrected start time still moves it."""
+    coach.import_activities([{**RIDE, "startTimeLocal": "2026-07-05 07:00:00"}])
+    coach.import_activities([{**RIDE, "startTimeLocal": "2026-07-06 07:00:00"}])
+    assert coach.list_activities()["activities"][0]["local_date"] == "2026-07-06"
+
+
+def _hr_only_session(activity_id, laps, blocks, date="2026-07-01"):
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities(
+        [
+            {
+                "activityId": activity_id,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": f"{date} 08:00:00",
+                "duration": float(sum(lap["duration"] for lap in laps)),
+                "averageHR": 150,
+            }
+        ]
+    )
+    coach.import_activity_laps({"lapDTOs": laps}, garmin_activity_id=str(activity_id))
+    spec = {"name": "S", "ftp": 266, "blocks": blocks}
+    planned_id = coach.save_planned_workouts([{"spec": spec, "scheduled_date": date}])[
+        "planned_workouts"
+    ][0]["id"]
+    coach.link_activity(planned_id, garmin_activity_id=str(activity_id))
+    return coach.compliance_report(planned_id)
+
+
+INTERVALS = [{"type": "steady", "duration": 600, "power_pct": 90, "role": "interval"}] * 3
+
+
+def test_one_clean_block_does_not_certify_the_untestable_ones():
+    """A warmup with power in front of three no-power intervals used to return
+    `as_prescribed`, asserting the intervals had been held."""
+    report = _hr_only_session(
+        6100,
+        [{"duration": 600.0, "averagePower": 146.0}] + [{"duration": 600.0, "averageHR": 150}] * 3,
+        [{"type": "steady", "duration": 600, "power_pct": 55, "role": "warmup"}, *INTERVALS],
+    )
+    assert report["unverifiable_blocks"] == 3
+    assert report["verdict"] == "unverifiable"
+
+
+def test_a_free_block_does_not_make_unverifiable_unreachable():
+    """`no_target` used to count as evidence of compliance, so any plan with a
+    free block could never report `unverifiable`."""
+    report = _hr_only_session(
+        6101,
+        [{"duration": 600.0, "averageHR": 140}] + [{"duration": 600.0, "averageHR": 150}] * 3,
+        [{"type": "free", "duration": 600, "role": "warmup"}, *INTERVALS],
+        date="2026-07-02",
+    )
+    assert report["verdict"] == "unverifiable"
+
+
+def test_a_no_power_block_cut_in_half_is_still_a_deviation():
+    """Duration is verifiable without a power meter, and the promotion used to
+    apply only over an already-clean verdict — so an HR-only ride abandoned
+    block by block reported nothing wrong at all."""
+    report = _hr_only_session(
+        6102,
+        [{"duration": 300.0, "averageHR": 150}] * 3,
+        list(INTERVALS),
+        date="2026-07-03",
+    )
+    assert report["off_target_blocks"] == 0, "no power was recorded, so none was wrong"
+    assert report["off_duration_blocks"] == 3
+    assert report["deviating_blocks"] == 3
+    assert report["verdict"] == "deviated"
+
+
+def test_linking_does_not_resurrect_a_skipped_session():
+    """The coach withdrew it; a matching ride is evidence about the ride, not a
+    reversal of that decision."""
+    coach.import_activities([RIDE])
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.update_planned_workout(planned_id, status="skipped")
+
+    result = coach.link_activity(planned_id, garmin_activity_id="5001")
+    assert result["linked"] is True
+    assert result["planned_workout"]["status"] == "skipped"
+    assert result["planned_workout"]["linked_activity_id"] is not None
+    assert "stays skipped" in result["status_unchanged"]
+
+
+def test_linking_a_planned_session_still_completes_it():
+    coach.import_activities([RIDE])
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    result = coach.link_activity(saved["planned_workouts"][0]["id"], auto=True)
+    assert result["planned_workout"]["status"] == "completed"
+    assert "status_unchanged" not in result
+
+
+def test_compute_load_reports_the_unknown_sport_rides_a_filter_hid():
+    """The NULL-sport fix landed in two of the three queries."""
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities(
+        [RIDE, {k: v for k, v in RIDE.items() if k != "activityType"} | {"activityId": 5100}]
+    )
+    filtered = coach.compute_load(sport="cycling")
+    assert filtered["count"] == 1
+    assert filtered["excluded_unknown_sport"] == 1
+    assert "drop the sport filter" in filtered["excluded_unknown_sport_note"]
+
+
+def test_a_planned_session_that_cannot_be_scored_is_counted_not_ignored():
+    """One corrupt spec used to fold to zero, so the week read as over-performed."""
+    import sqlite3
+
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    saved = coach.save_planned_workouts(
+        [
+            {"spec": SPEC, "scheduled_date": "2026-07-05"},
+            {"spec": SPEC, "scheduled_date": "2026-07-06"},
+        ]
+    )
+    broken_id = saved["planned_workouts"][1]["id"]
+    conn = sqlite3.connect(store.db_path())
+    conn.execute(
+        "UPDATE planned_workouts SET spec_json = ? WHERE id = ?", ('{"name": "corrupt"}', broken_id)
+    )
+    conn.commit()
+    conn.close()
+
+    totals = coach.get_week("2026-07-01", "2026-07-10", today="2026-07-20")["totals"]
+    assert totals["planned_sessions"] == 2
+    assert totals["planned_sessions_scored"] == 1
+    assert totals["planned_sessions_unscored"] == 1
+    assert str(broken_id) in totals["planned_unscored_warning"]
+
+
+def test_a_backdated_hr_entry_keeps_both_notes():
+    """The estimation note used to overwrite the backdating one, so zones came
+    back with no statement that they are not the ones in force."""
+    coach.log_hr(max_hr=190, effective_date="2026-08-01")
+    result = coach.log_hr(max_hr=192, effective_date="2026-01-01")
+    assert result["is_current"] is False
+    assert "backdated" in result["note"]
+    assert "92%" in result["estimation_note"]
+
+
+def test_the_empty_selection_has_the_same_shape_as_a_real_one():
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities([RIDE])
+    full = coach.compute_load()
+    empty = coach.compute_load(activity_ids=[])
+    assert set(full) - set(empty) == set(), (
+        f"missing from the empty result: {set(full) - set(empty)}"
+    )
+    assert empty["scored"] == 0 and empty["total_tss"] == 0.0
+
+
+def test_a_candidate_with_no_duration_does_not_rank_as_a_perfect_match():
+    """`abs(None or 0)` sorted an unknown duration ahead of a near-exact one."""
+    coach.import_activities(
+        [
+            {
+                "activityId": 5200,
+                "activityType": {"typeKey": "virtual_ride"},
+                "startTimeLocal": "2026-07-05 08:00:00",
+                "duration": 3700.0,
+            },
+            {
+                "activityId": 5201,
+                "activityType": {"typeKey": "virtual_ride"},
+                "startTimeLocal": "2026-07-05 09:00:00",
+            },
+        ]
+    )
+    spec = {
+        "name": "S",
+        "ftp": 266,
+        "blocks": [{"type": "steady", "duration": 3600, "power_pct": 65}],
+    }
+    saved = coach.save_planned_workouts([{"spec": spec, "scheduled_date": "2026-07-05"}])
+    result = coach.link_activity(saved["planned_workouts"][0]["id"], auto=True)
+    assert result["linked"] is False, "two candidates is ambiguous"
+    assert [c["garmin_activity_id"] for c in result["candidates"]] == ["5200", "5201"]

@@ -1324,7 +1324,11 @@ def list_activities(
 
     `sport` filters on the family: "cycling" catches virtual_ride,
     indoor_cycling, gravel_cycling and the rest, which is the point. The
-    device's own key is in `sub_sport` on every row.
+    device's own key is in `sub_sport` on every row. A ride whose payload
+    carried no activity type has an *unknown* sport and is excluded — but the
+    exclusion is reported as `excluded_unknown_sport` rather than being
+    silent, because a real session dropping out of a list without a word is how
+    it becomes a missed-session narrative.
 
     This reads only what has been imported. It is not a view of Garmin: a ride
     that was never passed to import_activities does not exist here, and its
@@ -1356,8 +1360,10 @@ def link_activity(
     produces a compliance report that is confidently about the wrong session,
     and nothing downstream would ever reveal it.
 
-    Sets the planned session's status to `completed`. Then call
-    compliance_report.
+    Sets the planned session's status to `completed` **only if it was still
+    `planned` or `pushed`**. A session marked `skipped` or `missed` keeps that
+    status and the response says so: linking a ride is evidence about the ride,
+    not a reversal of a decision the coach made. Then call compliance_report.
     """
     return _coach(
         coach.link_activity,
@@ -1548,13 +1554,19 @@ def compliance_report(planned_workout_id: int, activity_id: int | None = None) -
 
     A recovery, warmup or cooldown ridden *below* target is `easier_than_target`
     and not a miss —
-    that target is a ceiling. But a block cut short **is** a deviation even
-    when the watts were right: `off_target_blocks` counts wrong power,
-    `deviating_blocks` adds short and long, and `verdict` follows the latter.
-    `unverifiable_blocks` is blocks that recorded no power; they count toward
-    neither, because a lap with no watts says nothing about whether the target
-    was held. When every block is unverifiable the verdict is `unverifiable` —
-    an HR-only ride is not evidence the session was ridden correctly.
+    that target is a ceiling.
+
+    **Each block carries two verdicts**, because one can be knowable while the
+    other is not: `verdict` for power, `duration_verdict` for time. A lap with
+    no watts says nothing about whether a target was held — but if it ran half
+    its planned length, that much *is* known, and it counts as a deviation.
+
+    `off_target_blocks` counts wrong power, `off_duration_blocks` counts short
+    or long, `deviating_blocks` is their union, `unverifiable_blocks` is blocks
+    whose power could not be checked and whose duration was fine. The session
+    `verdict` is `deviated` if anything deviated, else `unverifiable` if **any**
+    block could not be checked — one clean warmup in front of five no-power
+    intervals is not evidence the intervals were ridden — else `as_prescribed`.
 
     Read `sentences` first: it is the report in order, already phrased.
     """

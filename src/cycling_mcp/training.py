@@ -72,8 +72,13 @@ EASY_ROLES = ("recovery", "warmup", "cooldown")
 # because it says nothing about the session: the lap recorded no watts, so the
 # target could not be checked either way. Counting it as a deviation makes an
 # HR-only ride read as a failed one.
-COMPLIANT_VERDICTS = ("on_target", "easier_than_target", "no_target")
+COMPLIANT_VERDICTS = ("on_target", "easier_than_target")
 UNVERIFIABLE_VERDICTS = ("no_power",)
+#: A block that asked for no power target. Neither evidence of compliance nor
+#: of a problem — it is simply outside the power question, and counting it as
+#: compliant made a plan with one free block unable to ever read `unverifiable`.
+NO_TARGET_VERDICTS = ("no_target",)
+DEVIATING_DURATION_VERDICTS = ("short", "long")
 
 _ORDINALS = (
     "first",
@@ -407,6 +412,7 @@ class BlockComparison:
     actual_avg_power_w: float | None
     actual_avg_hr: int | None
     verdict: str
+    duration_verdict: str
     sentence: str
 
     def as_dict(self) -> dict:
@@ -429,6 +435,7 @@ class BlockComparison:
             ),
             "actual_avg_hr": self.actual_avg_hr,
             "verdict": self.verdict,
+            "duration_verdict": self.duration_verdict,
             "sentence": self.sentence,
         }
 
@@ -444,9 +451,14 @@ def compare_block(
 ) -> BlockComparison:
     """One planned block against the lap that was ridden for it.
 
-    The verdict is on power when both sides have it, and on duration otherwise.
-    A recovery, warmup or cooldown block ridden *below* its target reads as
-    `easier_than_target` rather than a miss — that target is a ceiling.
+    Two verdicts, because they answer different questions and one can be
+    knowable while the other is not. `verdict` is about power:
+    `on_target` / `under` / `over` / `easier_than_target` (a recovery, warmup or
+    cooldown ridden below a target that is a ceiling), `no_power` when the lap
+    recorded none, `no_target` when the block asked for none.
+    `duration_verdict` is `on_time` / `short` / `long` / `unknown`, judged
+    independently — a block cut in half is a deviation whether or not a power
+    meter was running.
     `sentence` is the finding as a clause an athlete can read — the point of
     this whole comparison is a sentence like "the second block fell to 228 W
     against a 250 W target", and assembling that from six numeric fields is
@@ -495,14 +507,20 @@ def compare_block(
             f"the {target_text} target cannot be checked"
         )
 
+    # Duration is judged on its own, not folded into the power verdict. It was
+    # promoted only over an already-clean verdict, so a block with no recorded
+    # power kept `no_power` however badly its duration deviated — and an
+    # HR-only ride abandoned block by block reported nothing wrong. Duration is
+    # verifiable without a power meter; that is the whole point of checking it.
+    duration_verdict = "unknown"
     if actual_seconds is not None and planned_seconds:
+        duration_verdict = "on_time"
         drift = actual_seconds - planned_seconds
         if abs(drift) >= max(30.0, planned_seconds * 0.1):
+            duration_verdict = "short" if drift < 0 else "long"
             sentence += (
                 f" ({_mmss(actual_seconds)} ridden against {_mmss(planned_seconds)} planned)"
             )
-            if verdict in ("on_target", "easier_than_target"):
-                verdict = "short" if drift < 0 else "long"
 
     return BlockComparison(
         index=index,
@@ -514,6 +532,7 @@ def compare_block(
         actual_avg_power_w=actual_power,
         actual_avg_hr=actual_hr,
         verdict=verdict,
+        duration_verdict=duration_verdict,
         sentence=sentence,
     )
 

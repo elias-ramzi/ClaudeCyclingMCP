@@ -157,6 +157,10 @@ get_activity_splits(1662651131)   →   import_activity_laps(payload=..., garmin
   filter never silently drops a winter of training.
 - **Annotations survive.** RPE, feel and notes belong to this server, not to Garmin, and a re-import
   does not touch them.
+- **The ride's date is derived from its start times, never carried across a re-import.** A payload
+  with no `startTimeLocal` carries a UTC-derived date that is not null, so merging it as an ordinary
+  field moved an evening ride to the next day while the stored local time still said otherwise. It
+  is recomputed from the merged row, which is also what the flag reads — so the two cannot disagree.
 - **The data-quality flags are stored, and describe the row rather than the payload.** A ride whose
   normalised power arrived in a detailed fetch does not get stamped `no_normalized_power` when the
   thinner weekly list is re-synced over it — the flags are recomputed from what is stored after the
@@ -307,12 +311,18 @@ measure different things: the rendered band is what the athlete was told to hold
 far off a lap average has to be before it is worth mentioning.
 
 A recovery, warmup or cooldown ridden *below* target is `easier_than_target` and not a miss: that
-target is a ceiling. A block **cut short** is a deviation even when the watts were right —
-`off_target_blocks` counts wrong power, `deviating_blocks` adds short and long, and `verdict`
-follows the latter. `unverifiable_blocks` is blocks that recorded no power at all; they count toward
-neither, because a lap with no watts says nothing about whether the target was held. When *every*
-block is unverifiable the verdict is `unverifiable` — an HR-only ride is not evidence that the
-session was ridden correctly.
+target is a ceiling.
+
+**Each block carries two verdicts**, because one can be knowable while the other is not: `verdict`
+for power, `duration_verdict` for time. A lap with no watts says nothing about whether a target was
+held — but if it ran half its planned length, that much *is* known, and it counts as a deviation.
+Duration does not need a power meter.
+
+`off_target_blocks` counts wrong power, `off_duration_blocks` counts short or long,
+`deviating_blocks` is their union, and `unverifiable_blocks` is blocks whose power could not be
+checked and whose duration was fine. The session `verdict` is `deviated` if anything deviated, else
+`unverifiable` if **any** block could not be checked — one clean warmup in front of five no-power
+intervals is not evidence the intervals were ridden — else `as_prescribed`.
 
 The laps are returned whenever any are stored, mismatch included — that is precisely the case where
 nothing could be compared and the caller has to look at them.

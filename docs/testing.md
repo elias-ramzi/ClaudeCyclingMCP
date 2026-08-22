@@ -7,7 +7,7 @@ The offline gate, the live Garmin round-trip, and what the numbers are pinned ag
 pip install -e ".[dev]" && pytest
 ```
 
-423 offline tests: watt↔fraction conversion in both directions, duration totals,
+444 offline tests: watt↔fraction conversion in both directions, duration totals,
 NP/IF/TSS, both renderers against golden files, XML that actually parses, the
 round-trip comparison against a recorded real API exchange, and the skill
 frontmatter that decides whether a skill is ever reached for.

@@ -154,9 +154,11 @@ def test_an_activity_without_a_start_time_is_rejected():
 
 def test_a_missing_local_time_falls_back_to_utc_and_flags_it():
     """The UTC date is a different day for a late-evening or pre-dawn ride."""
+    from cycling_mcp.garmin_import import row_flags
+
     row, _ = normalize_activity({k: v for k, v in RIDE.items() if k != "startTimeLocal"})
     assert row["local_date"] == "2026-07-05"
-    assert "local_date_from_utc" in row["_flags"]
+    assert "local_date_from_utc" in row_flags(row)
 
 
 def test_the_local_date_wins_over_utc_when_they_disagree():
@@ -176,17 +178,22 @@ def test_epoch_milliseconds_are_read_as_a_timestamp():
 
 
 def test_a_ride_with_no_power_is_flagged_not_rejected():
+    from cycling_mcp.garmin_import import row_flags
+
     row, reason = normalize_activity(
         {k: v for k, v in RIDE.items() if k not in ("avgPower", "maxPower", "normPower")}
     )
     assert reason is None
-    assert "no_power" in row["_flags"]
+    assert "no_power" in row_flags(row)
 
 
 def test_average_power_without_np_is_flagged_separately():
+    from cycling_mcp.garmin_import import row_flags
+
     row, _ = normalize_activity({k: v for k, v in RIDE.items() if k != "normPower"})
-    assert "no_normalized_power" in row["_flags"]
-    assert "no_power" not in row["_flags"]
+    flags = row_flags(row)
+    assert "no_normalized_power" in flags
+    assert "no_power" not in flags
 
 
 # --------------------------------------------------------------------------
@@ -305,3 +312,42 @@ def test_the_three_numeric_coercers_stay_different_on_purpose():
     assert from_payload("72.0") is None, "a string in a DTO is a shape error"
     assert from_page("72.0") == 72.0
     assert (from_garmin(72), from_page(72), from_payload(72)) == (72.0, 72.0, 72.0)
+
+
+@pytest.mark.parametrize(
+    "value,expected_utc",
+    [
+        ("2026-08-20T23:12:33.5+02:00", "2026-08-20T21:12:33"),
+        ("2026-08-20T23:12:33.12345+02:00", "2026-08-20T21:12:33"),
+        ("2026-08-20T23:12:33.500+02:00", "2026-08-20T21:12:33"),
+        ("2026-08-20T23:12:33.500000+02:00", "2026-08-20T21:12:33"),
+        ("2026-08-20T23:12:33.5Z", "2026-08-20T23:12:33"),
+    ],
+)
+def test_an_odd_fractional_second_does_not_cost_the_utc_offset(value, expected_utc):
+    """Python 3.10's fromisoformat wants exactly 3 or 6 fractional digits.
+
+    `.5` fell through to the strptime fallback, which truncates at the dot and
+    took the "+02:00" with it — storing the instant two hours wrong, with
+    nothing to show for it. Wrong and plausible is worse than rejected, and
+    3.10 is this package's declared floor, so it only ever failed there.
+    """
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp(value, to_utc=True) == expected_utc
+    assert _timestamp(value) == "2026-08-20T23:12:33"
+
+
+def test_the_local_date_is_derived_from_the_row_not_carried():
+    """One source of truth, so a stored date and the times beside it cannot
+    disagree — which is what let a re-import move a ride to the next day."""
+    from cycling_mcp.garmin_import import local_date_of
+
+    assert (
+        local_date_of(
+            {"start_time_local": "2026-07-07T22:00:00", "start_time_utc": "2026-07-08T03:00:00"}
+        )
+        == "2026-07-07"
+    )
+    assert local_date_of({"start_time_utc": "2026-07-08T03:00:00"}) == "2026-07-08"
+    assert local_date_of({}) == ""

@@ -22,6 +22,7 @@ fails on a new one fails for every ride at once.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -73,6 +74,9 @@ _LAP_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 _INT_FIELDS = {"avg_hr", "max_hr"}
+
+# A fractional-seconds field, with whatever follows it (an offset, or nothing).
+_FRACTION = re.compile(r"^(.*?)\.(\d+)(.*)$")
 
 
 class GarminPayloadError(ValueError):
@@ -264,11 +268,17 @@ def _timestamp(value: Any, to_utc: bool = False) -> str | None:
     if not text:
         return None
 
-    # "Z" is only accepted by fromisoformat from 3.11; this package supports
-    # 3.10, where the equivalent offset spelling parses on every version.
+    # Two 3.10 limitations, both worked around here rather than left to the
+    # fallback below. "Z" is only accepted from 3.11, and a fractional-second
+    # field must be exactly 3 or 6 digits — "…33.5+02:00" raises there and
+    # parses on 3.11+. The fallback then strips everything after the dot,
+    # taking the UTC offset with it, and stores an instant two hours wrong with
+    # nothing to show for it. Wrong and plausible is worse than rejected, and
+    # 3.10 is this package's declared floor.
     iso = text.replace(" ", "T")
     if iso.endswith(("Z", "z")):
         iso = iso[:-1] + "+00:00"
+    iso = _pad_fraction(iso)
     try:
         parsed = datetime.fromisoformat(iso)
     except ValueError:
@@ -285,6 +295,34 @@ def _timestamp(value: Any, to_utc: bool = False) -> str | None:
         except ValueError:
             continue
     return None
+
+
+def _pad_fraction(text: str) -> str:
+    """Pad a fractional-seconds field to six digits, leaving any offset attached.
+
+    `.5` and `.12345` are legal ISO-8601 and rejected by `fromisoformat` before
+    3.11; six digits is accepted everywhere. Anything with no fraction, or a
+    fraction that is already 3 or 6 digits, comes back unchanged.
+    """
+    match = _FRACTION.match(text)
+    if match is None:
+        return text
+    head, digits, tail = match.groups()
+    return f"{head}.{digits[:6].ljust(6, '0')}{tail}"
+
+
+def local_date_of(row: dict) -> str:
+    """The day the athlete believes they trained, from a row's start times.
+
+    Local wall clock when there is one, else the UTC date. Derived rather than
+    carried, because a stored `local_date` and the times beside it must never
+    be able to disagree: a re-import from a payload with no `startTimeLocal`
+    used to overwrite the date with the UTC one while the stored local time
+    still said otherwise, moving an evening ride to the next day with nothing
+    flagged. `row_flags` reads the same two fields, so the flag and the
+    derivation agree by construction.
+    """
+    return (row.get("start_time_local") or row.get("start_time_utc") or "")[:10]
 
 
 def sport_family(type_key: str | None) -> str:
@@ -356,8 +394,6 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
     if local is None and utc is None:
         return None, f"activity {activity_id} has no readable start time (startTimeLocal/GMT)"
 
-    local_date = (local or utc or "")[:10]
-
     type_key = _type_key(item)
     row: dict[str, Any] = {
         "garmin_activity_id": activity_id,
@@ -371,7 +407,6 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
         "sub_sport": type_key,
         "start_time_utc": utc,
         "start_time_local": local,
-        "local_date": local_date,
         "source": "garmin",
     }
     for field in (
@@ -392,7 +427,7 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
         else:
             row[field] = number
 
-    row["_flags"] = row_flags(row)
+    row["local_date"] = local_date_of(row)
     return row, None
 
 

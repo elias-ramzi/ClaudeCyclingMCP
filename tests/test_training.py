@@ -202,8 +202,23 @@ def test_a_recovery_ridden_over_target_is_still_a_miss():
 
 def test_a_block_cut_short_is_reported_even_when_the_power_was_right():
     comparison = compare_block(2, "interval", 600, 250, 250, {"duration_s": 300, "avg_power": 250})
-    assert comparison.verdict == "short"
+    assert comparison.verdict == "on_target", "the watts were right"
+    assert comparison.duration_verdict == "short"
     assert "05:00 ridden against 10:00 planned" in comparison.sentence
+
+
+def test_a_block_with_no_power_still_has_its_duration_judged():
+    """The two verdicts are independent: duration is verifiable without watts,
+    and folding it into the power verdict lost it entirely on an HR-only ride."""
+    comparison = compare_block(2, "interval", 600, 250, 250, {"duration_s": 300})
+    assert comparison.verdict == "no_power"
+    assert comparison.duration_verdict == "short"
+
+
+def test_a_free_block_cut_short_is_still_short():
+    comparison = compare_block(1, "warmup", 600, None, None, {"duration_s": 200})
+    assert comparison.verdict == "no_target"
+    assert comparison.duration_verdict == "short"
 
 
 def test_a_block_with_no_recorded_power_says_so_rather_than_scoring_it():

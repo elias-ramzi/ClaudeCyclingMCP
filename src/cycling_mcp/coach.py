@@ -21,6 +21,7 @@ from typing import Any
 from .garmin_import import (
     as_activity_list,
     as_lap_list,
+    local_date_of,
     normalize_activity,
     normalize_lap,
     row_flags,
@@ -37,7 +38,7 @@ from .spec import (
 from .spec import validate_spec as _validate_spec
 from .store import CURRENT_SCHEMA_VERSION, DEFAULT_ATHLETE_ID, now_utc, open_db
 from .training import (
-    COMPLIANT_VERDICTS,
+    DEVIATING_DURATION_VERDICTS,
     LTHR_FROM_MAX_HR,
     TWENTY_MINUTE_FACTOR,
     UNVERIFIABLE_VERDICTS,
@@ -55,6 +56,9 @@ PLANNED_STATUSES = ("planned", "pushed", "completed", "missed", "skipped")
 EVENT_STATUSES = ("upcoming", "completed", "abandoned", "dns")
 EVENT_PRIORITIES = ("A", "B", "C")
 PUSH_TARGETS = ("garmin", "mywhoosh")
+#: Statuses that linking a ride may turn into `completed`. Anything else is
+#: a decision the coach made, and a link is not a reason to reverse it.
+AUTO_COMPLETABLE_STATUSES = ("planned", "pushed")
 FTP_METHODS = (
     "stated",
     "20min_test",
@@ -71,8 +75,6 @@ SPORTS = ("cycling", "running", "swimming", "other")
 # Plausibility limits. Outside these a value is far more likely to be the wrong
 # unit or the wrong field than a real measurement, and storing it would poison
 # every zone and every load figure computed afterwards.
-FTP_LIMITS = FTP_PLAUSIBLE_W
-FTP_USUAL = FTP_USUAL_W
 WEIGHT_LIMITS_KG = (25.0, 300.0)
 # Above this a weight is worth querying as a possible pounds figure. It is a
 # question, not a limit: the two ranges genuinely overlap for adults.
@@ -352,9 +354,10 @@ def _latest(
     This answers "what was on file then", where None means nothing was.
     `resolve_ftp` is the one that extrapolates.
     """
-    rows = _load_history(conn, athlete_id, table)
-    in_effect = [row for row in rows if as_of is None or row["effective_date"] <= as_of]
-    return in_effect[-1] if in_effect else None
+    resolved = _resolve_rows(_load_history(conn, athlete_id, table), as_of)
+    if resolved is None or resolved["extrapolated_backwards"]:
+        return None
+    return {key: value for key, value in resolved.items() if key != "extrapolated_backwards"}
 
 
 def _row_by_id(conn: sqlite3.Connection, table: str, row_id: int | None) -> dict | None:
@@ -392,7 +395,13 @@ def _dated_write_outcome(
     `column` narrows both questions to one field, which is what HR needs: a
     backdated resting HR supersedes nothing about the threshold.
     """
-    rows = _load_history(conn, athlete_id, table)
+    return _write_outcome(_load_history(conn, athlete_id, table), effective_date, row_id, column)
+
+
+def _write_outcome(
+    rows: list[dict], effective_date: str, row_id: int, column: str | None = None
+) -> dict:
+    """`_dated_write_outcome` over rows already in hand — log_hr asks three times."""
     others = [
         row
         for row in rows
@@ -425,7 +434,11 @@ def resolve_ftp(conn: sqlite3.Connection, athlete_id: int, on_date: str | None) 
 
 
 def resolve_hr(conn: sqlite3.Connection, athlete_id: int, on_date: str | None) -> dict | None:
-    """The HR figures in effect on `on_date`. See `History.hr`."""
+    """The HR figures in effect on `on_date`. See `History.hr`.
+
+    Reads all three history tables to answer a question about one. Fine for a
+    single call; build a `History` where more than one figure is wanted.
+    """
     return History(conn, athlete_id).hr(on_date)
 
 
@@ -528,6 +541,32 @@ def _aggregate_load(entries: list[dict]) -> dict:
             "compute_load says why, per ride."
         )
     return result
+
+
+def _sport_filter(sport: str | None) -> tuple[list[str], list[Any]]:
+    """The WHERE fragment for a sport filter, and its parameters.
+
+    One helper because there are three of these queries and the NULL branch was
+    fixed in two of them. A ride imported from a payload with no activity type
+    has an *unknown* sport, and a bare `sport = ?` drops it silently — which is
+    how a real session turns into a missed-session narrative.
+    """
+    return ([], []) if sport is None else (["sport = ?"], [sport])
+
+
+def _unknown_sport_note(count: int) -> dict:
+    """What a sport filter hid, said out loud rather than dropped."""
+    if not count:
+        return {}
+    return {
+        "excluded_unknown_sport": count,
+        "excluded_unknown_sport_note": (
+            f"{count} activit{'y' if count == 1 else 'ies'} in this range "
+            f"{'carries' if count == 1 else 'carry'} no sport from Garmin and "
+            f"{'is' if count == 1 else 'are'} not in this result. That is training that "
+            "happened; drop the sport filter to see it."
+        ),
+    }
 
 
 def _flags_json(row: dict) -> str | None:
@@ -736,12 +775,12 @@ def log_ftp(
         value = round(float(value_watts))
         method = method or "stated"
 
-    _check_range(value, FTP_LIMITS, "FTP", "W")
+    _check_range(value, FTP_PLAUSIBLE_W, "FTP", "W")
     method = _one_of(method, FTP_METHODS, "method")
     when = parse_date(effective_date, "effective_date") if effective_date else date.today()
 
     warnings: list[str] = []
-    if not (FTP_USUAL[0] <= value <= FTP_USUAL[1]):
+    if not (FTP_USUAL_W[0] <= value <= FTP_USUAL_W[1]):
         warnings.append(f"{value} W is an unusual FTP — stored as given, but worth confirming")
 
     with open_db() as conn:
@@ -909,10 +948,9 @@ def log_hr(
         # Per field: a backdated resting HR supersedes nothing about the
         # threshold, so asking the question row-at-a-time would answer it about
         # figures this entry never touched.
+        rows = _load_history(conn, athlete_id, "hr_history")
         outcomes = {
-            column: _dated_write_outcome(
-                conn, "hr_history", athlete_id, when.isoformat(), row_id or 0, column
-            )
+            column: _write_outcome(rows, when.isoformat(), row_id or 0, column)
             for column, given in values.items()
             if given is not None
         }
@@ -944,7 +982,10 @@ def log_hr(
         estimated = round(values["max_hr"] * LTHR_FROM_MAX_HR)
         result["hr_zones"] = hr_zones(estimated)
         result["threshold_hr_estimated"] = estimated
-        result["note"] = (
+        # A separate key: `note` may already carry the backdating warning, and
+        # reassigning it here dropped the statement that these zones are not
+        # the ones in force today.
+        result["estimation_note"] = (
             f"No threshold HR on file, so these zones use {LTHR_FROM_MAX_HR:.0%} of max HR "
             f"({estimated} bpm) as an estimate. A measured threshold routinely lands several "
             "bpm either side of that, and every boundary moves with it."
@@ -961,8 +1002,11 @@ def get_zones(as_of: str | None = None, athlete_id: int = DEFAULT_ATHLETE_ID) ->
     """
     when = as_of if as_of is None else parse_date(as_of, "as_of").isoformat()
     with open_db() as conn:
-        ftp = resolve_ftp(conn, athlete_id, when)
-        hr = resolve_hr(conn, athlete_id, when)
+        # One History for both figures: resolving them separately read
+        # ftp_history twice and hr_history four times for one answer.
+        history = History(conn, athlete_id)
+        ftp = history.ftp(when)
+        hr = history.hr(when)
 
     result: dict[str, Any] = {"as_of": when or date.today().isoformat()}
     if ftp:
@@ -1235,6 +1279,18 @@ def record_race_result(
         if debrief is not None:
             updates["debrief"] = _text(debrief)
 
+        if not updates:
+            # Reachable since status stopped defaulting to "completed": a bare
+            # call on an event that already has a result changes nothing, and
+            # "UPDATE events SET , updated_at = ?" is not a statement.
+            return {
+                "stored": _event_out(event),
+                "updated_fields": [],
+                "status_unchanged": (
+                    f"'{event['name']}' stays {event['status']}, and nothing else was given. "
+                    "Pass a finish time, a debrief, an activity, or an explicit status."
+                ),
+            }
         assignments = ", ".join(f"{key} = ?" for key in updates)
         conn.execute(
             f"UPDATE events SET {assignments}, updated_at = ? WHERE id = ?",
@@ -1314,13 +1370,15 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
             if row is None:
                 rejected.append({"index": index, "reason": reason})
                 continue
-            row.pop("_flags", None)
 
+            # Named columns, not SELECT *: an idempotent weekly re-sync would
+            # otherwise pull back the full stored Garmin payload for every ride
+            # only to discard it.
             existing = conn.execute(
-                "SELECT * FROM activities WHERE athlete_id = ? AND garmin_activity_id = ?",
+                f"SELECT id, {', '.join(_IMPORT_FIELDS)} FROM activities "
+                f"WHERE athlete_id = ? AND garmin_activity_id = ?",
                 (athlete_id, row["garmin_activity_id"]),
             ).fetchone()
-            raw = json.dumps(item, sort_keys=True, ensure_ascii=False)
 
             if existing is None:
                 row["flags_json"] = _flags_json(row)
@@ -1333,7 +1391,7 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
                 ]
                 values = [athlete_id, row["garmin_activity_id"]]
                 values += [row.get(field) for field in _IMPORT_FIELDS]
-                values += [raw, stamp]
+                values += [json.dumps(item, sort_keys=True, ensure_ascii=False), stamp]
                 placeholders = ", ".join("?" for _ in columns)
                 cursor = conn.execute(
                     f"INSERT INTO activities ({', '.join(columns)}) VALUES ({placeholders})",
@@ -1356,6 +1414,12 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
                     if value is not None and field in _IMPORT_FIELDS
                 },
             }
+            # Derived, not merged. A payload with no local start time carries a
+            # UTC-derived local_date that is non-None, so merging it as an
+            # ordinary field let a thin re-sync move an evening ride to the next
+            # day — while the stored start_time_local still said otherwise and
+            # the flag stayed clear, because the flag reads the start times.
+            merged["local_date"] = local_date_of(merged)
             merged["flags_json"] = _flags_json(merged)
             changes = {
                 field: merged.get(field)
@@ -1365,6 +1429,9 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
             if not changes:
                 unchanged.append(_project(current, _ACTIVITY_OUT_FIELDS))
                 continue
+            # Serialised here rather than above, so an unchanged ride — the
+            # common case on a re-sync — never pays for a dump it discards.
+            raw = json.dumps(item, sort_keys=True, ensure_ascii=False)
             assignments = ", ".join(f"{key} = ?" for key in changes)
             conn.execute(
                 f"UPDATE activities SET {assignments}, raw_json = ?, imported_at = ? WHERE id = ?",
@@ -1546,9 +1613,9 @@ def list_activities(
     # The date filter alone, kept separately: it is what counts the rides a
     # sport filter would hide rather than report.
     date_clauses, date_params = list(clauses), list(params)
-    if sport:
-        clauses.append("sport = ?")
-        params.append(sport)
+    sport_clauses, sport_params = _sport_filter(sport)
+    clauses += sport_clauses
+    params += sport_params
 
     with open_db() as conn:
         # One more than asked for, so "there is more" is a fact rather than the
@@ -1587,14 +1654,7 @@ def list_activities(
         result.update(_aggregate_load(activities))
     else:
         result["total_tss"] = None
-    if sport and unknown_sport:
-        result["excluded_unknown_sport"] = unknown_sport
-        result["excluded_unknown_sport_note"] = (
-            f"{unknown_sport} activit{'y' if unknown_sport == 1 else 'ies'} in this range "
-            f"{'carries' if unknown_sport == 1 else 'carry'} no sport from Garmin and "
-            f"{'is' if unknown_sport == 1 else 'are'} not in this list. That is training "
-            "that happened; drop the sport filter to see it."
-        )
+    result.update(_unknown_sport_note(unknown_sport))
     return result
 
 
@@ -1658,7 +1718,14 @@ def link_activity(
                         "It is offered as a candidate rather than hidden."
                     )
                 candidates.append(entry)
-            candidates.sort(key=lambda e: abs(e.get("duration_delta_s") or 0))
+            # Missing last, not zero. A candidate with no duration sorted as a
+            # perfect match and was presented ahead of a near-exact one.
+            candidates.sort(
+                key=lambda e: (
+                    e.get("duration_delta_s") is None,
+                    abs(e.get("duration_delta_s") or 0),
+                )
+            )
             if len(candidates) == 1:
                 chosen = _find_activity(conn, athlete_id, candidates[0]["id"], None)
         else:
@@ -1686,11 +1753,26 @@ def link_activity(
         else:
             date_note = None
 
-        conn.execute(
-            "UPDATE planned_workouts SET linked_activity_id = ?, status = 'completed', "
-            "updated_at = ? WHERE id = ?",
-            (chosen["id"], now_utc(), planned_workout_id),
-        )
+        # Auto-complete only from a status that means "still expected". A
+        # session the coach marked `skipped` or `missed` keeps that: linking a
+        # ride to it is evidence about the ride, not a reversal of the
+        # decision, and silently flipping it lost the coaching information.
+        status_note = None
+        if planned["status"] in AUTO_COMPLETABLE_STATUSES:
+            conn.execute(
+                "UPDATE planned_workouts SET linked_activity_id = ?, status = 'completed', "
+                "updated_at = ? WHERE id = ?",
+                (chosen["id"], now_utc(), planned_workout_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE planned_workouts SET linked_activity_id = ?, updated_at = ? WHERE id = ?",
+                (chosen["id"], now_utc(), planned_workout_id),
+            )
+            status_note = (
+                f"the session stays {planned['status']}; linking did not mark it completed. "
+                "Pass status explicitly to update_planned_workout if that is wrong."
+            )
         stored = _dict(
             conn.execute(
                 "SELECT * FROM planned_workouts WHERE id = ?", (planned_workout_id,)
@@ -1707,6 +1789,8 @@ def link_activity(
             "Call compliance_report to compare what was prescribed against what was ridden."
         ),
     }
+    if status_note:
+        result["status_unchanged"] = status_note
     if date_note:
         result["warning"] = date_note
     return result
@@ -1851,11 +1935,9 @@ def update_planned_workout(
     if spec is not None:
         workout, errors, spec_warnings = _validate_spec(spec)
         if workout is None:
-            return {
-                "updated": False,
-                "errors": errors,
-                "reason": "the replacement spec is invalid, so nothing was changed",
-            }
+            raise CoachError(
+                "the replacement spec is invalid, so nothing was changed: " + "; ".join(errors)
+            )
         updates["spec_json"] = json.dumps(spec, sort_keys=True, ensure_ascii=False)
         updates["warnings_json"] = json.dumps(spec_warnings)
         warnings = spec_warnings
@@ -1969,9 +2051,7 @@ def get_week(
         # week's correctly-written plans as stale against a number not yet in
         # force.
         ftp_on_date = {
-            row["scheduled_date"]: resolve_ftp(conn, athlete_id, row["scheduled_date"])
-            for row in planned_rows
-            if row
+            row["scheduled_date"]: history.ftp(row["scheduled_date"]) for row in planned_rows if row
         }
 
         # Links are stored on the planned workout, and link_activity permits a
@@ -2004,14 +2084,9 @@ def get_week(
     linked_to_plan = {
         row["linked_activity_id"] for row in planned_rows if row and row["linked_activity_id"]
     } | linked_elsewhere
-    event_by_activity = {
-        **events_by_activity_any_date,
-        **{
-            row["linked_activity_id"]: row
-            for row in event_rows
-            if row and row["linked_activity_id"]
-        },
-    }
+    # The any-date lookup above already covers every activity in the window, so
+    # a window-scoped overlay could only contribute keys nothing looks up.
+    event_by_activity = events_by_activity_any_date
 
     planned: list[dict] = []
     not_ridden: list[dict] = []
@@ -2074,7 +2149,14 @@ def get_week(
         )
 
     aggregate = _aggregate_load(activities)
-    planned_tss = sum(entry.get("planned_tss") or 0.0 for entry in planned)
+    # The same scored/unscored accounting the actuals get. A stored spec that no
+    # longer validates has no planned_tss, and summing past it folded the
+    # session to zero — so a week with one corrupt spec read as over-performed,
+    # which is the null-folds-to-zero pattern _aggregate_load exists to stop,
+    # surviving on the other side of the same summary.
+    planned_scored = [entry for entry in planned if entry.get("planned_tss") is not None]
+    planned_unscored = [entry for entry in planned if entry.get("planned_tss") is None]
+    planned_tss = sum(entry["planned_tss"] for entry in planned_scored)
     return {
         "start": first.isoformat(),
         "end": last.isoformat(),
@@ -2086,6 +2168,21 @@ def get_week(
             "planned_sessions": len(planned),
             "activities": len(activities),
             "planned_tss": round(planned_tss, 1),
+            "planned_sessions_scored": len(planned_scored),
+            "planned_sessions_unscored": len(planned_unscored),
+            **(
+                {
+                    "planned_unscored_warning": (
+                        f"{len(planned_unscored)} planned session"
+                        f"{'' if len(planned_unscored) == 1 else 's'} could not be scored "
+                        f"(ids {', '.join(str(e['id']) for e in planned_unscored)}) and "
+                        "contributed nothing to planned_tss, which therefore understates the "
+                        "week. See spec_errors on those entries."
+                    )
+                }
+                if planned_unscored
+                else {}
+            ),
             "actual_tss": aggregate["total_tss"],
             "activities_scored": aggregate["scored"],
             "activities_unscored": aggregate["unscored"],
@@ -2146,9 +2243,9 @@ def compute_load(
         return {
             "count": 0,
             "activities": [],
-            "by_method": {},
-            "total_tss": 0.0,
-            "unscored": 0,
+            # Through the aggregator, so this shape cannot drift from the one
+            # the normal path returns as that function grows keys.
+            **_aggregate_load([]),
             "note": "activity_ids was an empty list, so nothing was selected.",
         }
     clauses = ["athlete_id = ?"]
@@ -2162,9 +2259,10 @@ def compute_load(
     if end:
         clauses.append("local_date <= ?")
         params.append(parse_date(end, "end").isoformat())
-    if sport:
-        clauses.append("sport = ?")
-        params.append(sport)
+    sport_clauses, sport_params = _sport_filter(sport)
+    unfiltered_clauses, unfiltered_params = list(clauses), list(params)
+    clauses += sport_clauses
+    params += sport_params
 
     rows_out: list[dict] = []
     with open_db() as conn:
@@ -2191,7 +2289,20 @@ def compute_load(
                 }
             )
 
-    return {"count": len(rows_out), "activities": rows_out, **_aggregate_load(rows_out)}
+        unknown_sport = 0
+        if sport:
+            unknown_sport = conn.execute(
+                f"SELECT COUNT(*) AS n FROM activities "
+                f"WHERE {' AND '.join(unfiltered_clauses)} AND sport IS NULL",
+                unfiltered_params,
+            ).fetchone()["n"]
+
+    return {
+        "count": len(rows_out),
+        "activities": rows_out,
+        **_aggregate_load(rows_out),
+        **_unknown_sport_note(unknown_sport),
+    }
 
 
 def get_form(
@@ -2321,16 +2432,22 @@ def _compliance_verdict(
 ) -> str:
     """One word for the session: what the comparison actually established.
 
-    `unverifiable` is its own answer. A ride with no power in any lap says
-    nothing about whether the targets were held, and calling that either
-    `as_prescribed` or `deviated` asserts something the data cannot support.
+    `unverifiable` is its own answer, and **any** unverifiable block earns it —
+    not only a session where every block is one. Requiring all of them meant a
+    single clean warmup in front of five no-power intervals returned
+    `as_prescribed`, asserting five untestable blocks had been held; and a plan
+    containing one free block could never reach `unverifiable` at all, because
+    `no_target` used to count as evidence of compliance.
+
+    A deviation still outranks an unverifiable block: something is known to
+    have gone differently, which is the more useful thing to say.
     """
     if alignment != "by_lap":
         return "no_block_data"
-    if comparisons and len(unverifiable) == len(comparisons):
-        return "unverifiable"
     if deviating:
         return "deviated"
+    if unverifiable:
+        return "unverifiable"
     return "as_prescribed"
 
 
@@ -2372,8 +2489,17 @@ def compliance_report(
     `easier_than_target` and does not count against compliance: that target is
     a ceiling, and spinning easier than prescribed on a recovery is the session
     working, not failing. A block cut short is still a deviation even when the
-    watts were right: `off_target_blocks` counts wrong power,
-    `deviating_blocks` adds short and long, and `verdict` follows the latter.
+    watts were right — and it is a deviation whether or not a power meter was
+    running, because duration is verifiable without one. Each block carries two
+    verdicts for that reason: `verdict` for power, `duration_verdict` for time.
+
+    `off_target_blocks` counts wrong power, `off_duration_blocks` counts short
+    or long, `deviating_blocks` is their union, and `unverifiable_blocks` is
+    blocks whose power could not be checked and whose duration was fine. The
+    session `verdict` is `deviated` if anything deviated, else `unverifiable`
+    if **any** block could not be checked — one clean warmup in front of five
+    no-power intervals is not evidence the intervals were ridden — else
+    `as_prescribed`.
     """
     with open_db() as conn:
         planned = _dict(
@@ -2466,15 +2592,19 @@ def compliance_report(
     # right watts was reported as prescribed, which is the opposite of what
     # happened.
     off_target = [entry for entry in comparisons if entry["verdict"] in ("under", "over")]
-    unverifiable = [entry for entry in comparisons if entry["verdict"] in UNVERIFIABLE_VERDICTS]
-    # `no_power` is not a deviation: the lap recorded no watts, so the target
-    # was neither hit nor missed. Counting it made an HR-only ride — ridden for
-    # exactly the right durations — come back as a failed session.
-    deviating = [
+    off_duration = [
+        entry for entry in comparisons if entry["duration_verdict"] in DEVIATING_DURATION_VERDICTS
+    ]
+    # `no_power` is not a power deviation: the lap recorded no watts, so the
+    # target was neither hit nor missed. Its *duration* still is, though, so a
+    # block can be unverifiable on power and deviating on time at once — count
+    # it once, as a deviation, which is the more specific thing known about it.
+    deviating_ids = {id(entry) for entry in off_target} | {id(entry) for entry in off_duration}
+    deviating = [entry for entry in comparisons if id(entry) in deviating_ids]
+    unverifiable = [
         entry
         for entry in comparisons
-        if entry["verdict"] not in COMPLIANT_VERDICTS
-        and entry["verdict"] not in UNVERIFIABLE_VERDICTS
+        if entry["verdict"] in UNVERIFIABLE_VERDICTS and id(entry) not in deviating_ids
     ]
     return {
         "planned_workout_id": planned_workout_id,
@@ -2511,6 +2641,7 @@ def compliance_report(
         # caller has to look at them.
         "laps": laps,
         "off_target_blocks": len(off_target),
+        "off_duration_blocks": len(off_duration),
         "deviating_blocks": len(deviating),
         "unverifiable_blocks": len(unverifiable),
         "sentences": summary_sentences,

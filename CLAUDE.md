@@ -92,6 +92,21 @@ has not been applied ever runs again. Add the next one.
 go through `_resolve_rows`; a tool that scores more than one activity builds a `History` and
 resolves in memory. Resolving per ride turned a season into ~1000 queries for the same forty rows.
 
+**Compliance judges power and duration separately.** Each block carries a `verdict` and a
+`duration_verdict`. A lap with no watts says nothing about whether a target was held, but its
+duration is still knowable — folding the two together lost every duration deviation on an HR-only
+ride. And *any* unverifiable block stops a session being `as_prescribed`: one clean warmup is not
+evidence about the intervals behind it.
+
+**A ride's `local_date` is derived, never carried.** It comes from the merged row's start times, and
+`row_flags` reads the same two fields, so the stored date and the flag cannot disagree. Merging it
+as an ordinary import field let a payload with no local start time move an evening ride to the next
+day, silently.
+
+**Linking a ride never reverses a coaching decision.** `link_activity` and `record_race_result`
+auto-complete only from a status that still means "expected"; `skipped`, `missed`, `abandoned` and
+`dns` are outcomes somebody chose, and the response says when one was kept.
+
 **A refusal is raised, never returned as `{"ok": False}`.** The tool layer renders every one of them
 in a single place. A function returning its own `ok` flag works only until someone reorders the
 spread in `_coach` — `_coach` now raises if a result carries one.
