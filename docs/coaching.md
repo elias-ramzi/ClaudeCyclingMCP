@@ -318,11 +318,14 @@ for power, `duration_verdict` for time. A lap with no watts says nothing about w
 held — but if it ran half its planned length, that much *is* known, and it counts as a deviation.
 Duration does not need a power meter.
 
-`off_target_blocks` counts wrong power, `off_duration_blocks` counts short or long,
-`deviating_blocks` is their union, and `unverifiable_blocks` is blocks whose power could not be
-checked and whose duration was fine. The session `verdict` is `deviated` if anything deviated, else
-`unverifiable` if **any** block could not be checked — one clean warmup in front of five no-power
-intervals is not evidence the intervals were ridden — else `as_prescribed`.
+`off_target_blocks` counts wrong power and `off_duration_blocks` counts short or long. Every block
+then lands in exactly one of `deviating_blocks`, `unverifiable_blocks` and `compliant_blocks` — the
+classification is closed-world, and a verdict nothing recognises raises rather than passing. A block
+is unverifiable when its power could not be checked (`no_power`) **or** its lap carried no duration
+at all, and compliant only when everything asked of it was checked and held. The session `verdict`
+is `deviated` if anything deviated, else `unverifiable` if **any** block could not be checked — one
+clean warmup in front of five no-power intervals is not evidence the intervals were ridden — else
+`as_prescribed`.
 
 The laps are returned whenever any are stored, mismatch included — that is precisely the case where
 nothing could be compared and the caller has to look at them.
@@ -340,6 +343,22 @@ next time the same event is planned for, and it is more specific than any genera
 
 Linking refuses an activity whose date is not the event's unless forced. The realistic slip is
 linking the Sunday spin after a Saturday race, which then makes the A-event look like an easy hour.
+
+`record_race_result` completes an event still marked `upcoming` — but only when the call carries a
+result. A bare call writes nothing, so a retry or an existence probe cannot close a race with no
+time, no ride and no debrief. And an empty string is never an erase: across every stored free-text
+field — debrief, event and session notes, `feel`, the profile fields — blank text leaves what is
+stored alone and the response names the field it ignored. A stored value is replaced by better
+text, never by nothing.
+
+## Nulls the coach layer refuses to round off
+
+`duration_s` is nullable on activities and on laps: a thin payload is tolerated and flagged, not
+rejected. Nothing folds that null to zero. A ride with no duration reads "unknown" in `get_week`
+and `compute_load`, `compliance_report` says it could not be checked rather than inventing a
+shortfall against the plan, and `import_activity_laps` reports how many laps carry no time instead
+of accusing a ride's own splits of belonging to a different ride. Same rule as a null TSS: a zero
+is indistinguishable from a real zero, and a fabricated deviation is worse than no answer.
 
 ## Schema and migrations
 

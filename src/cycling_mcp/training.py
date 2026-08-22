@@ -68,17 +68,36 @@ COMPLIANCE_TOLERANCE_PCT = 5.0
 # under one of these is the session working as intended.
 EASY_ROLES = ("recovery", "warmup", "cooldown")
 
-# Verdicts that are not a departure from the plan. `no_power` belongs here
-# because it says nothing about the session: the lap recorded no watts, so the
-# target could not be checked either way. Counting it as a deviation makes an
-# HR-only ride read as a failed one.
+# The power-verdict vocabulary, split into the three things a block can be
+# evidence of. `no_power` is deliberately not compliant: the lap recorded no
+# watts, so the target was neither hit nor missed, and calling that compliance
+# asserts a session was verified when nothing about it was.
 COMPLIANT_VERDICTS = ("on_target", "easier_than_target")
+DEVIATING_VERDICTS = ("under", "over")
 UNVERIFIABLE_VERDICTS = ("no_power",)
 #: A block that asked for no power target. Neither evidence of compliance nor
-#: of a problem — it is simply outside the power question, and counting it as
-#: compliant made a plan with one free block unable to ever read `unverifiable`.
+#: of a problem on the power axis — it is simply outside the power question, so
+#: what is known about such a block comes from its duration instead.
 NO_TARGET_VERDICTS = ("no_target",)
+
+# The duration-verdict vocabulary, the same three ways. `unknown` is
+# unverifiable rather than fine: `duration_s` is nullable, so a lap from a thin
+# payload carries no time and how long the block was ridden for is not known.
+COMPLIANT_DURATION_VERDICTS = ("on_time",)
 DEVIATING_DURATION_VERDICTS = ("short", "long")
+UNVERIFIABLE_DURATION_VERDICTS = ("unknown",)
+
+#: Everything `compare_block` can put on each axis. `classify_block` refuses
+#: anything outside these rather than letting a verdict added later fall
+#: through to "nothing wrong here".
+KNOWN_VERDICTS = (
+    COMPLIANT_VERDICTS + DEVIATING_VERDICTS + UNVERIFIABLE_VERDICTS + NO_TARGET_VERDICTS
+)
+KNOWN_DURATION_VERDICTS = (
+    COMPLIANT_DURATION_VERDICTS + DEVIATING_DURATION_VERDICTS + UNVERIFIABLE_DURATION_VERDICTS
+)
+#: What a block can be evidence of, once both axes are read together.
+BLOCK_CLASSES = ("compliant", "deviating", "unverifiable")
 
 _ORDINALS = (
     "first",
@@ -537,13 +556,48 @@ def compare_block(
     )
 
 
-def _mmss(seconds: float | None) -> str:
-    """A duration for a sentence, or a phrase saying there isn't one.
+def classify_block(comparison: dict) -> str:
+    """ "compliant", "deviating" or "unverifiable" — exactly one, for every block.
 
-    Formatting is `spec.format_duration`, so a compliance sentence and the
-    block table it is compared against never disagree about how long ten
-    minutes is.
+    Closed-world on purpose. Enumerating the positive buckets and letting the
+    rest fall through meant a block that was neither — a free block whose lap
+    carried no duration, `no_target` over `unknown` — counted as evidence the
+    session went to plan, and a verdict added to `compare_block` later would
+    have done the same silently. Here every `(verdict, duration_verdict)` pair
+    lands in exactly one class and an unrecognised one raises.
+
+    Deviating outranks unverifiable, and either axis can supply it: a block can
+    be unverifiable on power and short on time at once, and the short is the
+    more specific thing known about it.
     """
-    if seconds is None:
-        return "an unknown time"
-    return format_duration(round(seconds))
+    verdict = comparison["verdict"]
+    duration_verdict = comparison["duration_verdict"]
+    if verdict not in KNOWN_VERDICTS:
+        raise ValueError(f"unrecognised block verdict {verdict!r}")
+    if duration_verdict not in KNOWN_DURATION_VERDICTS:
+        raise ValueError(f"unrecognised block duration_verdict {duration_verdict!r}")
+    if verdict in DEVIATING_VERDICTS or duration_verdict in DEVIATING_DURATION_VERDICTS:
+        return "deviating"
+    if verdict in UNVERIFIABLE_VERDICTS or duration_verdict in UNVERIFIABLE_DURATION_VERDICTS:
+        return "unverifiable"
+    return "compliant"
+
+
+def format_duration_or(seconds: float | None, absent: str) -> str:
+    """A duration, or the phrase that stands in when there is no duration.
+
+    One formatter for every nullable duration this layer prints. `duration_s`
+    is nullable on both activities and laps — a thin payload is tolerated and
+    flagged, not rejected — and `format_duration(round(x or 0))` turned every
+    one of those into a confident "0:00": a ride reported as zero-length, and a
+    fabricated deviation against whatever was planned.
+
+    Formatting is `spec.format_duration`, so a sentence and the table beside it
+    never disagree about how long ten minutes is.
+    """
+    return absent if seconds is None else format_duration(round(seconds))
+
+
+def _mmss(seconds: float | None) -> str:
+    """A duration for a compliance sentence, or a phrase saying there isn't one."""
+    return format_duration_or(seconds, "an unknown time")

@@ -38,14 +38,17 @@ from .spec import (
 from .spec import validate_spec as _validate_spec
 from .store import CURRENT_SCHEMA_VERSION, DEFAULT_ATHLETE_ID, now_utc, open_db
 from .training import (
+    BLOCK_CLASSES,
     DEVIATING_DURATION_VERDICTS,
+    DEVIATING_VERDICTS,
     LTHR_FROM_MAX_HR,
     TWENTY_MINUTE_FACTOR,
-    UNVERIFIABLE_VERDICTS,
     Load,
+    classify_block,
     compare_block,
     compute_activity_load,
     form_series,
+    format_duration_or,
     hr_zones,
     parse_date,
     power_zones,
@@ -133,7 +136,10 @@ _IMPORT_FIELDS = (
 
 #: The activity columns every read needs. Naming them keeps `raw_json` — the
 #: whole Garmin payload, by far the largest column — out of queries that return
-#: hundreds of rows and never look at it.
+#: hundreds of rows and never look at it. Every read of an activity row uses
+#: this one list: a query that names a narrower set silently hands `None` back
+#: through `_project` for whatever it left out, which is a wrong value wearing
+#: the shape of a real one. A test pins that it covers `_IMPORT_FIELDS`.
 _ACTIVITY_SELECT = ", ".join(_ACTIVITY_OUT_FIELDS)
 
 _LAP_OUT_FIELDS = (
@@ -180,6 +186,62 @@ def _text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _stage_text(updates: dict[str, Any], fields: dict[str, Any]) -> list[str]:
+    """Stage free-text fields for an UPDATE. Blank means "leave it alone".
+
+    One rule for every `_text`-coerced update field, because they all had the
+    same hole: `if value is not None` admits `""`, `_text("")` returns None, and
+    the UPDATE writes NULL over what is stored. An empty form field erased a
+    race debrief — the one part of that record still useful a year later — and
+    the empty-updates guard could not see it, because `updates` was not empty.
+
+    So a blank is never an instruction to erase: the field is skipped and the
+    caller is told which, by name. Omitted and blank now mean the same thing,
+    which is the only pair of meanings that cannot silently destroy text.
+
+    Returns the names that were given blank, for `_blank_text_note`.
+    """
+    blanked = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        text = _text(value)
+        if text is None:
+            blanked.append(key)
+            continue
+        updates[key] = text
+    return blanked
+
+
+def _blank_phrase(blanked: list[str]) -> str:
+    """ "note was given as empty text" — the clause both blank answers open with."""
+    names = ", ".join(sorted(blanked))
+    return f"{names} {'was' if len(blanked) == 1 else 'were'} given as empty text"
+
+
+def _blank_text_note(blanked: list[str]) -> dict:
+    """What a blank field did — nothing — said out loud rather than silently."""
+    if not blanked:
+        return {}
+    return {
+        "ignored_blank_fields": sorted(blanked),
+        "ignored_blank_note": (
+            f"{_blank_phrase(blanked)}, which is not an instruction to erase what is stored, "
+            "so the stored value was left unchanged. Pass the corrected text to replace it."
+        ),
+    }
+
+
+def _nothing_given(blanked: list[str], hint: str) -> str:
+    """The refusal for an update call that carried nothing usable."""
+    if not blanked:
+        return hint
+    return (
+        f"{_blank_phrase(blanked)}, which never overwrites a stored value, so there is "
+        f"nothing to do. {hint}"
+    )
 
 
 def _today(value: str | None = None) -> date:
@@ -286,12 +348,36 @@ class History:
     Build one at the top of any tool that scores more than a single activity.
     The alternative — resolving from the database per ride — is what turns a
     loop over a season into thousands of queries for the same forty rows.
+
+    Each table is read on first use and kept, so asking for one figure costs
+    one query rather than three: `get_zones` never looks at weight, `log_hr`
+    never looks at FTP, and eagerly loading all three made every one of them
+    pay for the other two. The connection has to outlive the object — every
+    caller builds it inside its own `with open_db()`.
     """
 
     def __init__(self, conn: sqlite3.Connection, athlete_id: int) -> None:
-        self.ftp_rows = _load_history(conn, athlete_id, "ftp_history")
-        self.weight_rows = _load_history(conn, athlete_id, "weight_history")
-        self.hr_rows = _load_history(conn, athlete_id, "hr_history")
+        self._conn = conn
+        self._athlete_id = athlete_id
+        self._rows: dict[str, list[dict]] = {}
+
+    def rows(self, table: str) -> list[dict]:
+        """Every entry in one dated history table, read once and kept."""
+        if table not in self._rows:
+            self._rows[table] = _load_history(self._conn, self._athlete_id, table)
+        return self._rows[table]
+
+    @property
+    def ftp_rows(self) -> list[dict]:
+        return self.rows("ftp_history")
+
+    @property
+    def weight_rows(self) -> list[dict]:
+        return self.rows("weight_history")
+
+    @property
+    def hr_rows(self) -> list[dict]:
+        return self.rows("hr_history")
 
     def ftp(self, on_date: str | None) -> dict | None:
         """The FTP in effect on a date. See `resolve_ftp` for why it is dated."""
@@ -299,6 +385,18 @@ class History:
 
     def weight(self, on_date: str | None) -> dict | None:
         return _resolve_rows(self.weight_rows, on_date)
+
+    def latest(self, table: str, on_date: str | None) -> dict | None:
+        """The most recent entry in one table at or before `on_date`, no backwards guess.
+
+        "What was on file then", where None means nothing was — as against
+        `ftp`/`weight`, which extrapolate backwards so a ride from before the
+        first entry can still be scored.
+        """
+        resolved = _resolve_rows(self.rows(table), on_date)
+        if resolved is None or resolved["extrapolated_backwards"]:
+            return None
+        return {key: value for key, value in resolved.items() if key != "extrapolated_backwards"}
 
     def hr(self, on_date: str | None) -> dict | None:
         """The HR figures in effect on a date, each resolved on its own.
@@ -349,15 +447,8 @@ class History:
 def _latest(
     conn: sqlite3.Connection, table: str, athlete_id: int, as_of: str | None
 ) -> dict | None:
-    """The most recent entry at or before `as_of`, with no backwards guess.
-
-    This answers "what was on file then", where None means nothing was.
-    `resolve_ftp` is the one that extrapolates.
-    """
-    resolved = _resolve_rows(_load_history(conn, athlete_id, table), as_of)
-    if resolved is None or resolved["extrapolated_backwards"]:
-        return None
-    return {key: value for key, value in resolved.items() if key != "extrapolated_backwards"}
+    """`History.latest` for a caller that wants one figure and holds no History."""
+    return History(conn, athlete_id).latest(table, as_of)
 
 
 def _row_by_id(conn: sqlite3.Connection, table: str, row_id: int | None) -> dict | None:
@@ -436,8 +527,8 @@ def resolve_ftp(conn: sqlite3.Connection, athlete_id: int, on_date: str | None) 
 def resolve_hr(conn: sqlite3.Connection, athlete_id: int, on_date: str | None) -> dict | None:
     """The HR figures in effect on `on_date`. See `History.hr`.
 
-    Reads all three history tables to answer a question about one. Fine for a
-    single call; build a `History` where more than one figure is wanted.
+    Reads `hr_history` once. Fine for a single call; build a `History` and keep
+    it where more than one figure, or more than one date, is wanted.
     """
     return History(conn, athlete_id).hr(on_date)
 
@@ -535,12 +626,33 @@ def _aggregate_load(entries: list[dict]) -> dict:
             "when judging whether a week was harder than the last."
         )
     if unscored:
-        result["unscored_warning"] = (
-            f"{unscored} activit{'y' if unscored == 1 else 'ies'} could not be scored and "
-            "contributed nothing to this total, which therefore understates the week. "
-            "compute_load says why, per ride."
+        result["unscored_warning"] = _unscored_warning(
+            unscored,
+            ("activity", "activities"),
+            "this total",
+            "compute_load says why, per ride.",
         )
     return result
+
+
+def _unscored_warning(
+    count: int,
+    noun: tuple[str, str],
+    total: str,
+    pointer: str,
+    ids: list[Any] | None = None,
+) -> str:
+    """The sentence every total says when something in it could not be scored.
+
+    One helper because the planned and the actual side of a week say the same
+    thing about the same hole, and a total that quietly omits what it could not
+    score reads as a light week rather than an unmeasured one.
+    """
+    where = f" (ids {', '.join(str(value) for value in ids)})" if ids else ""
+    return (
+        f"{count} {noun[0] if count == 1 else noun[1]} could not be scored{where} and "
+        f"contributed nothing to {total}, which therefore understates the week. {pointer}"
+    )
 
 
 def _sport_filter(sport: str | None) -> tuple[list[str], list[Any]]:
@@ -552,6 +664,39 @@ def _sport_filter(sport: str | None) -> tuple[list[str], list[Any]]:
     how a real session turns into a missed-session narrative.
     """
     return ([], []) if sport is None else (["sport = ?"], [sport])
+
+
+def _scope_by_sport(
+    clauses: list[str], params: list[Any], sport: str | None
+) -> tuple[list[str], list[Any], list[str], list[Any]]:
+    """Splice the sport filter in, keeping the query without it.
+
+    Both halves are needed together every time: the filtered one selects, the
+    unfiltered one counts what the filter hid. Snapshotting the clauses before
+    the splice and then counting NULL-sport rows was copied verbatim between
+    two tools, which is exactly how the NULL-sport branch came to be fixed in
+    some of these queries and not others.
+    """
+    unfiltered_clauses, unfiltered_params = list(clauses), list(params)
+    sport_clauses, sport_params = _sport_filter(sport)
+    return (
+        [*clauses, *sport_clauses],
+        [*params, *sport_params],
+        unfiltered_clauses,
+        unfiltered_params,
+    )
+
+
+def _unknown_sport_count(
+    conn: sqlite3.Connection, clauses: list[str], params: list[Any], sport: str | None
+) -> int:
+    """How many rides in range the sport filter hid because Garmin sent no type."""
+    if not sport:
+        return 0
+    return conn.execute(
+        f"SELECT COUNT(*) AS n FROM activities WHERE {' AND '.join(clauses)} AND sport IS NULL",
+        params,
+    ).fetchone()["n"]
 
 
 def _unknown_sport_note(count: int) -> dict:
@@ -634,11 +779,13 @@ def get_profile(athlete_id: int = DEFAULT_ATHLETE_ID) -> dict:
     """The athlete record, the current dated figures, and what is still unknown."""
     with open_db() as conn:
         athlete = _ensure_athlete(conn, athlete_id)
-        ftp = _latest(conn, "ftp_history", athlete_id, None)
-        weight = _latest(conn, "weight_history", athlete_id, None)
+        # One History for all three figures: three tables, three queries.
+        history = History(conn, athlete_id)
+        ftp = history.latest("ftp_history", None)
+        weight = history.latest("weight_history", None)
         # Per-field, so a lone resting-HR entry does not read as "no threshold
         # on file" and reopen a gap that was closed months ago.
-        hr = resolve_hr(conn, athlete_id, None)
+        hr = history.hr(None)
         events = conn.execute(
             "SELECT COUNT(*) AS n FROM events WHERE athlete_id = ? AND status = 'upcoming'",
             (athlete_id,),
@@ -714,10 +861,12 @@ def update_profile(
     constraints: str | None = None,
     athlete_id: int = DEFAULT_ATHLETE_ID,
 ) -> dict:
-    """Set any subset of the athlete fields. Omitted fields are left alone."""
+    """Set any subset of the athlete fields. Omitted fields are left alone.
+
+    So is a field given as empty text: blank never overwrites a stored value,
+    and the response names any field ignored for that reason.
+    """
     updates: dict[str, Any] = {}
-    if display_name is not None:
-        updates["display_name"] = _text(display_name)
     if height_cm is not None:
         _check_range(float(height_cm), (100.0, 250.0), "height", "cm")
         updates["height_cm"] = float(height_cm)
@@ -726,16 +875,18 @@ def update_profile(
         if not (1900 <= year <= date.today().year):
             raise CoachError(f"birth_year of {year} is not a year an athlete was born in")
         updates["birth_year"] = year
-    for key, value in (
-        ("availability", availability),
-        ("equipment", equipment),
-        ("constraints", constraints),
-    ):
-        if value is not None:
-            updates[key] = _text(value)
+    blanked = _stage_text(
+        updates,
+        {
+            "display_name": display_name,
+            "availability": availability,
+            "equipment": equipment,
+            "constraints": constraints,
+        },
+    )
 
     if not updates:
-        raise CoachError("nothing to update — pass at least one field")
+        raise CoachError(_nothing_given(blanked, "nothing to update — pass at least one field"))
 
     with open_db() as conn:
         _ensure_athlete(conn, athlete_id)
@@ -745,7 +896,11 @@ def update_profile(
             (*updates.values(), now_utc(), athlete_id),
         )
         row = conn.execute("SELECT * FROM athlete WHERE athlete_id = ?", (athlete_id,)).fetchone()
-    return {"updated_fields": sorted(updates), "athlete": _dict(row)}
+    return {
+        "updated_fields": sorted(updates),
+        "athlete": _dict(row),
+        **_blank_text_note(blanked),
+    }
 
 
 def log_ftp(
@@ -945,16 +1100,25 @@ def log_hr(
         )
         row_id = cursor.lastrowid
         stored = _row_by_id(conn, "hr_history", row_id)
+        # One History, read once: the outcomes, today's figures and the ones
+        # this entry establishes are three questions about the same rows.
+        history = History(conn, athlete_id)
         # Per field: a backdated resting HR supersedes nothing about the
         # threshold, so asking the question row-at-a-time would answer it about
         # figures this entry never touched.
-        rows = _load_history(conn, athlete_id, "hr_history")
         outcomes = {
-            column: _write_outcome(rows, when.isoformat(), row_id or 0, column)
+            column: _write_outcome(history.hr_rows, when.isoformat(), row_id or 0, column)
             for column, given in values.items()
             if given is not None
         }
-        in_effect = History(conn, athlete_id).hr(None)
+        in_effect = history.hr(None)
+        # The figures in force on this entry's own date, which is what the
+        # zones below are of. Resolved, not read off this entry: keying the
+        # zones on what *this* call carried returned zones estimated from max
+        # HR — and a note saying no threshold was on file — to an athlete whose
+        # measured threshold was sitting in the table, and whose `in_effect`
+        # in the same response said so.
+        on_date = history.hr(when.isoformat())
 
     superseded_fields = {
         column: outcome["superseded_by"]
@@ -973,23 +1137,23 @@ def log_hr(
                 f"{column} (a later entry dated {row['effective_date']} still applies)"
                 for column, row in sorted(superseded_fields.items())
             )
-            + ". The zones below are the ones this entry establishes on "
-            f"{when.isoformat()}, not today's."
+            + f". The zones below are the ones in force on {when.isoformat()}, not today's."
         )
-    if values["threshold_hr"]:
-        result["hr_zones"] = hr_zones(values["threshold_hr"])
-    elif values["max_hr"]:
-        estimated = round(values["max_hr"] * LTHR_FROM_MAX_HR)
-        result["hr_zones"] = hr_zones(estimated)
-        result["threshold_hr_estimated"] = estimated
-        # A separate key: `note` may already carry the backdating warning, and
-        # reassigning it here dropped the statement that these zones are not
-        # the ones in force today.
-        result["estimation_note"] = (
-            f"No threshold HR on file, so these zones use {LTHR_FROM_MAX_HR:.0%} of max HR "
-            f"({estimated} bpm) as an estimate. A measured threshold routinely lands several "
-            "bpm either side of that, and every boundary moves with it."
-        )
+    # Zones only when this entry could have moved them. A lone resting-HR
+    # entry says nothing about where threshold sits.
+    if (values["threshold_hr"] or values["max_hr"]) and on_date and on_date.get("threshold_hr"):
+        result["hr_zones"] = hr_zones(on_date["threshold_hr"])
+        if on_date["threshold_hr_estimated"]:
+            result["threshold_hr_estimated"] = on_date["threshold_hr"]
+            # A separate key: `note` may already carry the backdating warning,
+            # and reassigning it here dropped the statement that these zones
+            # are not the ones in force today.
+            result["estimation_note"] = (
+                f"No threshold HR on file for {when.isoformat()}, so these zones use "
+                f"{LTHR_FROM_MAX_HR:.0%} of max HR ({on_date['threshold_hr']} bpm) as an "
+                "estimate. A measured threshold routinely lands several bpm either side of "
+                "that, and every boundary moves with it."
+            )
     return result
 
 
@@ -1112,10 +1276,12 @@ def update_event(
     note: str | None = None,
     athlete_id: int = DEFAULT_ATHLETE_ID,
 ) -> dict:
-    """Change any subset of an event's fields. Results are set by record_race_result."""
+    """Change any subset of an event's fields. Results are set by record_race_result.
+
+    An omitted field is left alone, and so is one given as empty text — see
+    `_stage_text`.
+    """
     updates: dict[str, Any] = {}
-    if name is not None:
-        updates["name"] = _text(name)
     if event_date is not None:
         updates["event_date"] = parse_date(event_date, "event_date").isoformat()
     if distance_km is not None:
@@ -1126,10 +1292,9 @@ def update_event(
         updates["priority"] = _one_of(priority.upper(), EVENT_PRIORITIES, "priority")
     if status is not None:
         updates["status"] = _one_of(status, EVENT_STATUSES, "status")
-    if note is not None:
-        updates["note"] = _text(note)
+    blanked = _stage_text(updates, {"name": name, "note": note})
     if not updates:
-        raise CoachError("nothing to update — pass at least one field")
+        raise CoachError(_nothing_given(blanked, "nothing to update — pass at least one field"))
 
     with open_db() as conn:
         row = conn.execute(
@@ -1143,7 +1308,11 @@ def update_event(
             (*updates.values(), now_utc(), event_id),
         )
         stored = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
-    return {"updated_fields": sorted(updates), "stored": _event_out(_dict(stored) or {})}
+    return {
+        "updated_fields": sorted(updates),
+        "stored": _event_out(_dict(stored) or {}),
+        **_blank_text_note(blanked),
+    }
 
 
 def list_events(
@@ -1231,11 +1400,16 @@ def record_race_result(
     `finish_time` accepts "4:32:10" or a number of seconds. The debrief is free
     text and is the most valuable thing stored here: pacing, nutrition, where
     it went wrong, what to do differently. `list_events` hands it back the next
-    time this event is planned for.
+    time this event is planned for. An empty debrief is not an erase: blank
+    text never overwrites the stored one — see `_stage_text`.
+
+    A call carrying no result at all writes nothing, including the status: an
+    upcoming event is completed by a result, not by being asked about.
     """
     # Omitted means "leave it alone", not "completed". Adding a debrief to a
     # race the athlete abandoned used to quietly rewrite it as finished — and
-    # nothing in the response said so.
+    # nothing in the response said so. An upcoming event is completed only by a
+    # call that actually carries a result; a bare one writes nothing at all.
     status = _one_of(status, EVENT_STATUSES, "status")
     seconds: int | None = None
     if finish_time is not None:
@@ -1268,41 +1442,46 @@ def record_race_result(
         updates: dict[str, Any] = {}
         if status is not None:
             updates["status"] = status
-        elif event["status"] == "upcoming":
-            # No result recorded yet, so filing one completes it. An event
-            # already marked abandoned or dns keeps that: it is the outcome.
-            updates["status"] = "completed"
         if activity is not None:
             updates["linked_activity_id"] = activity["id"]
         if seconds is not None:
             updates["finish_time_s"] = seconds
-        if debrief is not None:
-            updates["debrief"] = _text(debrief)
+        blanked = _stage_text(updates, {"debrief": debrief})
 
-        if not updates:
-            # Reachable since status stopped defaulting to "completed": a bare
-            # call on an event that already has a result changes nothing, and
-            # "UPDATE events SET , updated_at = ?" is not a statement.
-            return {
-                "stored": _event_out(event),
-                "updated_fields": [],
-                "status_unchanged": (
-                    f"'{event['name']}' stays {event['status']}, and nothing else was given. "
-                    "Pass a finish time, a debrief, an activity, or an explicit status."
-                ),
-            }
-        assignments = ", ".join(f"{key} = ?" for key in updates)
-        conn.execute(
-            f"UPDATE events SET {assignments}, updated_at = ? WHERE id = ?",
-            (*updates.values(), now_utc(), event_id),
-        )
+        # After the fields, not before them. Auto-completing first meant a bare
+        # `record_race_result(event_id)` — a partial retry, an existence probe —
+        # injected `status = completed` into an otherwise empty update and
+        # closed an upcoming race with no finish time, no ride and no debrief.
+        # A result completes an event; asking about one does not.
+        if updates and "status" not in updates and event["status"] == "upcoming":
+            # No result recorded yet, so filing one completes it. An event
+            # already marked abandoned or dns keeps that: it is the outcome.
+            updates["status"] = "completed"
+
+        if updates:
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            conn.execute(
+                f"UPDATE events SET {assignments}, updated_at = ? WHERE id = ?",
+                (*updates.values(), now_utc(), event_id),
+            )
+        # Read back even when nothing was written, so a call that changes
+        # nothing returns the same shape — debrief nudge included — as one that
+        # does. "UPDATE events SET , updated_at = ?" is not a statement, so the
+        # write is what gets skipped, not the answer.
         stored = _dict(conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone())
         load = _activity_load(History(conn, athlete_id), activity).as_dict() if activity else None
 
-    result: dict[str, Any] = {"stored": _event_out(stored or {}), "updated_fields": sorted(updates)}
+    result: dict[str, Any] = {
+        "stored": _event_out(stored or {}),
+        "updated_fields": sorted(updates),
+        **_blank_text_note(blanked),
+    }
     if "status" not in updates:
         result["status_unchanged"] = (
             f"'{event['name']}' stays {event['status']}. Pass status explicitly to change it."
+            if updates
+            else f"'{event['name']}' stays {event['status']}, and nothing else was given. "
+            "Pass a finish time, a debrief, an activity, or an explicit status."
         )
     if activity is not None:
         result["linked_activity"] = _project(activity, _ACTIVITY_OUT_FIELDS)
@@ -1373,9 +1552,15 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
 
             # Named columns, not SELECT *: an idempotent weekly re-sync would
             # otherwise pull back the full stored Garmin payload for every ride
-            # only to discard it.
+            # only to discard it. `_ACTIVITY_SELECT` and not the import fields
+            # alone, because this row is both merged against the payload *and*
+            # projected through `_ACTIVITY_OUT_FIELDS` on the unchanged path —
+            # and `_project` fills a missing column with None, so the narrower
+            # list handed back `garmin_activity_id: null` for every unchanged
+            # ride and anchored its data-quality flags to no identifiable
+            # activity.
             existing = conn.execute(
-                f"SELECT id, {', '.join(_IMPORT_FIELDS)} FROM activities "
+                f"SELECT {_ACTIVITY_SELECT} FROM activities "
                 f"WHERE athlete_id = ? AND garmin_activity_id = ?",
                 (athlete_id, row["garmin_activity_id"]),
             ).fetchone()
@@ -1519,7 +1704,9 @@ def import_activity_laps(
             )
         ]
 
-    total = sum(lap["duration_s"] or 0 for lap in stored)
+    timed = [lap for lap in stored if lap["duration_s"] is not None]
+    total = sum(lap["duration_s"] for lap in timed)
+    untimed = len(stored) - len(timed)
     result: dict[str, Any] = {
         "activity_id": activity["id"],
         "garmin_activity_id": activity["garmin_activity_id"],
@@ -1527,7 +1714,17 @@ def import_activity_laps(
         "laps": stored,
         "lap_total_seconds": round(total),
     }
-    if activity.get("duration_s") and abs(total - activity["duration_s"]) > 60:
+    if untimed:
+        # A lap with no duration contributed zero to the sum, so the total fell
+        # short of the ride and the tool accused the ride's own splits of
+        # belonging to a different ride. An incomplete sum cannot be compared
+        # with a whole; say which laps are missing instead of inventing a gap.
+        result["laps_missing_duration"] = untimed
+        result["duration_check"] = (
+            f"{untimed} of {len(stored)} laps carry no duration, so the {round(total)} s "
+            "total covers only part of the ride and was not checked against it."
+        )
+    elif activity.get("duration_s") and abs(total - activity["duration_s"]) > 60:
         result["warning"] = (
             f"the laps sum to {round(total)} s but the activity is "
             f"{round(activity['duration_s'])} s. Either these splits belong to a different "
@@ -1549,7 +1746,8 @@ def annotate_activity(
     This is the half of a session no device records, and it is what makes a
     plan adaptable: two rides with identical power files, one of which felt
     catastrophic, call for different weeks. Store it whenever the athlete says
-    anything about how a session went.
+    anything about how a session went. A blank `feel` or `note` leaves the
+    stored one alone rather than erasing it — see `_stage_text`.
     """
     updates: dict[str, Any] = {}
     if rpe is not None:
@@ -1557,12 +1755,9 @@ def annotate_activity(
         if not (1 <= value <= 10):
             raise CoachError(f"rpe must be 1-10, got {rpe!r}")
         updates["rpe"] = value
-    if feel is not None:
-        updates["feel"] = _text(feel)
-    if note is not None:
-        updates["note"] = _text(note)
+    blanked = _stage_text(updates, {"feel": feel, "note": note})
     if not updates:
-        raise CoachError("nothing to store — pass rpe, feel or note")
+        raise CoachError(_nothing_given(blanked, "nothing to store — pass rpe, feel or note"))
 
     with open_db() as conn:
         activity = _find_activity(conn, athlete_id, activity_id, garmin_activity_id)
@@ -1575,6 +1770,7 @@ def annotate_activity(
     return {
         "updated_fields": sorted(updates),
         "stored": _project(stored, _ACTIVITY_OUT_FIELDS),
+        **_blank_text_note(blanked),
     }
 
 
@@ -1612,10 +1808,7 @@ def list_activities(
 
     # The date filter alone, kept separately: it is what counts the rides a
     # sport filter would hide rather than report.
-    date_clauses, date_params = list(clauses), list(params)
-    sport_clauses, sport_params = _sport_filter(sport)
-    clauses += sport_clauses
-    params += sport_params
+    clauses, params, date_clauses, date_params = _scope_by_sport(clauses, params, sport)
 
     with open_db() as conn:
         # One more than asked for, so "there is more" is a fact rather than the
@@ -1627,13 +1820,7 @@ def list_activities(
         ).fetchall()
         truncated = len(rows) > int(limit)
         rows = rows[: int(limit)]
-        unknown_sport = 0
-        if sport:
-            unknown_sport = conn.execute(
-                f"SELECT COUNT(*) AS n FROM activities "
-                f"WHERE {' AND '.join(date_clauses)} AND sport IS NULL",
-                date_params,
-            ).fetchone()["n"]
+        unknown_sport = _unknown_sport_count(conn, date_clauses, date_params, sport)
         history = History(conn, athlete_id) if include_load else None
         activities = []
         for row in rows:
@@ -1675,7 +1862,11 @@ def link_activity(
     report that is confidently about the wrong session, and nothing downstream
     would reveal it.
 
-    Linking sets the planned workout's status to `completed`.
+    Linking marks the session `completed` **only if it was still expected** —
+    `planned` or `pushed`. A session the coach marked `skipped` or `missed`
+    keeps that status and the response says so: a matching ride is evidence
+    about the ride, not a reversal of the decision. An already-`completed`
+    session is simply re-linked, which is how a mislink is corrected.
     """
     with open_db() as conn:
         planned = _dict(
@@ -1757,18 +1948,20 @@ def link_activity(
         # session the coach marked `skipped` or `missed` keeps that: linking a
         # ride to it is evidence about the ride, not a reversal of the
         # decision, and silently flipping it lost the coaching information.
+        completes = planned["status"] in AUTO_COMPLETABLE_STATUSES
+        conn.execute(
+            "UPDATE planned_workouts SET linked_activity_id = ?, "
+            + ("status = 'completed', " if completes else "")
+            + "updated_at = ? WHERE id = ?",
+            (chosen["id"], now_utc(), planned_workout_id),
+        )
+        # Only for a status that is a coaching decision. Firing it on a
+        # `completed` session — re-linking one to the correct ride, the routine
+        # mislink correction — warned that completion had been withheld from a
+        # session that is already completed, and invited a pointless status
+        # update to fix nothing.
         status_note = None
-        if planned["status"] in AUTO_COMPLETABLE_STATUSES:
-            conn.execute(
-                "UPDATE planned_workouts SET linked_activity_id = ?, status = 'completed', "
-                "updated_at = ? WHERE id = ?",
-                (chosen["id"], now_utc(), planned_workout_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE planned_workouts SET linked_activity_id = ?, updated_at = ? WHERE id = ?",
-                (chosen["id"], now_utc(), planned_workout_id),
-            )
+        if not completes and planned["status"] != "completed":
             status_note = (
                 f"the session stays {planned['status']}; linking did not mark it completed. "
                 "Pass status explicitly to update_planned_workout if that is wrong."
@@ -1850,10 +2043,12 @@ def save_planned_workouts(workouts: list[dict], athlete_id: int = DEFAULT_ATHLET
                 )
                 continue
 
+            # The same "still expected" set link_activity completes from: a
+            # session already ridden, missed or withdrawn is not a clash.
             clash = conn.execute(
                 "SELECT id FROM planned_workouts WHERE athlete_id = ? AND scheduled_date = ? "
-                "AND status IN ('planned', 'pushed')",
-                (athlete_id, when),
+                f"AND status IN ({', '.join('?' for _ in AUTO_COMPLETABLE_STATUSES)})",
+                (athlete_id, when, *AUTO_COMPLETABLE_STATUSES),
             ).fetchall()
             cursor = conn.execute(
                 "INSERT INTO planned_workouts (athlete_id, spec_json, scheduled_date, status, "
@@ -1926,8 +2121,7 @@ def update_planned_workout(
         updates["scheduled_date"] = parse_date(scheduled_date, "scheduled_date").isoformat()
     if pushed_to is not None:
         updates["pushed_to"] = _one_of(pushed_to, PUSH_TARGETS, "pushed_to")
-    if note is not None:
-        updates["note"] = _text(note)
+    blanked = _stage_text(updates, {"note": note})
     if linked_activity_id is not None:
         updates["linked_activity_id"] = int(linked_activity_id)
 
@@ -1943,7 +2137,7 @@ def update_planned_workout(
         warnings = spec_warnings
 
     if not updates:
-        raise CoachError("nothing to update — pass at least one field")
+        raise CoachError(_nothing_given(blanked, "nothing to update — pass at least one field"))
 
     with open_db() as conn:
         row = conn.execute(
@@ -1969,6 +2163,7 @@ def update_planned_workout(
         "updated": True,
         "updated_fields": sorted(updates),
         "planned_workout": _planned_summary(stored or {}),
+        **_blank_text_note(blanked),
     }
     if warnings:
         result["spec_warnings"] = warnings
@@ -2108,7 +2303,7 @@ def get_week(
         planned.append(entry)
         if (
             row["linked_activity_id"] is None
-            and row["status"] in ("planned", "pushed")
+            and row["status"] in AUTO_COMPLETABLE_STATUSES
             and parse_date(row["scheduled_date"], "scheduled_date") < reference
         ):
             not_ridden.append(
@@ -2138,12 +2333,12 @@ def get_week(
                 "local_date": entry["local_date"],
                 "sport": entry["sport"],
                 "name": entry["name"],
-                "duration": format_duration(round(entry["duration_s"] or 0)),
+                "duration": format_duration_or(entry["duration_s"], "unknown"),
                 "tss": (entry.get("load") or {}).get("tss"),
                 "sentence": (
                     f"{entry['local_date']}: {entry['name'] or entry['sport']}, "
-                    f"{format_duration(round(entry['duration_s'] or 0))}, was ridden with "
-                    "nothing planned for it"
+                    f"{format_duration_or(entry['duration_s'], 'unknown duration')}, was "
+                    "ridden with nothing planned for it"
                 ),
             }
         )
@@ -2172,12 +2367,12 @@ def get_week(
             "planned_sessions_unscored": len(planned_unscored),
             **(
                 {
-                    "planned_unscored_warning": (
-                        f"{len(planned_unscored)} planned session"
-                        f"{'' if len(planned_unscored) == 1 else 's'} could not be scored "
-                        f"(ids {', '.join(str(e['id']) for e in planned_unscored)}) and "
-                        "contributed nothing to planned_tss, which therefore understates the "
-                        "week. See spec_errors on those entries."
+                    "planned_unscored_warning": _unscored_warning(
+                        len(planned_unscored),
+                        ("planned session", "planned sessions"),
+                        "planned_tss",
+                        "See spec_errors on those entries.",
+                        [entry["id"] for entry in planned_unscored],
                     )
                 }
                 if planned_unscored
@@ -2259,10 +2454,7 @@ def compute_load(
     if end:
         clauses.append("local_date <= ?")
         params.append(parse_date(end, "end").isoformat())
-    sport_clauses, sport_params = _sport_filter(sport)
-    unfiltered_clauses, unfiltered_params = list(clauses), list(params)
-    clauses += sport_clauses
-    params += sport_params
+    clauses, params, unfiltered_clauses, unfiltered_params = _scope_by_sport(clauses, params, sport)
 
     rows_out: list[dict] = []
     with open_db() as conn:
@@ -2281,7 +2473,7 @@ def compute_load(
                     "local_date": activity["local_date"],
                     "name": activity["name"],
                     "sport": activity["sport"],
-                    "duration": format_duration(round(activity["duration_s"] or 0)),
+                    "duration": format_duration_or(activity["duration_s"], "unknown"),
                     "normalized_power": activity["normalized_power"],
                     "avg_power": activity["avg_power"],
                     "avg_hr": activity["avg_hr"],
@@ -2289,13 +2481,7 @@ def compute_load(
                 }
             )
 
-        unknown_sport = 0
-        if sport:
-            unknown_sport = conn.execute(
-                f"SELECT COUNT(*) AS n FROM activities "
-                f"WHERE {' AND '.join(unfiltered_clauses)} AND sport IS NULL",
-                unfiltered_params,
-            ).fetchone()["n"]
+        unknown_sport = _unknown_sport_count(conn, unfiltered_clauses, unfiltered_params, sport)
 
     return {
         "count": len(rows_out),
@@ -2427,20 +2613,21 @@ def _planned_blocks(spec: dict) -> list[dict]:
     return blocks
 
 
-def _compliance_verdict(
-    alignment: str, comparisons: list[dict], deviating: list[dict], unverifiable: list[dict]
-) -> str:
+def _compliance_verdict(alignment: str, deviating: list[dict], unverifiable: list[dict]) -> str:
     """One word for the session: what the comparison actually established.
 
     `unverifiable` is its own answer, and **any** unverifiable block earns it —
     not only a session where every block is one. Requiring all of them meant a
     single clean warmup in front of five no-power intervals returned
-    `as_prescribed`, asserting five untestable blocks had been held; and a plan
-    containing one free block could never reach `unverifiable` at all, because
-    `no_target` used to count as evidence of compliance.
+    `as_prescribed`, asserting five untestable blocks had been held.
 
     A deviation still outranks an unverifiable block: something is known to
     have gone differently, which is the more useful thing to say.
+
+    The three lists come from `classify_block`, which partitions every block
+    into exactly one of them — so `as_prescribed` is reached only when every
+    block was checked and every check passed, rather than by falling through
+    the buckets nothing claimed.
     """
     if alignment != "by_lap":
         return "no_block_data"
@@ -2493,13 +2680,15 @@ def compliance_report(
     running, because duration is verifiable without one. Each block carries two
     verdicts for that reason: `verdict` for power, `duration_verdict` for time.
 
-    `off_target_blocks` counts wrong power, `off_duration_blocks` counts short
-    or long, `deviating_blocks` is their union, and `unverifiable_blocks` is
-    blocks whose power could not be checked and whose duration was fine. The
-    session `verdict` is `deviated` if anything deviated, else `unverifiable`
-    if **any** block could not be checked — one clean warmup in front of five
-    no-power intervals is not evidence the intervals were ridden — else
-    `as_prescribed`.
+    `off_target_blocks` counts wrong power and `off_duration_blocks` counts
+    short or long. Every block then lands in exactly one of
+    `deviating_blocks`, `unverifiable_blocks` and `compliant_blocks`: a block
+    is unverifiable when its power could not be checked (`no_power`) or its lap
+    carried no duration at all, and compliant only when everything asked of it
+    was checked and held. The session `verdict` is `deviated` if anything
+    deviated, else `unverifiable` if **any** block could not be checked — one
+    clean warmup in front of five no-power intervals is not evidence the
+    intervals were ridden — else `as_prescribed`.
     """
     with open_db() as conn:
         planned = _dict(
@@ -2559,22 +2748,33 @@ def compliance_report(
         alignment = "mismatch"
 
     planned_seconds = metrics.total_seconds
-    actual_seconds = activity.get("duration_s") or 0
-    duration_delta = actual_seconds - planned_seconds
+    # Not `or 0`. A ride imported from a thin payload carries no duration — it
+    # is tolerated and flagged `no_duration`, not rejected — and folding that
+    # to zero reported "rode 0:00" and then asserted the ride was the whole
+    # planned session shorter than planned, in the field the docstring says to
+    # read first. A deviation nobody rode is worse than no answer.
+    actual_seconds = activity.get("duration_s")
     actual_np = activity.get("normalized_power") or activity.get("avg_power")
     summary_sentences: list[str] = [
         f"Planned {format_duration(planned_seconds)} at IF "
         f"{metrics.intensity_factor:.2f} (NP {metrics.normalised_power} W, "
-        f"TSS {metrics.tss:.0f}); rode {format_duration(round(actual_seconds))}"
+        f"TSS {metrics.tss:.0f}); rode {format_duration_or(actual_seconds, 'an unknown time')}"
         + (f" at {round(actual_np)} W" if actual_np else "")
         + (f" for {load.tss:.0f} TSS" if load.tss is not None else "")
         + "."
     ]
-    if abs(duration_delta) >= max(120, planned_seconds * 0.05):
+    if actual_seconds is None:
         summary_sentences.append(
-            f"The ride was {format_duration(abs(round(duration_delta)))} "
-            f"{'longer' if duration_delta > 0 else 'shorter'} than planned."
+            "This ride carries no duration, so it could not be checked against the "
+            f"{format_duration(planned_seconds)} planned."
         )
+    else:
+        duration_delta = actual_seconds - planned_seconds
+        if abs(duration_delta) >= max(120, planned_seconds * 0.05):
+            summary_sentences.append(
+                f"The ride was {format_duration(abs(round(duration_delta)))} "
+                f"{'longer' if duration_delta > 0 else 'shorter'} than planned."
+            )
     if alignment == "mismatch":
         summary_sentences.append(
             f"{len(laps)} laps were recorded against {len(blocks)} planned blocks, so no "
@@ -2590,22 +2790,18 @@ def compliance_report(
     # "Deviated" has to include a block that was cut short, not only one ridden
     # at the wrong power. A 10-minute interval abandoned after 5 at exactly the
     # right watts was reported as prescribed, which is the opposite of what
-    # happened.
-    off_target = [entry for entry in comparisons if entry["verdict"] in ("under", "over")]
+    # happened. These two count each axis; `classify_block` is what decides
+    # what the block as a whole is evidence of, so a block that is unverifiable
+    # on power and short on time is counted once, as a deviation.
+    off_target = [entry for entry in comparisons if entry["verdict"] in DEVIATING_VERDICTS]
     off_duration = [
         entry for entry in comparisons if entry["duration_verdict"] in DEVIATING_DURATION_VERDICTS
     ]
-    # `no_power` is not a power deviation: the lap recorded no watts, so the
-    # target was neither hit nor missed. Its *duration* still is, though, so a
-    # block can be unverifiable on power and deviating on time at once — count
-    # it once, as a deviation, which is the more specific thing known about it.
-    deviating_ids = {id(entry) for entry in off_target} | {id(entry) for entry in off_duration}
-    deviating = [entry for entry in comparisons if id(entry) in deviating_ids]
-    unverifiable = [
-        entry
-        for entry in comparisons
-        if entry["verdict"] in UNVERIFIABLE_VERDICTS and id(entry) not in deviating_ids
-    ]
+    classes: dict[str, list[dict]] = {name: [] for name in BLOCK_CLASSES}
+    for entry in comparisons:
+        classes[classify_block(entry)].append(entry)
+    deviating = classes["deviating"]
+    unverifiable = classes["unverifiable"]
     return {
         "planned_workout_id": planned_workout_id,
         "activity_id": activity["id"],
@@ -2626,7 +2822,7 @@ def compliance_report(
         },
         "actual": {
             "name": activity["name"],
-            "duration": format_duration(round(actual_seconds)),
+            "duration": format_duration_or(actual_seconds, "unknown"),
             "duration_s": actual_seconds,
             "normalized_power_w": activity.get("normalized_power"),
             "avg_power_w": activity.get("avg_power"),
@@ -2644,8 +2840,9 @@ def compliance_report(
         "off_duration_blocks": len(off_duration),
         "deviating_blocks": len(deviating),
         "unverifiable_blocks": len(unverifiable),
+        "compliant_blocks": len(classes["compliant"]),
         "sentences": summary_sentences,
-        "verdict": _compliance_verdict(alignment, comparisons, deviating, unverifiable),
+        "verdict": _compliance_verdict(alignment, deviating, unverifiable),
     }
 
 

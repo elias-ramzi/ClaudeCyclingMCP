@@ -351,3 +351,81 @@ def test_the_local_date_is_derived_from_the_row_not_carried():
     )
     assert local_date_of({"start_time_utc": "2026-07-08T03:00:00"}) == "2026-07-08"
     assert local_date_of({}) == ""
+
+
+# --------------------------------------------------------------------------
+# review round 3 — the third 3.10-only shape of the same fallback
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        # What strftime("%z") writes. `fromisoformat` refuses it before 3.11.
+        ("2026-08-20T23:12:33.5+0200", "2026-08-20T21:12:33"),
+        ("2026-08-20T23:12:33+0200", "2026-08-20T21:12:33"),
+        ("2026-08-20T23:12:33.5-0500", "2026-08-21T04:12:33"),
+        ("2026-08-20T23:12:33.5+0000", "2026-08-20T23:12:33"),
+        # Shapes fromisoformat rejects on every version, so the pattern
+        # fallback runs — and must apply the offset rather than truncate it.
+        ("2026-08-20 23:12:33 +02:00", "2026-08-20T21:12:33"),
+        ("2026-08-20 23:12:33 +0200", "2026-08-20T21:12:33"),
+    ],
+)
+def test_a_colon_less_offset_is_applied_not_discarded(value, expected):
+    """`.split(".")[0]` took the offset with the fraction, so an instant came
+    back hours from the truth — wrong, plausible, and invisible downstream.
+    Patched one shape at a time across three rounds; normalised once now."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp(value, to_utc=True) == expected
+
+
+def test_a_colon_less_offset_on_a_local_time_still_keeps_the_wall_clock():
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp("2026-08-20T23:12:33.5+0200") == "2026-08-20T23:12:33"
+
+
+def test_a_plain_date_is_not_mistaken_for_an_offset():
+    """ "2026-08-20" ends in "-08-20"; a greedier offset pattern would eat it."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp("2026-08-20") == "2026-08-20T00:00:00"
+    assert _timestamp("2026-08-20 07:12") == "2026-08-20T07:12:00"
+
+
+def test_an_unreadable_timestamp_is_still_refused():
+    """The fallback exists to read more shapes, not to invent an instant."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp("last Tuesday") is None
+    assert _timestamp("2026-08-20T25:12:33+02:00") is None
+
+
+def test_the_fallback_never_drops_a_utc_offset(monkeypatch):
+    """The offset shapes above all reach `fromisoformat` on 3.11+, so this pins
+    the path 3.10 — the declared floor — actually takes: the pattern fallback,
+    which used to truncate at the dot and take the offset with it. Simulated by
+    making `fromisoformat` refuse everything, which is what 3.10 does to a
+    colon-less offset and to a one-digit fraction.
+    """
+    from datetime import datetime as real_datetime
+
+    from cycling_mcp import garmin_import
+
+    class Strict(real_datetime):
+        @classmethod
+        def fromisoformat(cls, value):
+            raise ValueError("simulating Python 3.10")
+
+    monkeypatch.setattr(garmin_import, "datetime", Strict)
+    assert garmin_import._timestamp("2026-08-20T23:12:33.5+0200", to_utc=True) == (
+        "2026-08-20T21:12:33"
+    )
+    assert garmin_import._timestamp("2026-08-20T23:12:33.5+02:00", to_utc=True) == (
+        "2026-08-20T21:12:33"
+    )
+    assert garmin_import._timestamp("2026-08-20T23:12:33.5+0200") == "2026-08-20T23:12:33"
+    assert garmin_import._timestamp("2026-08-20T23:12:33Z", to_utc=True) == "2026-08-20T23:12:33"
+    assert garmin_import._timestamp("2026-08-20") == "2026-08-20T00:00:00"

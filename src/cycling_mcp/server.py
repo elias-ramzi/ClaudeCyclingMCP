@@ -1189,10 +1189,15 @@ def record_race_result(
     stops being flagged as unplanned training. It still counts in full toward
     load and CTL — the athlete's body did not know it was a race.
 
-    Omit `status` and an event still marked `upcoming` becomes `completed`,
-    while one already marked `abandoned` or `dns` **keeps that** — adding a
-    debrief months later must not quietly rewrite a race the athlete did not
-    finish into one they did. Pass `status` explicitly to change it.
+    Omit `status` and an event still marked `upcoming` becomes `completed` —
+    but only when the call actually carries a result, so a bare call changes
+    nothing at all. One already marked `abandoned` or `dns` **keeps that**:
+    adding a debrief months later must not quietly rewrite a race the athlete
+    did not finish into one they did. Pass `status` explicitly to change it.
+
+    An empty `debrief` is not an erase instruction. Blank text never overwrites
+    what is stored — pass the corrected text instead — and the response names
+    any field that was ignored for that reason.
 
     `finish_time` takes "4:32:10" or a number of seconds. The **debrief is the
     point**: what the pacing was, what was eaten and when, what went wrong.
@@ -1298,6 +1303,10 @@ def annotate_activity(
     Particularly valuable when no HRV or readiness data exists. Sensations are
     then the only fatigue signal there is, and an unrecorded one is gone by the
     next conversation.
+
+    Empty text is never an erase instruction: a blank `feel` or `note` leaves
+    the stored one alone and is named in the response. Pass the replacement
+    text to change it.
     """
     return _coach(
         coach.annotate_activity,
@@ -1561,12 +1570,18 @@ def compliance_report(planned_workout_id: int, activity_id: int | None = None) -
     no watts says nothing about whether a target was held — but if it ran half
     its planned length, that much *is* known, and it counts as a deviation.
 
-    `off_target_blocks` counts wrong power, `off_duration_blocks` counts short
-    or long, `deviating_blocks` is their union, `unverifiable_blocks` is blocks
-    whose power could not be checked and whose duration was fine. The session
-    `verdict` is `deviated` if anything deviated, else `unverifiable` if **any**
-    block could not be checked — one clean warmup in front of five no-power
-    intervals is not evidence the intervals were ridden — else `as_prescribed`.
+    `off_target_blocks` counts wrong power and `off_duration_blocks` counts
+    short or long. Every block then falls into exactly one of
+    `deviating_blocks`, `unverifiable_blocks` and `compliant_blocks`: a block is
+    unverifiable when its power could not be checked **or** its lap carried no
+    duration at all, and compliant only when everything asked of it was checked
+    and held. The session `verdict` is `deviated` if anything deviated, else
+    `unverifiable` if **any** block could not be checked — one clean warmup in
+    front of five no-power intervals is not evidence the intervals were ridden
+    — else `as_prescribed`.
+
+    A ride with no stored duration is said to be unknown, never rounded to
+    0:00, and no shortfall against the plan is computed from it.
 
     Read `sentences` first: it is the report in order, already phrased.
     """

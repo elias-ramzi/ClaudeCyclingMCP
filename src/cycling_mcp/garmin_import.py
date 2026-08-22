@@ -78,6 +78,12 @@ _INT_FIELDS = {"avg_hr", "max_hr"}
 # A fractional-seconds field, with whatever follows it (an offset, or nothing).
 _FRACTION = re.compile(r"^(.*?)\.(\d+)(.*)$")
 
+# A trailing UTC offset, colon or no colon. `strftime("%z")` writes "+0200",
+# which `fromisoformat` refuses before 3.11 — and which a fallback that strips
+# it turns into an instant two hours from the truth. A date cannot match this:
+# "2026-08-20" has no two digits left after the sign and the day.
+_OFFSET = re.compile(r"([+-])(\d{2}):?(\d{2})$")
+
 
 class GarminPayloadError(ValueError):
     """Raised when a payload is not something this module can read at all."""
@@ -268,32 +274,52 @@ def _timestamp(value: Any, to_utc: bool = False) -> str | None:
     if not text:
         return None
 
-    # Two 3.10 limitations, both worked around here rather than left to the
-    # fallback below. "Z" is only accepted from 3.11, and a fractional-second
-    # field must be exactly 3 or 6 digits — "…33.5+02:00" raises there and
-    # parses on 3.11+. The fallback then strips everything after the dot,
-    # taking the UTC offset with it, and stores an instant two hours wrong with
-    # nothing to show for it. Wrong and plausible is worse than rejected, and
-    # 3.10 is this package's declared floor.
+    # Normalised once, not shape by shape. `fromisoformat` before 3.11 — this
+    # package's declared floor — rejects "Z", a fractional-second field that is
+    # not exactly 3 or 6 digits, and a UTC offset written without its colon,
+    # which is precisely what `strftime("%z")` emits. Each of those used to
+    # fall through to the pattern loop below, which discarded everything after
+    # the dot and took the offset with it, storing an instant hours wrong with
+    # nothing to show for it. Wrong and plausible is worse than rejected.
     iso = text.replace(" ", "T")
     if iso.endswith(("Z", "z")):
         iso = iso[:-1] + "+00:00"
     iso = _pad_fraction(iso)
+    iso = _OFFSET.sub(r"\1\2:\3", iso)
     try:
         parsed = datetime.fromisoformat(iso)
     except ValueError:
         parsed = None
-    if parsed is not None:
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone(timezone.utc) if to_utc else parsed.replace(tzinfo=None)
-        return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+    if parsed is None:
+        parsed = _from_patterns(iso)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc) if to_utc else parsed.replace(tzinfo=None)
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S")
 
-    text = text.replace("T", " ").replace("Z", "").strip().split(".")[0]
+
+def _from_patterns(iso: str) -> datetime | None:
+    """The shapes `fromisoformat` will not take, with any UTC offset preserved.
+
+    The offset is split off and reattached rather than truncated away. A
+    fallback that silently drops "+02:00" answers with a real-looking instant
+    two hours from the truth, and nothing downstream can tell — which is worse
+    than this function returning None and the activity being rejected.
+    """
+    offset = None
+    match = _OFFSET.search(iso)
+    if match is not None:
+        iso = iso[: match.start()]
+        sign = -1 if match.group(1) == "-" else 1
+        offset = timezone(sign * timedelta(hours=int(match.group(2)), minutes=int(match.group(3))))
+    body = iso.replace("T", " ").split(".")[0].strip()
     for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            return datetime.strptime(text, pattern).strftime("%Y-%m-%dT%H:%M:%S")
+            parsed = datetime.strptime(body, pattern)
         except ValueError:
             continue
+        return parsed if offset is None else parsed.replace(tzinfo=offset)
     return None
 
 
@@ -301,8 +327,9 @@ def _pad_fraction(text: str) -> str:
     """Pad a fractional-seconds field to six digits, leaving any offset attached.
 
     `.5` and `.12345` are legal ISO-8601 and rejected by `fromisoformat` before
-    3.11; six digits is accepted everywhere. Anything with no fraction, or a
-    fraction that is already 3 or 6 digits, comes back unchanged.
+    3.11; six digits is accepted everywhere, so every fraction is rewritten to
+    six — `.500` becomes `.500000`, which is the same instant. A string with no
+    fractional field at all comes back untouched.
     """
     match = _FRACTION.match(text)
     if match is None:

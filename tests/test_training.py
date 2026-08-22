@@ -12,6 +12,10 @@ from datetime import date, timedelta
 import pytest
 
 from cycling_mcp.training import (
+    BLOCK_CLASSES,
+    KNOWN_DURATION_VERDICTS,
+    KNOWN_VERDICTS,
+    classify_block,
     compare_block,
     compute_activity_load,
     form_series,
@@ -231,3 +235,79 @@ def test_ordinals_stop_pretending_past_ten():
     assert ordinal(1) == "first"
     assert ordinal(10) == "tenth"
     assert ordinal(14) == "number 14"
+
+
+# --------------------------------------------------------------------------
+# the compliance partition
+# --------------------------------------------------------------------------
+
+
+def _verdicts_compare_block_can_produce() -> tuple[set[str], set[str]]:
+    """Every verdict pair the comparison actually emits, driven not enumerated.
+
+    The vocabulary lists exist to make `classify_block` closed-world; if
+    `compare_block` learns a verdict they do not know about, that is the whole
+    failure this partition is meant to make loud rather than silent.
+    """
+    laps = (
+        {"duration_s": 600, "avg_power": 250},  # on target, on time
+        {"duration_s": 600, "avg_power": 180},  # under
+        {"duration_s": 600, "avg_power": 320},  # over
+        {"duration_s": 200, "avg_power": 250},  # short
+        {"duration_s": 900, "avg_power": 250},  # long
+        {"duration_s": 600, "avg_power": 100},  # under a ceiling: easier_than_target
+        {"duration_s": 600},  # no power
+        {},  # no power, unknown duration
+    )
+    verdicts, durations = set(), set()
+    for role, low, high in (("interval", 250, 250), ("recovery", 150, 150), ("warmup", None, None)):
+        for lap in laps:
+            comparison = compare_block(1, role, 600, low, high, lap).as_dict()
+            verdicts.add(comparison["verdict"])
+            durations.add(comparison["duration_verdict"])
+    return verdicts, durations
+
+
+def test_the_vocabulary_covers_every_verdict_the_comparison_emits():
+    verdicts, durations = _verdicts_compare_block_can_produce()
+    assert verdicts == set(KNOWN_VERDICTS)
+    assert durations == set(KNOWN_DURATION_VERDICTS)
+
+
+def test_every_verdict_pair_lands_in_exactly_one_class():
+    """The previous version enumerated the positive buckets and let the rest
+    fall through, so `no_target` over `unknown` — a free block whose lap carried
+    no time — counted as evidence the session went to plan."""
+    for verdict in KNOWN_VERDICTS:
+        for duration_verdict in KNOWN_DURATION_VERDICTS:
+            block = {"verdict": verdict, "duration_verdict": duration_verdict}
+            assert classify_block(block) in BLOCK_CLASSES
+
+
+def test_an_unknown_duration_makes_a_block_unverifiable():
+    assert classify_block({"verdict": "no_target", "duration_verdict": "unknown"}) == "unverifiable"
+    assert classify_block({"verdict": "on_target", "duration_verdict": "unknown"}) == "unverifiable"
+
+
+def test_a_deviation_on_either_axis_outranks_an_unverifiable_one():
+    assert classify_block({"verdict": "no_power", "duration_verdict": "short"}) == "deviating"
+    assert classify_block({"verdict": "over", "duration_verdict": "unknown"}) == "deviating"
+
+
+def test_only_a_block_checked_on_both_axes_is_compliant():
+    assert classify_block({"verdict": "on_target", "duration_verdict": "on_time"}) == "compliant"
+    assert (
+        classify_block({"verdict": "easier_than_target", "duration_verdict": "on_time"})
+        == "compliant"
+    )
+    assert classify_block({"verdict": "no_target", "duration_verdict": "on_time"}) == "compliant"
+    assert classify_block({"verdict": "no_power", "duration_verdict": "on_time"}) == "unverifiable"
+
+
+def test_a_verdict_nothing_knows_about_raises_rather_than_passing():
+    """A verdict added to `compare_block` later must not fall through to
+    "nothing wrong here"."""
+    with pytest.raises(ValueError, match="unrecognised block verdict"):
+        classify_block({"verdict": "sandbagged", "duration_verdict": "on_time"})
+    with pytest.raises(ValueError, match="unrecognised block duration_verdict"):
+        classify_block({"verdict": "on_target", "duration_verdict": "eventually"})

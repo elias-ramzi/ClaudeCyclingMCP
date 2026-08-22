@@ -1447,3 +1447,321 @@ def test_a_candidate_with_no_duration_does_not_rank_as_a_perfect_match():
     result = coach.link_activity(saved["planned_workouts"][0]["id"], auto=True)
     assert result["linked"] is False, "two candidates is ambiguous"
     assert [c["garmin_activity_id"] for c in result["candidates"]] == ["5200", "5201"]
+
+
+# --------------------------------------------------------------------------
+# review round 3 — mostly siblings of the round 2 fixes, in the functions the
+# fix did not reach
+# --------------------------------------------------------------------------
+
+
+def test_the_activity_select_covers_everything_an_import_writes():
+    """The re-import lookup merges the payload over this row *and* projects it
+    through `_ACTIVITY_OUT_FIELDS`, and `_project` fills a column it cannot see
+    with None. A narrower select is a null wearing the shape of a real value."""
+    assert set(coach._IMPORT_FIELDS) <= set(coach._ACTIVITY_OUT_FIELDS)
+
+
+THIN_RIDE = {
+    "activityId": 7001,
+    "activityName": "Zwift with the club",
+    "activityType": {"typeKey": "virtual_ride"},
+    "startTimeLocal": "2026-07-05 07:00:00",
+    "startTimeGMT": "2026-07-05 05:00:00",
+    "duration": 3600.0,
+    "averageHR": 148,
+}
+
+
+def test_an_unchanged_re_import_names_the_ride_it_left_alone():
+    """The named-column lookup dropped `garmin_activity_id`, so an idempotent
+    weekly re-sync answered `unchanged: [null]` and anchored every data-quality
+    flag to no identifiable activity."""
+    coach.import_activities([THIN_RIDE])
+    again = coach.import_activities([THIN_RIDE])
+
+    assert again["unchanged"] == 1
+    assert again["activities"]["unchanged"] == ["7001"]
+    assert again["flags"] == [{"garmin_activity_id": "7001", "flags": ["no_power"]}]
+
+
+def test_an_unchanged_re_import_does_not_blank_the_subjective_layer():
+    """`rpe`, `feel` and `note` are outside the import fields, so the narrowed
+    lookup reported them as null on the ride it had just left alone."""
+    coach.import_activities([THIN_RIDE])
+    coach.annotate_activity(garmin_activity_id="7001", rpe=7, feel="ok", note="with the club")
+    again = coach.import_activities([THIN_RIDE])
+    assert again["unchanged"] == 1
+    stored = coach.list_activities()["activities"][0]
+    assert (stored["rpe"], stored["feel"], stored["note"]) == (7, "ok", "with the club")
+
+
+def test_an_empty_debrief_does_not_erase_the_stored_one():
+    """`debrief=""` passed the `is not None` guard, `_text` turned it into None,
+    and the UPDATE wrote NULL over the one field still useful a year later."""
+    event = coach.add_event("Club 100", "2026-07-04", priority="B")["stored"]
+    coach.record_race_result(event["id"], debrief="cracked at km 90, ate nothing after hour two")
+
+    result = coach.record_race_result(event["id"], debrief="")
+    assert result["updated_fields"] == []
+    assert result["stored"]["debrief"] == "cracked at km 90, ate nothing after hour two"
+    assert result["ignored_blank_fields"] == ["debrief"]
+    assert "not an instruction to erase" in result["ignored_blank_note"]
+
+
+def test_an_empty_event_note_does_not_erase_the_stored_one():
+    event = coach.add_event("Club 100", "2026-07-04", priority="B", note="start at the church")[
+        "stored"
+    ]
+    result = coach.update_event(event["id"], note="  ", priority="A")
+    assert result["updated_fields"] == ["priority"]
+    assert result["stored"]["note"] == "start at the church"
+    assert result["ignored_blank_fields"] == ["note"]
+
+
+def test_an_update_that_is_only_blank_text_refuses_and_says_why():
+    """Otherwise the refusal reads "pass at least one field" to a caller who
+    passed one."""
+    event = coach.add_event("Club 100", "2026-07-04", priority="B", note="church")["stored"]
+    with pytest.raises(coach.CoachError, match="empty text"):
+        coach.update_event(event["id"], note="")
+    assert coach.list_events()["events"][0]["note"] == "church"
+
+
+def test_an_empty_annotation_does_not_erase_the_stored_one():
+    coach.import_activities([RIDE])
+    coach.annotate_activity(garmin_activity_id="5001", note="legs felt flat all morning")
+    result = coach.annotate_activity(garmin_activity_id="5001", rpe=6, note="")
+    assert result["updated_fields"] == ["rpe"]
+    assert result["stored"]["note"] == "legs felt flat all morning"
+    assert result["ignored_blank_fields"] == ["note"]
+
+
+def test_an_empty_profile_field_does_not_erase_the_stored_one():
+    coach.update_profile(availability="Tue, Thu, Sat", equipment="Kickr, power meter")
+    result = coach.update_profile(availability="", equipment="Kickr, power meter, Edge 840")
+    assert result["updated_fields"] == ["equipment"]
+    assert result["athlete"]["availability"] == "Tue, Thu, Sat"
+    assert result["ignored_blank_fields"] == ["availability"]
+
+
+def test_logging_a_max_hr_does_not_hide_a_measured_threshold():
+    """The zones keyed off what *this* entry carried, so an athlete with a
+    measured 165 on file who logged a max HR was handed zones estimated from
+    92% of it — beside an `in_effect_today` in the same response saying the
+    threshold is measured and 165."""
+    from cycling_mcp.training import hr_zones
+
+    coach.log_hr(threshold_hr=165, effective_date="2026-06-01")
+    result = coach.log_hr(max_hr=190, effective_date="2026-07-01")
+
+    assert result["in_effect_today"]["threshold_hr"] == 165
+    assert result["in_effect_today"]["threshold_hr_estimated"] is False
+    assert result["hr_zones"] == hr_zones(165)
+    assert "estimation_note" not in result
+    assert "threshold_hr_estimated" not in result
+
+
+def test_a_max_hr_alone_still_says_the_zones_are_an_estimate():
+    result = coach.log_hr(max_hr=190, effective_date="2026-07-01")
+    assert result["threshold_hr_estimated"] == 175
+    assert "92%" in result["estimation_note"]
+
+
+def test_a_bare_race_result_does_not_complete_an_upcoming_event():
+    """The auto-complete ran before the empty-updates guard, so an existence
+    probe or a partial retry closed the race with no time, no ride, no debrief."""
+    event = coach.add_event("Club 100", "2026-09-04", priority="A")["stored"]
+    result = coach.record_race_result(event["id"])
+
+    assert result["updated_fields"] == []
+    assert result["stored"]["status"] == "upcoming"
+    assert result["stored"]["linked_activity_id"] is None
+    assert "nothing else was given" in result["status_unchanged"]
+    assert "No debrief stored" in result["missing"]
+
+
+def test_a_result_that_carries_something_still_completes_an_upcoming_event():
+    event = coach.add_event("Club 100", "2026-09-04", priority="A")["stored"]
+    result = coach.record_race_result(event["id"], debrief="rode it steady, no cramps")
+    assert result["stored"]["status"] == "completed"
+    assert result["updated_fields"] == ["debrief", "status"]
+
+
+def test_a_blank_debrief_does_not_complete_an_upcoming_event_either():
+    """Blank text writes nothing, so it is not a result to complete the race on."""
+    event = coach.add_event("Club 100", "2026-09-04", priority="A")["stored"]
+    result = coach.record_race_result(event["id"], debrief="   ")
+    assert result["updated_fields"] == []
+    assert result["stored"]["status"] == "upcoming"
+
+
+def _lap(**fields):
+    return {"duration": None, **fields}
+
+
+def test_a_session_whose_laps_carry_no_duration_is_not_as_prescribed():
+    """`no_target` over `unknown` landed in no bucket at all, so a session with
+    nothing verifiable about it returned `as_prescribed`."""
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities(
+        [
+            {
+                "activityId": 7100,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-01 08:00:00",
+                "duration": 1200.0,
+            }
+        ]
+    )
+    coach.import_activity_laps(
+        {"lapDTOs": [{"lapIndex": 1}, {"lapIndex": 2}]}, garmin_activity_id="7100"
+    )
+    spec = {
+        "name": "Free ride",
+        "ftp": 266,
+        "blocks": [
+            {"type": "free", "duration": 600, "role": "warmup"},
+            {"type": "free", "duration": 600, "role": "recovery"},
+        ],
+    }
+    planned_id = coach.save_planned_workouts([{"spec": spec, "scheduled_date": "2026-07-01"}])[
+        "planned_workouts"
+    ][0]["id"]
+    coach.link_activity(planned_id, garmin_activity_id="7100")
+    report = coach.compliance_report(planned_id)
+
+    assert [block["duration_verdict"] for block in report["blocks"]] == ["unknown", "unknown"]
+    assert report["unverifiable_blocks"] == 2
+    assert report["compliant_blocks"] == 0
+    assert report["verdict"] == "unverifiable"
+
+
+def test_every_block_lands_in_exactly_one_class():
+    """The counts have to partition the blocks, or the session verdict is read
+    off buckets that between them do not cover the report."""
+    report = _hr_only_session(
+        7101,
+        [{"duration": 600.0, "averagePower": 146.0}, {"duration": 200.0, "averageHR": 150}],
+        [
+            {"type": "steady", "duration": 600, "power_pct": 55, "role": "warmup"},
+            {"type": "steady", "duration": 600, "power_pct": 90, "role": "interval"},
+        ],
+    )
+    assert report["deviating_blocks"] + report["unverifiable_blocks"] + report[
+        "compliant_blocks"
+    ] == len(report["blocks"])
+    assert (report["deviating_blocks"], report["compliant_blocks"]) == (1, 1)
+
+
+def _ride_with_no_duration(activity_id=7200, date="2026-07-05"):
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities(
+        [
+            {
+                "activityId": activity_id,
+                "activityName": "Long one with friends",
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": f"{date} 08:00:00",
+                "averageHR": 150,
+            }
+        ]
+    )
+
+
+def test_a_ride_with_no_duration_is_not_reported_as_a_zero_length_one():
+    """`duration_s or 0` printed "rode 0:00" and then asserted the ride was the
+    whole planned session shorter than planned."""
+    _ride_with_no_duration()
+    spec = {
+        "name": "Endurance hour",
+        "ftp": 266,
+        "blocks": [{"type": "steady", "duration": 3600, "power_pct": 65}],
+    }
+    planned_id = coach.save_planned_workouts([{"spec": spec, "scheduled_date": "2026-07-05"}])[
+        "planned_workouts"
+    ][0]["id"]
+    coach.link_activity(planned_id, garmin_activity_id="7200")
+    report = coach.compliance_report(planned_id)
+
+    assert report["actual"]["duration"] == "unknown"
+    assert report["actual"]["duration_s"] is None
+    assert "rode an unknown time" in report["sentences"][0]
+    assert not any("rode 0:00" in sentence for sentence in report["sentences"])
+    assert not any("shorter than planned" in sentence for sentence in report["sentences"])
+    assert any("carries no duration" in sentence for sentence in report["sentences"])
+
+
+def test_a_ride_with_no_duration_reads_as_unknown_in_the_week_and_the_load():
+    _ride_with_no_duration()
+    week = coach.get_week("2026-07-05", "2026-07-11", today="2026-07-20")
+    unplanned = week["deviations"]["ridden_not_planned"]
+    assert [entry["duration"] for entry in unplanned] == ["unknown"]
+    assert "unknown duration, was ridden with nothing planned" in unplanned[0]["sentence"]
+    assert "0:00" not in unplanned[0]["sentence"]
+    assert coach.compute_load()["activities"][0]["duration"] == "unknown"
+
+
+def test_laps_with_no_duration_are_counted_not_accused():
+    """Each contributed zero to the sum, so the total fell short of the ride and
+    the tool warned that the ride's own splits belonged to a different ride."""
+    coach.import_activities([RIDE])  # 4200 s
+    result = coach.import_activity_laps(
+        {
+            "lapDTOs": [
+                {"lapIndex": 1, "duration": 2100.0},
+                {"lapIndex": 2},
+                {"lapIndex": 3, "duration": 2100.0},
+            ]
+        },
+        garmin_activity_id="5001",
+    )
+    assert "warning" not in result
+    assert result["laps_missing_duration"] == 1
+    assert "1 of 3 laps carry no duration" in result["duration_check"]
+    assert result["lap_total_seconds"] == 4200
+
+
+def test_laps_that_really_do_not_add_up_are_still_reported():
+    coach.import_activities([RIDE])  # 4200 s
+    result = coach.import_activity_laps(
+        {"lapDTOs": [{"lapIndex": 1, "duration": 1200.0}]}, garmin_activity_id="5001"
+    )
+    assert "belong to a different ride" in result["warning"]
+    assert "laps_missing_duration" not in result
+
+
+def test_relinking_a_completed_session_does_not_warn_about_completing_it():
+    """The note fired for any status that is not `planned`/`pushed`, so
+    correcting a mislink said completion had been withheld from a session that
+    is already completed."""
+    coach.import_activities([RIDE, {**RIDE, "activityId": 5002, "avgPower": 150.0}])
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.link_activity(planned_id, garmin_activity_id="5002")
+
+    result = coach.link_activity(planned_id, garmin_activity_id="5001")
+    assert result["planned_workout"]["status"] == "completed"
+    assert result["activity"]["garmin_activity_id"] == "5001"
+    assert "status_unchanged" not in result
+
+
+def test_a_colon_less_utc_offset_keeps_the_instant_it_carries():
+    """`strftime("%z")` writes "+0200", which `fromisoformat` refuses before
+    3.11 — and the fallback then dropped it, storing an evening ride two hours
+    from where it happened."""
+    coach.import_activities(
+        [
+            {
+                "activityId": 7300,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-08-20T23:12:33.5+0200",
+                "startTimeGMT": "2026-08-20T21:12:33.5+0000",
+                "duration": 3600.0,
+            }
+        ]
+    )
+    stored = coach.list_activities()["activities"][0]
+    assert stored["start_time_local"] == "2026-08-20T23:12:33"
+    assert stored["start_time_utc"] == "2026-08-20T21:12:33"
+    assert stored["local_date"] == "2026-08-20"

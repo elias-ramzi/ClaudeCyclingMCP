@@ -215,6 +215,71 @@ serialises a payload it is about to discard; `get_week`'s event lookup drops a n
 `log_hr` and `get_zones` load each history table once; and `FTP_LIMITS`/`FTP_USUAL` no longer alias
 the shared constants under second names.
 
+#### Found in the third review round
+
+Ten more, each reproduced before fixing and pinned by a test that asserts the shape of the output
+rather than a count — the worst bug of this round survived a test that checked only how many rides
+came back. Most are siblings of a round-2 fix, in the function the fix did not reach, so each was
+fixed as a pattern across the module rather than at the cited line.
+
+- **An idempotent re-import answered `unchanged: [null]`.** *(Regression.)* The dedup query was
+  narrowed to the import fields, which do not include `garmin_activity_id`, while the unchanged
+  branch still projected the row through the wider read list — and a projection fills a column it
+  cannot see with None. Every data-quality caveat on an unchanged ride was anchored to no
+  identifiable activity, and its `rpe`, `feel` and `note` came back null too. Every read of an
+  activity row now uses the one column list, and a test pins that it covers the import fields.
+- **An empty string erased a stored debrief, event name, session note, annotation or profile
+  field.** `debrief=""` passed the `is not None` guard, `_text("")` returned None, and the UPDATE
+  wrote NULL over the field the docstring calls the only part of a race record still useful a year
+  later. One rule now covers every free-text update field: blank text never overwrites a stored
+  value, the response names any field ignored for that reason, and a call carrying nothing else
+  refuses with that reason rather than "pass at least one field".
+- **`log_hr` returned estimated zones and a false note over a measured threshold.** The zones keyed
+  off what *this* entry carried, so an athlete with 165 bpm on file who logged a max HR got zones
+  computed from 92% of it and "No threshold HR on file" — beside an `in_effect_today` in the same
+  response saying the threshold is measured and 165. Zones now come from the figures in force on the
+  entry's own date, and the estimation note only when that resolved threshold is itself an estimate.
+- **A bare `record_race_result` completed an upcoming race with nothing in it.** *(Regression.)*
+  The auto-complete ran before the empty-updates guard added in round 2, so a partial retry or an
+  existence probe closed the race with no time, no ride and no debrief. Completion now needs a call
+  that actually carries a result, and the no-op path returns the same shape — debrief nudge included
+  — as a real one instead of hand-building its own.
+- **Evidence-free blocks still counted toward `as_prescribed`.** *(Regression.)* Round 2 replaced a
+  closed-world classification with three positive buckets, so a block that was in none of them — a
+  free block whose lap carried no duration — was silently evidence that the session went to plan,
+  and a verdict added later would have been too. `classify_block` now partitions every
+  `(verdict, duration_verdict)` pair into exactly one of compliant / deviating / unverifiable,
+  treats an unknown duration as unverifiable, and raises on a verdict nothing recognises.
+  `compliance_report` reports `compliant_blocks` alongside the other two.
+- **A NULL ride duration was printed as "0:00" and reported as a deviation.** *(Regression of the
+  same null-folds-to-zero pattern round 2 fixed in `planned_tss`.)* `compliance_report` said "rode
+  0:00" and then "The ride was 1:00:00 shorter than planned" about a ride whose duration is simply
+  not stored; `get_week` and `compute_load` printed a zero-length ride. One formatter now prints
+  "unknown" wherever a duration may be null, and the comparison says it could not be made rather
+  than inventing a shortfall.
+- **NULL lap durations triggered the "splits belong to a different ride" warning.** Each contributed
+  zero to the lap total, so the sum fell short of the ride and the tool accused the ride's own
+  splits. It now counts the untimed laps and says the cross-check was not made.
+- **On Python 3.10 a colon-less UTC offset still stored an instant hours wrong.** `"…33.5+0200"` —
+  what `strftime("%z")` writes — was the third shape of the same defect patched in three rounds. The
+  offset colon is now normalised alongside the existing `Z` and fraction rewrites, and the fallback
+  splits any offset off and reapplies it instead of truncating at the dot: no path can drop an
+  offset any more.
+- **`link_activity` contradicted itself on a completed session.** Re-linking one to the correct ride
+  — the routine mislink correction — warned that "linking did not mark it completed" about a session
+  already completed, and invited a pointless status update. The note is now scoped to statuses that
+  are coaching decisions, and the two near-identical UPDATE statements are one.
+- **`get_week` printed a NULL ride duration as "0:00"** in the sentence a model relays, rather than
+  saying the length is unknown.
+
+Also from that review: `AUTO_COMPLETABLE_STATUSES` is used at all three sites that spelled out
+`('planned', 'pushed')`; the unknown-sport count and its snapshot-before-splice dance are one helper
+shared by `list_activities` and `compute_load`; the planned and actual sides of a week share one
+unscored-total warning; `History` reads each history table on first use rather than all three
+eagerly, so `get_profile` issues three queries where it issued five and `log_hr` one where it issued
+four; the identity-set block classification is gone, superseded by the partition; and
+`_pad_fraction`'s docstring no longer claims a 3-digit fraction comes back unchanged.
+
 ### Notes
 
 Ingestion is model-mediated by design: Claude fetches from the Garmin MCP and passes the JSON here
