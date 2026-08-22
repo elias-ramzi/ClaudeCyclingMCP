@@ -209,11 +209,21 @@ def test_a_wrong_duration_blocks_export():
     assert "42:00" in " ".join(result["problems"])
 
 
-def test_a_missing_snapshot_warns_but_does_not_block():
-    """Blocking here would be wrong — the check is weaker, not failed."""
+def test_a_missing_snapshot_blocks_rather_than_passing_on_weaker_checks():
+    """This used to warn and pass. That was wrong, and wrong in the dangerous
+    direction.
+
+    On a real no-op the duration and Training Load checks both pass — that is
+    exactly how the failure presents — so without the snapshot the tool cannot
+    tell success from nothing having happened. Reporting "safe to export" on
+    two checks that provably do not discriminate is worse than reporting
+    nothing. Blocking costs only time, because no credit is spent before the
+    export itself.
+    """
     result = compare_mywhoosh_import(**GOOD, workout_time="68:00", training_load=71)
-    assert result["safe_to_export"]
-    assert any("no-op" in w for w in result["warnings"])
+    assert result["safe_to_export"] is False
+    assert any("did not run" in p for p in result["problems"])
+    assert any("costs a credit" in p for p in result["problems"])
 
 
 def test_a_far_off_training_load_warns_but_does_not_block():

@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] - 2026-08-21
+
+Everything below came out of real sessions using the server — four field reports from
+agents that built and uploaded actual workouts. Three of the bugs they found had shipped
+past a green test suite, all three for the same reason: the tests called the Python
+functions, and the bugs only existed once arguments had been through JSON and a client.
+
 ### Changed
 
 - **The README is now an overview, not a manual.** It leads with why the platforms need this —
@@ -23,6 +32,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`verify_mywhoosh_library_entry`** — checks the library card against the session that was
+  exported, in the card's own formats (`"1h 18m"` as readily as `"78:00"`). The credit is already
+  spent by then, so it prevents nothing; it establishes what the spend bought, which the redirect
+  alone cannot say. It also folds multiplication signs, because MyWhoosh renders an uploaded
+  `Tempo-3x14` as `Tempo-3×14` on the card while the editor header shows the ASCII form — so any
+  future match-by-name would have missed.
 - **`get_skill`** — returns a bundled procedure by name. The skills reach Claude Code through
   `.claude/skills` and other clients through MCP prompts, but neither route lets a *model* retrieve
   a procedure it has just been asked for by name; in Claude Desktop, "use the mywhoosh-upload skill"
@@ -91,6 +106,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checked in one command.
 - **Guidance for a timed-out browser call**, which the skill had none of. A timeout says nothing
   about whether the action applied, and it is the case most likely to tempt a destructive retry.
+- **`verify_mywhoosh_import` no longer passes when the snapshot is missing.** It used to warn and
+  return `safe_to_export: true`. But on a real no-op the duration and Training Load checks both
+  pass — that is exactly how the failure presents — so without the snapshot the tool cannot tell
+  success from nothing having happened, and reporting "safe to export" on two checks that provably
+  do not discriminate is worse than reporting nothing. Blocking costs only time: no credit is spent
+  before the export itself, so a fresh editor and a re-import are free.
 - **`verify_mywhoosh_import` reported an unchanged header as changed**, returning
   `safe_to_export: true` on the exact silent no-op it exists to catch. A scraped Training Load
   arrives as text while `training_load` is typed numeric, so the two sides of one reading were
@@ -110,6 +131,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   normal case, and that a disagreement means read the second — matching Step 5, which already
   writes to the second. The snippet now reports each field's index, since `name`, `id` and
   `placeholder` are all null on those inputs.
+- **`mywhoosh-upload` Step 8 says `find` returns two refs for EXPORT TO MYWHOOSH, and which to
+  click.** Step 5 documented that duplication for the FTP fields; Step 8 was silent about it at the
+  one irreversible control on the page, leaving an agent to infer it unaided. It also notes the
+  redirect lands on Collections rather than My Workouts, and that the card's `×` is not a mismatch.
+- **Step 3 names its two branches** — targets in watts, where the FTP is load-bearing, versus
+  targets in percentages, where it only moves the displayed numbers. The percentage case had been a
+  paragraph inside prose organised around the watts case.
 - **CI was red on Windows only.** Tests read files this project writes as UTF-8 using the platform
   default encoding, which is cp1252 on Windows, so the `·` separators and `Récupération` in the
   Garmin UI checklist came back mangled. The written files were always correct; the tests were
@@ -207,7 +235,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.1.0] - 2026-08-12
 
-First release.
+First release — cut in the repository but never tagged or published to PyPI, so `0.2.0` is the first version available to install.
 
 ### Added
 
@@ -253,5 +281,6 @@ First release.
 - Whether the MyWhoosh builder's FTP field reflects the athlete's game profile, or is a local preview
   value defaulting to 200 W, is not verified.
 
-[Unreleased]: https://github.com/elias-ramzi/ClaudeCyclingMCP/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/elias-ramzi/ClaudeCyclingMCP/releases/tag/v0.1.0
+[Unreleased]: https://github.com/elias-ramzi/ClaudeCyclingMCP/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/elias-ramzi/ClaudeCyclingMCP/releases/tag/v0.2.0
+[0.1.0]: https://github.com/elias-ramzi/ClaudeCyclingMCP/tree/6610803
