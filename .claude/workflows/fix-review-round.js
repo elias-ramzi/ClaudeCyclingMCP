@@ -19,14 +19,15 @@ const MAX_ATTEMPTS = (args && args.max_attempts) || 2
 const COMMIT = args && args.commit === false ? false : true
 
 const REPO = '/Users/elias/ClaudeCyclingMCP'
+const BRANCH = (args && args.branch) || 'dev'
+const PR = (args && args.pr) || 10
 const HOUSE = `
-Repo: ${REPO}, branch feat/coach-layer. Read CLAUDE.md first; its rules are load-bearing:
+Repo: ${REPO}, branch ${BRANCH} (PR #${PR}). Read CLAUDE.md first; its rules are load-bearing:
 a null is never folded to zero and a placeholder zero is never compared as a measurement;
 never overwrite a stored value with a null (the clear verb is the one deliberate exception);
 tolerate-and-flag beats reject when a valid datum exists; refusals are raised as CoachError
 and must be catchable by _coach's handler set (no bare AssertionError/OverflowError escapes);
-migrations are append-only; golden files change only deliberately. DO NOT touch
-src/cycling_mcp/verify.py — a separate session owns it. Gate:
+migrations are append-only; golden files change only deliberately. Gate:
 .venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/python -m pytest -q
 (offline suite must stay green; DB tests point CLAUDE_CYCLING_DB at a tmp_path and must never
 touch ~/.claude-cycling/coach.db).`
@@ -66,7 +67,7 @@ const PLAN_SCHEMA = {
 const plan = await agent(
   `You are the planner for a fix round. ${HOUSE}
 
-Fetch the review with: gh pr view 7 --comments — the review to fix is the comment at ${review}
+Fetch the review with: gh pr view ${PR} --comments — the review to fix is the comment at ${review}
 (match it by URL; it is the latest "Review round N" comment). Read the findings, the cleanup
 list, and the "verified clean" section. Then read the cited code.
 
@@ -176,7 +177,7 @@ Batch outcomes: ${JSON.stringify(results)}
    implementers have not already done so coherently (merge/dedupe their entries).
 ${
   COMMIT && unapproved.length === 0
-    ? '5. If and only if the gate is green and you found no substantive problem: commit everything to feat/coach-layer with a message describing the round, and push.'
+    ? `5. If and only if the gate is green and you found no substantive problem: commit everything to ${BRANCH} with a message describing the round, and push.`
     : `5. DO NOT COMMIT: ${unapproved.length ? `batches not approved: ${unapproved.map((r) => r.batch).join(', ')}` : 'commit disabled by args'}. Leave the tree for a human.`
 }
 
