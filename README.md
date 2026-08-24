@@ -43,8 +43,9 @@ rather than trusting a success response.
 - 🚴 **Two renderers, one source** — `.zwo` for MyWhoosh and a Garmin `upload_workout` payload, each pinned to a platform quirk that was expensive to learn ([format notes](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/tools.md#format-notes)).
 - 🔍 **Verification, not optimism** — compare a Garmin upload against what was actually stored, and a MyWhoosh import against the scraped builder header, including a pre-import snapshot that catches a silent no-op.
 - 🏋️ **A coach, not just a renderer** — a local file of profile, dated FTP/weight/HR, objectives, imported rides and planned sessions, with TSS, CTL/ATL/TSB and plan-vs-actual computed from it ([the coach layer](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/coaching.md)).
+- 🥗 **Nutrition on the same file** — an ingredient base, standard meals and a per-ingredient food log, with calorie targets computed from BMR **and that day's actual training** — a big session is not a deficit day ([the nutrition layer](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/nutrition.md)).
 - 🔐 **No credentials, ever** — the server never uploads and holds no tokens. Its only side effects are its own database and the file you ask for with `out_path`.
-- 🧩 **Bundled skills** — Garmin upload-and-verify, a browser-driven MyWhoosh import that reads MyWhoosh's own FTP before rendering, and a generic cycling-coach procedure.
+- 🧩 **Bundled skills** — Garmin upload-and-verify, a browser-driven MyWhoosh import that reads MyWhoosh's own FTP before rendering, and generic cycling-coach and nutrition procedures.
 
 ## Install
 
@@ -96,13 +97,14 @@ two platforms consume FTP at different times, and getting it wrong on the MyWhoo
 
 ## Skills
 
-Three bundled procedures in [`.claude/skills/`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills), triggering on how someone
+Four bundled procedures in [`.claude/skills/`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills), triggering on how someone
 actually describes what they want — "create", "add", "send", "put it on", "what am I doing this
 week" — not only on "upload":
 
 - **[`garmin-upload`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/garmin-upload/SKILL.md)** — renders, uploads via the Garmin MCP, then fetches the workout back and compares it against what was sent. Offers to schedule it.
 - **[`mywhoosh-upload`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/mywhoosh-upload/SKILL.md)** — drives the MyWhoosh builder through Claude in Chrome, since there is no API. It reads MyWhoosh's FTP out of the builder *before* rendering, so the fractions are right by construction, and stops for explicit confirmation before the export — which spends a finite slot credit.
 - **[`coaching`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/coaching/SKILL.md)** — how to coach with the tools below: the onboarding interview driven by whatever the profile is still missing, the weekly loop (read reality, compare to plan, then write it), and the adaptation rules that make it a plan rather than a template. Generic — it carries no athlete's facts.
+- **[`nutrition`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/nutrition/SKILL.md)** — seeding a food base from whatever the athlete already tracks, the daily logging loop where "can I eat X?" is answered by subtraction rather than by a yes or no, and why a big session is not a deficit day. Equally generic: the athlete's own foods, portions and preparation quirks live in their database, not in the skill.
 
 Each step states what it expects to see, so a run that breaks after a platform redesign reports
 which assumption failed instead of quietly producing nothing.
@@ -156,11 +158,55 @@ cycling.
 Full detail — the schema, the formulas and their limits, the timezone rule: [the coach
 layer](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/coaching.md).
 
+## Nutrition
+
+The nutrition layer sits in the same database, for the same athlete, because that is what makes a
+calorie target mean anything: it is computed from the athlete's profile **and from what the training
+tables say about that date**.
+
+- **An ingredient base** — per-100 g macros, aliases so "skyr, 200" resolves, habitual portions,
+  raw-versus-cooked state, price per package, and a note for the athlete's own know-how (a
+  rice-cooker water ratio, "weigh it — this is where eyeballing drifts").
+- **Standard meals** — a name and a list of grams. Their macros are computed from the ingredients
+  every time, so a correction propagates. A **log entry** does the exact opposite and freezes its
+  macros and cost at log time: a day already eaten is a measurement, not a view over current data.
+- **Targets that know about the ride** — Mifflin-St Jeor BMR, a sedentary baseline, plus Garmin's own
+  calories for that day (or the planned session's mechanical work, for a date still ahead), then the
+  goal's rate. Every input and intermediate is in the response, because a target whose arithmetic is
+  invisible can only be accepted or refused.
+- **Day type read, not asked** — an event makes its date `race` and the day before `race_eve`; a long
+  or hard ride makes it `big_session`. **On those days the deficit is withheld**, and the response
+  says how much: under-fuelling a hard session costs the session and the recovery from it.
+- **Refusals that hold** — a target below computed BMR is clamped by `suggest_targets` and refused
+  outright by `confirm_targets`, whoever asked.
+
+```
+suggest_targets(date="2026-08-24")   →  BMR 1682 x 1.3 = 2187, + 900 kcal ridden = 3087 maintenance,
+                                        -550/day for a -0.5 kg/week goal  →  2537 kcal, 145 g protein
+confirm_targets(date="2026-08-24")
+
+log_meal(meal="Petit-dej", overrides=[{"ingredient": "cruesli", "grams": 30}])
+                                     →  261 kcal, 24.4 g protein, grouped under "Petit-dej"
+log_food(entries=[{"label": "canteen: chicken and chips", "kcal": 700,
+                   "protein_g": 35, "is_estimate": true}], slot="lunch")
+
+day_summary(date="2026-08-24")       →  961 kcal eaten; remaining 1576 kcal, 85.6 g protein,
+                                        23.2 g fibre — 1 entry is a flagged estimate
+```
+
+The evening is then composed from that remainder and `list_meals`. The deficit itself is never judged
+on one day: `week_summary` reads it on the weekly average and on the 7-day moving average of morning
+weigh-ins, because day-to-day weight is water, glycogen and salt.
+
+Full detail — the schema, the target formula, the freeze rule: [the nutrition
+layer](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/nutrition.md).
+
 ## Documentation
 
 - [Spec format](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/spec-format.md) — every field, the block types, and how FTP is consumed by each platform.
 - [Tools](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/tools.md) — the full tool reference, plus the `.zwo` and Garmin format rules the renderers are pinned to.
 - [The coach layer](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/coaching.md) — the database, the model-mediated ingestion flow, and every formula with its limits.
+- [The nutrition layer](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/nutrition.md) — the food base, the freeze rule, and how a calorie target is derived from the day's training.
 - [Garmin schema provenance](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/garmin-schema.md) — what the payload shape was derived against, the two silent-failure findings, and verification status.
 - [Skills](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/skills.md) — what each bundled skill does, and the two ways one runs.
 - [Testing](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/testing.md) — the offline gate and the live Garmin round-trip.

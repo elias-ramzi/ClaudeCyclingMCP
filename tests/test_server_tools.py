@@ -437,7 +437,7 @@ def test_server_info_makes_the_build_sayable():
 
     info = json.loads(server_info())
     assert info["version"] == __version__
-    assert info["skills"] == ["coaching", "garmin-upload", "mywhoosh-upload"]
+    assert info["skills"] == ["coaching", "garmin-upload", "mywhoosh-upload", "nutrition"]
     assert Path(info["package_path"]).is_dir()
     # Distinguishes a local editable checkout from a uvx cache in one glance.
     assert info["package_path"].endswith("cycling_mcp")
