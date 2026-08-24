@@ -22,9 +22,10 @@ fails on a new one fails for every ride at once.
 from __future__ import annotations
 
 import json
+import math
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, NamedTuple
 
 # Garmin reports a bike ride under whichever child type the device chose:
 # "virtual_ride" for a trainer app, "indoor_cycling" for a smart trainer with no
@@ -88,6 +89,53 @@ _FRACTION = re.compile(r"^(.*?)\.(\d+)(.*)$")
 # "-20" — so it is never read on its own: `_split_offset` requires a time in
 # front of it.
 _OFFSET = re.compile(r"([+-])(\d{2})(?::?(\d{2}))?$")
+
+# A value that is a whole date and nothing else. It is what tells a real
+# offset on a date-only value from the false positive the pattern above finds
+# inside every date: "2026-08-20" leaves "2026-08", "2026-08-20-05:00" leaves
+# a whole date and so really does carry an offset.
+_DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+#: The band a ride's date has to fall in to be a ride at all. The floor
+#: predates power meters, Garmin Connect and every athlete's training log; the
+#: ceiling is today plus enough slop for a device in a timezone ahead of this
+#: server. Outside it, a date is a sentinel or a broken clock — not a training
+#: date — and it is refused per row.
+#:
+#: Convertible is not the same question as plausible, which is why this exists
+#: beside the overflow guards rather than instead of them: "0001-01-01" with a
+#: *negative* offset converts away from the underflow and stores perfectly
+#: happily, and every date-walking tool downstream then has to cross two
+#: thousand years to reach the ride behind it.
+PLAUSIBLE_DATE_FLOOR = date(1990, 1, 1)
+FUTURE_DATE_SLOP_DAYS = 2
+
+
+def implausible_date(day: str, today: date | None = None) -> str | None:
+    """Why this date cannot be a ride's, or None when it can be.
+
+    A sentence, not a bool: the import path reports per-row rejections with a
+    reason, and "3 rejected" tells nobody what to fix.
+    """
+    try:
+        parsed = date.fromisoformat(day)
+    except (TypeError, ValueError):
+        return f"has an unreadable date ({day!r})"
+    ceiling = (today or date.today()) + timedelta(days=FUTURE_DATE_SLOP_DAYS)
+    if parsed < PLAUSIBLE_DATE_FLOOR:
+        return (
+            f"is dated {parsed.isoformat()}, before {PLAUSIBLE_DATE_FLOOR.isoformat()} — that is "
+            "a zero-date sentinel or a device clock that never set, not a ride. Storing it puts "
+            "a ride two thousand years behind the rest of the log, which every form and load "
+            "calculation then has to walk across"
+        )
+    if parsed > ceiling:
+        return (
+            f"is dated {parsed.isoformat()}, which is in the future — a device clock that is "
+            "wrong, not a ride that has happened"
+        )
+    return None
 
 
 class GarminPayloadError(ValueError):
@@ -268,15 +316,22 @@ def _timestamp(value: Any, to_utc: bool = False) -> str | None:
     if isinstance(value, (int, float)):
         # Epoch milliseconds. Seconds-since-epoch would put us in 1970, which
         # is not a date any athlete rode on.
-        seconds = float(value) / 1000.0
-        if seconds < 10**8:
-            return None
+        #
+        # The whole branch is inside the try, not just the arithmetic: JSON
+        # integers are arbitrary-precision in Python, so `float(10**400)`
+        # overflows one line *above* where the guard used to start, and that
+        # raise aborted the entire import call — losing every valid ride in the
+        # batch to one corrupt row, which is the exact invariant the guard
+        # exists to hold. Only OverflowError is reachable here now: NaN and the
+        # infinities are refused by the finiteness check rather than left to
+        # raise ValueError from `timedelta`, so a narrow except keeps a future
+        # bug in this block loud instead of turning it into a silent rejection.
         try:
+            seconds = float(value) / 1000.0
+            if not math.isfinite(seconds) or seconds < 10**8:
+                return None
             moment = datetime(1970, 1, 1) + timedelta(seconds=seconds)
-        except (OverflowError, OSError, ValueError):
-            # Same rule as the offset conversion below: a number too large to
-            # be a date is an unreadable timestamp, not a reason to abort the
-            # import call and lose every valid ride beside it.
+        except OverflowError:
             return None
         return moment.strftime("%Y-%m-%dT%H:%M:%S")
     if not isinstance(value, str):
@@ -297,83 +352,125 @@ def _timestamp(value: Any, to_utc: bool = False) -> str | None:
     if iso.endswith(("Z", "z")):
         iso = iso[:-1] + "+00:00"
     iso = _pad_fraction(iso)
-    body, offset = _split_offset(iso)
-    if offset is not None:
-        iso = body + offset
+    split = _split_offset(iso)
+    if split is None:
+        return None
     try:
-        parsed = datetime.fromisoformat(iso)
+        parsed = datetime.fromisoformat(split.normalised)
     except ValueError:
         parsed = None
     if parsed is None:
-        parsed = _from_patterns(iso)
+        parsed = _from_patterns(split)
     if parsed is None:
         return None
     if parsed.tzinfo is not None:
         try:
             parsed = parsed.astimezone(timezone.utc) if to_utc else parsed.replace(tzinfo=None)
-        except (OverflowError, OSError, ValueError):
+        except OverflowError:
             # A sentinel date with an offset — "0001-01-01T00:00:00+0200", the
             # zero date some exporters write — cannot be moved to UTC without
             # leaving the representable range. A payload is data, not input the
             # caller controls: raising here aborted the whole import call and
             # took every valid ride in the batch with it. An unconvertible
             # timestamp is an unreadable one, and the per-row rejection path
-            # already says so with a reason.
+            # already says so with a reason. (The sentinels that convert
+            # *without* overflowing are caught by `implausible_date`, because
+            # convertible and plausible are not the same question.)
             return None
     return parsed.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def _split_offset(iso: str) -> tuple[str, str | None]:
+class _Split(NamedTuple):
+    """A timestamp taken apart once: the datetime text, and its offset if any.
+
+    Both parse paths read this, so the offset is found, normalised and turned
+    into a `tzinfo` exactly once. Splitting in `_timestamp` and splitting again
+    in the fallback meant the same string was parsed twice and the offset was
+    re-read by fixed slicing, which only worked while both halves agreed on the
+    spelling they had just written.
+    """
+
+    body: str
+    offset: str | None
+    tz: timezone | None
+
+    @property
+    def normalised(self) -> str:
+        """The timestamp with its offset in the one spelling `fromisoformat` takes."""
+        return self.body + self.offset if self.offset else self.body
+
+
+def _split_offset(iso: str) -> _Split | None:
     """A timestamp split into its datetime part and its UTC offset as `+HH:MM`.
 
-    The offset is only read off a string that carries a time. Without that
-    guard the hour-only form matches inside a bare date — "2026-08-20" ends in
-    "-20" — and would turn a date into an instant twenty hours away.
+    None means the string carries an offset that cannot be read as one, and the
+    timestamp is unreadable rather than merely offset-less. Two ways in:
+
+    * an offset on a value with no time. `fromisoformat` on 3.11+ takes any
+      separator, so it read `"2026-08-20-05:00"` as the *date* 2026-08-20 at
+      the *time* 05:00 — a fabricated time of day, from digits that were a
+      timezone, and `to_utc` then did nothing because the result was naive. On
+      3.10 the same string rejects, so this corruption was invisible to half
+      the test matrix. A date with an offset and no clock is not an instant;
+    * an offset outside the ±24h a `timezone` can hold, e.g. "+99:00".
+
+    An offset is only *read* off a value carrying a time, because the hour-only
+    form matches inside a bare date — "2026-08-20" ends in "-20". That match is
+    a false positive when what precedes it is not a whole date, and a real
+    offset when it is; the two are told apart rather than both waved through.
     """
     match = _OFFSET.search(iso)
     if match is None:
-        return iso, None
+        return _Split(iso, None, None)
     body = iso[: match.start()]
     if "T" not in body:
-        return iso, None
-    return body, f"{match.group(1)}{match.group(2)}:{match.group(3) or '00'}"
+        # No clock in front of the match. Either the match landed inside the
+        # date itself (a bare "2026-08-20"), which is not an offset at all, or
+        # the value really is a date with an offset stuck to it, which is not
+        # a readable instant.
+        return None if _DATE_ONLY.match(body) else _Split(iso, None, None)
+    offset = f"{match.group(1)}{match.group(2)}:{match.group(3) or '00'}"
+    sign = -1 if match.group(1) == "-" else 1
+    try:
+        tz = timezone(sign * timedelta(hours=int(match.group(2)), minutes=int(match.group(3) or 0)))
+    except ValueError:
+        # "+99:00" is not a UTC offset. Refuse rather than drop it.
+        return None
+    return _Split(body, offset, tz)
 
 
-def _from_patterns(iso: str) -> datetime | None:
+def _from_patterns(split: _Split) -> datetime | None:
     """The shapes `fromisoformat` will not take, with any UTC offset preserved.
 
-    The offset is split off and reattached rather than truncated away, and
-    anything still attached that this function cannot account for is a
+    The offset is carried in from `_split_offset` rather than truncated away,
+    and anything still attached that this function cannot account for is a
     rejection rather than a truncation. That rule is the point: a fallback that
     silently drops "+02:00" answers with a real-looking instant two hours from
     the truth and nothing downstream can tell, and four rounds of review found
     four spellings of the same offset doing exactly that, one at a time.
     Rejecting costs one row, which `import_activities` reports with a reason.
     """
-    body, offset = _split_offset(iso)
-    tzinfo = None
-    if offset is not None:
-        sign = -1 if offset[0] == "-" else 1
-        try:
-            tzinfo = timezone(sign * timedelta(hours=int(offset[1:3]), minutes=int(offset[4:6])))
-        except ValueError:
-            # "+99:00" is not a UTC offset. Refuse rather than drop it.
-            return None
-
     # Drop a fractional-seconds field, and *only* a fractional-seconds field.
     # Truncating at the dot is what discarded offsets for four rounds; if what
     # follows the dot is not digits alone, something is still attached that
     # this function has not accounted for.
-    head, dot, tail = body.partition(".")
+    head, dot, tail = split.body.partition(".")
     if dot and not tail.isdigit():
         return None
 
+    text = head.replace("T", " ").strip()
     for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            parsed = datetime.strptime(head.replace("T", " ").strip(), pattern)
+            parsed = datetime.strptime(text, pattern)
         except ValueError:
             continue
-        return parsed if tzinfo is None else parsed.replace(tzinfo=tzinfo)
+        if split.tz is not None and pattern == "%Y-%m-%d":
+            # A date, an offset, and no clock between them — "2026-08-20T+02:00"
+            # is the spelling that gets here rather than through the guard in
+            # `_split_offset`. Reading it as midnight in that zone would invent
+            # the same time of day out of the same digits, one branch over.
+            return None
+        return parsed if split.tz is None else parsed.replace(tzinfo=split.tz)
     return None
 
 
@@ -509,6 +606,9 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
             row[field] = number
 
     row["local_date"] = local_date_of(row)
+    problem = implausible_date(row["local_date"])
+    if problem:
+        return None, f"activity {activity_id} {problem}"
     return row, None
 
 

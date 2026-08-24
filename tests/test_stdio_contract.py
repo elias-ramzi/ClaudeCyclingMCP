@@ -448,3 +448,67 @@ def test_clearing_a_field_the_tool_does_not_own_is_a_refusal_over_the_wire(coach
     assert "_error" not in result
     assert result["ok"] is False
     assert "cannot clear 'debrief'" in result["error"]
+
+
+def test_a_bare_clear_name_survives_the_schema(coach_client):
+    """The coach layer takes `clear="constraints"`; pydantic will not coerce a
+    scalar to a list, so a str-only-list schema refused that spelling before
+    any code ran — the two surfaces disagreeing on one input, exactly as the
+    str-only garmin_activity_id did."""
+    coach_client.call("update_profile", constraints="shift work until March")
+    result = coach_client.call("update_profile", clear="constraints")
+    assert "_error" not in result, result
+    assert result["ok"] is True
+    assert result["cleared_fields"] == ["constraints"]
+    assert result["athlete"]["constraints"] is None
+
+
+def test_unlinking_a_planned_session_survives_the_schema(coach_client):
+    coach_client.call("import_activities", payload=[{**RIDE, "activityId": 8801}])
+    spec = {
+        "name": "Endurance 2h",
+        "ftp": 266,
+        "blocks": [{"type": "steady", "duration": 7200, "power_pct": 65}],
+    }
+    saved = coach_client.call(
+        "save_planned_workouts", workouts=[{"spec": spec, "scheduled_date": "2026-07-05"}]
+    )
+    planned_id = saved["planned_workouts"][0]["id"]
+    # By id, not auto: this client is module-scoped and other tests have
+    # already put rides on that date, which `auto` correctly calls ambiguous.
+    linked = coach_client.call(
+        "link_activity", planned_workout_id=planned_id, garmin_activity_id=8801
+    )
+    assert linked["linked"] is True
+
+    result = coach_client.call(
+        "update_planned_workout",
+        planned_workout_id=planned_id,
+        clear=["linked_activity_id"],
+        status="missed",
+    )
+    assert "_error" not in result, result
+    assert result["ok"] is True
+    assert result["cleared_fields"] == ["linked_activity_id"]
+    assert result["planned_workout"]["linked_activity_id"] is None
+    assert result["planned_workout"]["status"] == "missed"
+
+
+def test_one_malformed_item_does_not_lose_the_rest_of_the_week(coach_client):
+    """`workouts: list[dict]` made pydantic refuse the whole call, which
+    defeated the per-item refusal the tool documents."""
+    spec = {
+        "name": "Endurance 90",
+        "ftp": 266,
+        "blocks": [{"type": "steady", "duration": 5400, "power_pct": 65}],
+    }
+    result = coach_client.call(
+        "save_planned_workouts",
+        workouts=["not a session", {"spec": spec, "scheduled_date": "2026-07-09"}],
+    )
+    assert "_error" not in result, result
+    assert result["ok"] is True
+    assert result["saved"] == 1
+    assert result["refused"] == 1
+    assert result["refusals"][0] == {"index": 0, "errors": ["item must be an object"]}
+    assert result["planned_workouts"][0]["scheduled_date"] == "2026-07-09"

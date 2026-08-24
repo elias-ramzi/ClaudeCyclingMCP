@@ -851,7 +851,7 @@ def test_totals_do_not_count_an_unscored_ride_as_zero():
     listing = coach.list_activities()
     assert listing["scored"] == 1
     assert listing["unscored"] == 1
-    assert "understates" in listing["unscored_warning"]
+    assert "is understated by an unknown amount" in listing["unscored_warning"]
     assert listing["total_tss"] == pytest.approx(64.6, abs=0.05)
 
 
@@ -1944,7 +1944,7 @@ def test_a_field_given_both_blank_and_clear_is_cleared_once():
 
 def test_a_field_given_both_new_text_and_clear_is_refused():
     coach.update_profile(constraints="shift work")
-    with pytest.raises(coach.CoachError, match="both new text and a request to clear"):
+    with pytest.raises(coach.CoachError, match="both a new value and a request to clear"):
         coach.update_profile(constraints="travelling in June", clear=["constraints"])
     assert coach.get_profile()["athlete"]["constraints"] == "shift work"
 
@@ -2010,6 +2010,232 @@ def test_a_ride_with_no_duration_says_the_laps_could_not_be_checked():
         {"lapDTOs": [{"lapIndex": 1, "duration": 1200.0}, {"lapIndex": 2}]},
         garmin_activity_id="8200",
     )
-    assert "the activity carries no duration" in result["duration_check"]
+    assert "the activity carries no usable duration" in result["duration_check"]
     assert result["laps_missing_duration"] == 1
     assert "warning" not in result
+
+
+# --------------------------------------------------------------------------
+# review round 5 — the boundaries of the round 4 fixes, and the clear surface
+# --------------------------------------------------------------------------
+
+
+def test_one_corrupt_timestamp_does_not_cost_the_batch():
+    """`float(10**400)` raised one line above the round-4 guard, so a single
+    corrupt row aborted the call and lost every valid ride beside it."""
+    result = coach.import_activities(
+        [
+            {"activityId": 9001, "startTimeGMT": 10**400, "duration": 3600.0},
+            {"activityId": 9002, "startTimeLocal": "0001-01-01T00:00:00-05:00"},
+            RIDE,
+        ]
+    )
+    assert result["inserted"] == 1
+    assert [entry["garmin_activity_id"] for entry in result["activities"]["inserted"]] == ["5001"]
+    assert result["rejected"] == 2
+    assert [entry["index"] for entry in result["rejections"]] == [0, 1]
+    assert "before 1990-01-01" in result["rejections"][1]["reason"]
+
+
+def test_a_zero_duration_ride_does_not_accuse_its_own_splits():
+    """Manual entries carry `"duration": 0` and the importer stores the 0. The
+    round-4 rewrite read it as a real length with `is not None`, so importing
+    the ride's own laps reported them as belonging to a different ride."""
+    coach.import_activities(
+        [
+            {
+                "activityId": 9100,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-05 08:00:00",
+                "duration": 0,
+            }
+        ]
+    )
+    result = coach.import_activity_laps(
+        {"lapDTOs": [{"lapIndex": 1, "duration": 1200.0}]}, garmin_activity_id="9100"
+    )
+    assert "warning" not in result
+    assert "the activity carries no usable duration" in result["duration_check"]
+
+
+def test_a_zero_duration_lap_is_untimed_not_a_zero_length_one():
+    coach.import_activities([RIDE])  # 4200 s
+    result = coach.import_activity_laps(
+        {"lapDTOs": [{"lapIndex": 1, "duration": 4200.0}, {"lapIndex": 2, "duration": 0}]},
+        garmin_activity_id="5001",
+    )
+    assert result["laps_missing_duration"] == 1
+    assert "warning" not in result
+
+
+def test_the_lap_sentences_agree_with_their_subject():
+    coach.import_activities([RIDE])  # 4200 s
+    one = coach.import_activity_laps(
+        {"lapDTOs": [{"lapIndex": 1, "duration": 1200.0}]}, garmin_activity_id="5001"
+    )
+    assert one["warning"].startswith("the 1 timed lap sums to")
+    many = coach.import_activity_laps(
+        {"lapDTOs": [{"lapIndex": 1, "duration": 600.0}, {"lapIndex": 2, "duration": 600.0}]},
+        garmin_activity_id="5001",
+    )
+    assert many["warning"].startswith("the 2 timed laps sum to")
+
+
+def test_get_form_refuses_a_window_nobody_could_read():
+    """ "All history" spelled 0001..9999 is 3.65 million points: a hang, not an
+    answer. get_week over the same range is safe — it is a SQL BETWEEN."""
+    with pytest.raises(coach.CoachError, match="covers at most"):
+        coach.get_form("0001-01-01", "9999-12-31")
+    with pytest.raises(coach.CoachError, match="3652059 days"):
+        coach.get_form("0001-01-01", "9999-12-31")
+
+
+def test_get_form_still_takes_a_long_but_sane_window():
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities([RIDE])
+    form = coach.get_form("2024-01-01", "2026-08-24")
+    assert form["start"] == "2024-01-01"
+    assert len(form["series"]) == 967
+
+
+def test_a_legacy_sentinel_row_does_not_drag_the_walk_back_to_year_one():
+    """Import refuses these now, but a row stored before that rule existed
+    would still set `earliest` to year 1 — 740,000 days of walk on every call
+    and a `history_days_before_start` that suppressed warmup_incomplete."""
+    import sqlite3
+
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities([RIDE])
+    conn = sqlite3.connect(store.db_path())
+    conn.execute(
+        "INSERT INTO activities (athlete_id, garmin_activity_id, local_date, "
+        "start_time_local, duration_s, avg_power, source, imported_at) "
+        "VALUES (1, '9200', '0001-01-01', '0001-01-01T00:00:00', 3600, 200, 'garmin', 'x')"
+    )
+    conn.commit()
+    conn.close()
+
+    form = coach.get_form("2026-07-01", "2026-07-31")
+    assert form["excluded_implausible_dates"] == ["0001-01-01"]
+    assert "sentinel date" in form["excluded_implausible_note"]
+    assert form["history_days_before_start"] < 400
+    assert "warmup_incomplete" in form, "the fictitious history used to suppress this"
+    assert len(form["series"]) == 31
+
+
+def test_a_wrongly_auto_linked_session_can_be_unlinked():
+    """`link_activity` only ever re-links to another real ride, so a session
+    auto-linked to the wrong activity and actually missed fell out of both of
+    get_week's deviation lists at once and compliance_report kept answering
+    about that ride."""
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities([RIDE])
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.link_activity(planned_id, auto=True)
+
+    result = coach.update_planned_workout(planned_id, clear=["linked_activity_id"], status="missed")
+    assert result["cleared_fields"] == ["linked_activity_id"]
+    assert result["planned_workout"]["linked_activity_id"] is None
+    assert result["planned_workout"]["status"] == "missed"
+
+    week = coach.get_week("2026-07-05", "2026-07-11", today="2026-07-20")
+    assert [entry["activity_id"] for entry in week["deviations"]["ridden_not_planned"]] == [1]
+    with pytest.raises(coach.CoachError, match="has no activity linked"):
+        coach.compliance_report(planned_id)
+
+
+def test_unlinking_and_relinking_in_one_call_is_refused():
+    coach.import_activities([RIDE])
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.link_activity(planned_id, auto=True)
+    with pytest.raises(coach.CoachError, match="both a new value and a request to clear"):
+        coach.update_planned_workout(planned_id, linked_activity_id=1, clear=["linked_activity_id"])
+    assert (
+        coach.get_week("2026-07-05", "2026-07-11")["planned_workouts"][0]["linked_activity_id"] == 1
+    )
+
+
+def test_a_whole_race_result_can_be_retracted():
+    """A result is three things. Clearing the debrief alone left a finish time
+    on an again-upcoming race and a ride get_week still read as that race's."""
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities([RIDE])
+    event = coach.add_event("Club 100", "2026-07-05", priority="B")["stored"]
+    coach.record_race_result(
+        event["id"], garmin_activity_id="5001", finish_time="4:32:10", debrief="wrong race"
+    )
+
+    result = coach.record_race_result(
+        event["id"],
+        status="upcoming",
+        clear=["debrief", "finish_time_s", "linked_activity_id"],
+    )
+    assert result["cleared_fields"] == ["debrief", "finish_time_s", "linked_activity_id"]
+    assert result["stored"]["status"] == "upcoming"
+    assert result["stored"]["finish_time_s"] is None
+    assert "finish_time" not in result["stored"], "no time to format any more"
+    assert result["stored"]["linked_activity_id"] is None
+
+    week = coach.get_week("2026-07-05", "2026-07-11", today="2026-07-20")
+    ridden = week["deviations"]["ridden_not_planned"]
+    assert [entry["activity_id"] for entry in ridden] == [1], "the ride is training again"
+
+
+def test_clearing_a_finish_time_does_not_complete_an_upcoming_race():
+    event = coach.add_event("Club 100", "2026-09-04", priority="A")["stored"]
+    result = coach.record_race_result(event["id"], clear=["finish_time_s"])
+    assert result["stored"]["status"] == "upcoming"
+    assert result["cleared_fields"] == ["finish_time_s"]
+
+
+def test_a_bare_field_name_clears_the_same_way_a_list_does():
+    """The coach layer tolerates a bare name; the tool signatures say
+    `str | list[str]` so the wire agrees with it."""
+    coach.update_profile(constraints="shift work")
+    result = coach.update_profile(clear="constraints")
+    assert result["cleared_fields"] == ["constraints"]
+    assert result["athlete"]["constraints"] is None
+
+
+def test_a_negative_duration_is_not_a_length_either():
+    """Null, zero and negative are the same answer — this row does not say how
+    long — and only the first was treated that way."""
+    coach.import_activities(
+        [
+            {
+                "activityId": 9300,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-05 08:00:00",
+                "duration": -5,
+            }
+        ]
+    )
+    result = coach.import_activity_laps(
+        {"lapDTOs": [{"lapIndex": 1, "duration": 1200.0}, {"lapIndex": 2, "duration": -5}]},
+        garmin_activity_id="9300",
+    )
+    assert "warning" not in result
+    assert result["laps_missing_duration"] == 1
+    assert "the activity carries no usable duration" in result["duration_check"]
+
+
+def test_a_far_future_window_does_not_walk_from_the_first_ride():
+    """The span cap bounds the window, not the walk: form_series starts at the
+    earliest stored ride, so a five-year window ending in 9999 crossed eight
+    thousand years to reach it — inside the cap, and still 2.9M steps."""
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities([RIDE])
+    form = coach.get_form("9998-01-01", "9999-01-01")
+    assert len(form["series"]) == 366
+    assert "1 ride sits more than 3660 days before" in form["runup_capped"]
+    assert form["history_days_before_start"] == 0
+
+
+def test_a_normal_window_is_never_capped():
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities([RIDE])
+    form = coach.get_form("2026-07-05", "2026-07-31")
+    assert "runup_capped" not in form
+    assert "excluded_implausible_dates" not in form

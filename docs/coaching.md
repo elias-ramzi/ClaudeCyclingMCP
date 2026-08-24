@@ -170,8 +170,12 @@ get_activity_splits(1662651131)   →   import_activity_laps(payload=..., garmin
   "unknown" value would not be caught by the null rule above — and a thinner re-import would quietly
   reclassify a `virtual_ride` as unknown, dropping it out of every cycling filter while its
   `sub_sport` still said otherwise.
-- Rejections come back individually, with a reason each. An activity with no `activityId` or no
-  readable start time is rejected; nothing else is.
+- Rejections come back individually, with a reason each, and one bad row never costs the batch: an
+  activity with no `activityId`, no readable start time, or a date outside 1990-01-01..today is
+  rejected, and the valid rides beside it are still stored. The date band is the last of those
+  because *convertible* and *plausible* are different questions — a zero-date sentinel reads
+  perfectly well and puts a ride in year 1, which every date-walking tool downstream then has to
+  cross.
 
 ### On dates
 
@@ -273,6 +277,13 @@ real history rather than from zero. Where that run-up is under 42 days the numbe
 out of their starting value, and `warmup_incomplete` says so. Pass `seed_ctl`/`seed_atl` if better
 starting values are known.
 
+Both ends of that walk are bounded, because it steps a day at a time and returns a point for each.
+A window wider than five years is **refused** — "all history" spelled `0001-01-01..9999-12-31` is
+3.65 million points, which is a hang rather than an answer — and the run-up is cut at ten years,
+reported as `runup_capped`. A stored ride dated before 1990 is left out of the run-up entirely and
+named in `excluded_implausible_dates`: import refuses those dates now, but a sentinel row written
+before that rule would otherwise start the walk two thousand years early.
+
 Cross-check against the Garmin MCP's `get_training_load_trend`. It computes from everything Garmin
 holds, using its own load metric; this computes from what was imported, using TSS. A disagreement is
 information — usually a gap in what was imported, or rides scored by heart rate here. Find the cause
@@ -354,13 +365,32 @@ An empty string is never an erase. Across every stored free-text field — debri
 notes, `feel`, the profile fields — blank text leaves what is stored alone and the response names
 the field it ignored. A stray empty form field cannot destroy a debrief.
 
-Erasing is a verb instead: `clear=["constraints"]` on the same tool empties the named fields and
-reports `cleared_fields`. It exists because "leave it alone" is the wrong answer when a note has
-stopped being true — a healed collarbone sitting in `constraints` routes every future plan around
-an injury that is over, and writing "none" leaves a constraint string downstream reads as real.
-Each tool clears only its own free-text fields; naming anything else is refused rather than
-quietly ignored, because a caller clearing the wrong field is destroying something. An event's
-name is not clearable: an event without one is not a record.
+Erasing is a verb instead. Each update tool takes `clear`, which empties the named fields and
+reports them in `cleared_fields`:
+
+| Tool | Clears |
+|---|---|
+| `update_profile` | `display_name`, `availability`, `equipment`, `constraints` |
+| `update_event` | `note` |
+| `annotate_activity` | `feel`, `note` |
+| `update_planned_workout` | `note`, `linked_activity_id` |
+| `record_race_result` | `debrief`, `finish_time_s`, `linked_activity_id` |
+
+`update_profile(clear=["constraints"])` is the case it was built for: "leave it alone" is the wrong
+answer when a note has stopped being true, and a healed collarbone still sitting in `constraints`
+routes every future plan around an injury that is over — while writing "none" instead leaves a
+constraint string downstream reads as real.
+
+The criterion is not "free text". It is that **empty is a state the record can be in**: a race with
+no finish time, a session with no ride linked. `update_planned_workout(clear=["linked_activity_id"])`
+is the only unlink there is — `link_activity` re-links to another ride but cannot say "no ride at
+all" — and without it a session auto-linked to the wrong activity and then marked `missed` drops out
+of both of `get_week`'s deviation lists at once. An event's name is not clearable, because an event
+without one is not a record.
+
+Each tool clears only its own fields; naming anything else is refused rather than quietly ignored,
+because a caller clearing the wrong field is destroying something. So is naming a field you also
+passed a new value for.
 
 ## Nulls the coach layer refuses to round off
 

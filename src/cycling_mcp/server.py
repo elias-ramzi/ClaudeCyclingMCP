@@ -946,7 +946,11 @@ def update_profile(
     availability: str | None = None,
     equipment: str | None = None,
     constraints: str | None = None,
-    clear: list[str] | None = None,
+    # str | list[str], because pydantic will not coerce a scalar to a list:
+    # the coach layer takes a bare field name and a str-only schema would
+    # have refused that spelling before any code ran, exactly as the
+    # str-only garmin_activity_id did. Same fix, same reason.
+    clear: str | list[str] | None = None,
 ) -> str:
     """Set athlete fields. Anything omitted is left as it was.
 
@@ -1135,7 +1139,7 @@ def update_event(
     priority: str | None = None,
     status: str | None = None,
     note: str | None = None,
-    clear: list[str] | None = None,
+    clear: str | list[str] | None = None,
 ) -> str:
     """Change an event's details: a moved date, a corrected profile, a dropped priority.
 
@@ -1191,7 +1195,7 @@ def record_race_result(
     debrief: str | None = None,
     status: str | None = None,
     force: bool = False,
-    clear: list[str] | None = None,
+    clear: str | list[str] | None = None,
 ) -> str:
     """Close out a race: link the ride, store the time, write the debrief.
 
@@ -1211,9 +1215,12 @@ def record_race_result(
 
     An empty `debrief` is not an erase instruction. Blank text never overwrites
     what is stored — pass the corrected text instead — and the response names
-    any field that was ignored for that reason. To empty a debrief filed
-    against the wrong race, pass `clear=["debrief"]`; that is an erase, not a
-    result, so it never completes an upcoming event.
+    any field that was ignored for that reason. Erasing is explicit:
+    `clear=["debrief", "finish_time_s", "linked_activity_id"]` are the three
+    parts of a result, and retracting one filed against the wrong race means
+    all three — a cleared debrief alone leaves a finish time on the
+    again-upcoming event and a ride get_week still reads as that race's.
+    Clearing is not a result, so it never completes an upcoming event.
 
     `finish_time` takes "4:32:10" or a number of seconds. The **debrief is the
     point**: what the pacing was, what was eaten and when, what went wrong.
@@ -1321,7 +1328,7 @@ def annotate_activity(
     rpe: int | None = None,
     feel: str | None = None,
     note: str | None = None,
-    clear: list[str] | None = None,
+    clear: str | list[str] | None = None,
 ) -> str:
     """Attach the subjective read to a ride: RPE 1-10, how it felt, free text.
 
@@ -1417,7 +1424,14 @@ def link_activity(
 
 
 @app.tool()
-def save_planned_workouts(workouts: list[dict]) -> str:
+def save_planned_workouts(
+    # list[Any], not list[dict]: pydantic rejects the whole call when one item
+    # is the wrong shape, which defeats the promise below that valid items are
+    # still stored. The per-item refusal names the index and keeps the rest of
+    # the week — it only ever fired in-process while the schema was narrower
+    # than the layer beneath it. Same disagreement as a str-only `clear`.
+    workouts: list[Any],
+) -> str:
     """Store planned sessions, one item per session.
 
     Each item is {"spec": ..., "scheduled_date": "YYYY-MM-DD", "note": ...}.
@@ -1451,7 +1465,7 @@ def update_planned_workout(
     note: str | None = None,
     spec: dict | None = None,
     linked_activity_id: int | None = None,
-    clear: list[str] | None = None,
+    clear: str | list[str] | None = None,
 ) -> str:
     """Change a planned session: status, date, push target, note, or the spec itself.
 
@@ -1467,6 +1481,13 @@ def update_planned_workout(
     Replacing `spec` re-validates it and refuses an invalid one, exactly as
     save_planned_workouts does. A blank `note` is ignored rather than stored;
     `clear=["note"]` empties it.
+
+    `clear=["linked_activity_id"]` **unlinks** the ride — the way back when
+    link_activity's `auto` grabbed the only activity on the day and the session
+    was actually missed. Re-linking can only point at a different ride; without
+    the unlink, a session marked `missed` with a link still attached vanishes
+    from both of get_week's deviation lists and compliance_report keeps
+    answering about the wrong ride.
     """
     return _coach(
         coach.update_planned_workout,
@@ -1561,9 +1582,16 @@ def get_form(start: str, end: str, seed_ctl: float = 0.0, seed_atl: float = 0.0)
     whose first import is three weeks old has a CTL that describes the import
     date, not them.
 
-    A ride with no power and no heart rate cannot be scored and adds nothing,
-    so its day steps as a rest day. `unscored_warning` says how many did that:
-    read it before calling a falling CTL detraining.
+    A ride that cannot be scored adds nothing, so its day steps as a rest day.
+    Four reasons, and they call for different answers: no power **and** no
+    heart rate; power but no FTP on file for that date; heart rate but no
+    threshold HR; or no duration to multiply by. The middle two are fixed by
+    logging an earlier FTP or threshold, not by importing more rides.
+    `unscored_warning` says how many did that: read it before calling a falling
+    CTL detraining.
+
+    At most five years per call — it steps a day at a time and returns a point
+    for each, so a wider window is refused rather than walked.
 
     **Cross-check against the Garmin MCP's `get_training_load_trend`.** Garmin
     computes from everything it holds, this from what was imported, and it uses

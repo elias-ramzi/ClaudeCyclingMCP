@@ -336,6 +336,78 @@ Also from that review: `docs/coaching.md`, `docs/tools.md` and the `coaching` sk
 clear verb and the one-directional lap check; `_unscored_warning` takes the clause its third caller
 needed; and `get_form`'s docstrings on both layers say what an unscored ride does to the curve.
 
+#### Found in the fifth review round
+
+Ten. Almost all of them live at the *boundary* of a round-4 fix — one line above a guard, one
+Python version to the side of a rejection rule, one falsy value past an `is not None` — so each is
+fixed by moving the boundary rather than by adding another case beside it.
+
+- **An oversized integer timestamp still took the whole import batch down.** The round-4 overflow
+  guard started one line below `float(value)`, and JSON integers are arbitrary-precision in Python:
+  `float(10**400)` raised outside the try and lost every valid ride in the call. The whole epoch
+  branch is inside the guard now, NaN and the infinities are refused rather than left to raise from
+  `timedelta`, and the except is narrowed to `OverflowError` — the only thing that can still reach
+  it.
+- **A bare date with a UTC offset became a fabricated time of day on Python 3.11+.** `fromisoformat`
+  there takes any separator, so `"2026-08-20-05:00"` read the offset *sign* as the date/time
+  separator and the offset *digits* as a clock — a start time invented out of a timezone, naive, so
+  `to_utc` did nothing. On 3.10 the same string rejected cleanly, which is why it survived a review
+  round: the corruption was invisible on half the matrix. A date with an offset and no clock is now
+  refused on both parse paths, and both are tested. A bare date with no offset still reads, because
+  the offset pattern matches inside every date ("2026-08-20" ends in "-20") — the false positive and
+  the real offset are told apart rather than both waved through.
+- **A sentinel date that did not overflow imported as a ride in year 1.** Round 4 caught only the
+  sentinels whose UTC conversion overflowed; `"0001-01-01T00:00:00-05:00"` converts *away* from the
+  underflow, and a naive or local-time sentinel is never converted at all. `get_form` then walked
+  ~740,000 days per call and reported 739,000 days of history for a three-week-old athlete.
+  Convertible and plausible are different questions: an activity dated before 1990 or in the future
+  is now rejected per row, with the reason, which closes the class regardless of offset or path.
+- **A zero-duration activity accused its own splits of belonging to a different ride.** Round 4
+  replaced a truthy gate with `is not None`, and manual entries carry `"duration": 0`. A placeholder
+  zero is not a measurement — the same rule that keeps a null TSS out of a total — so null, zero and
+  negative now route together to "carries no usable duration, could not be checked", for laps as
+  well as rides.
+- **`get_form` accepted an unbounded window and hung instead of refusing.** "All history" spelled
+  `0001-01-01..9999-12-31` — a plausible guess for a model that has not been told a bound —
+  materialised 3.65 million points. Windows beyond five years are refused with the bound named.
+  Both ends of the walk are bounded now, not just the window: the run-up is capped at ten years
+  (`runup_capped`) and rides dated before 1990 are kept out of it (`excluded_implausible_dates`) —
+  a five-year window ending in 9999 was inside the span cap and still crossed eight thousand years
+  to reach the first stored ride.
+- **A wrongly auto-linked session could not be unlinked.** `link_activity` only ever re-links to
+  another real ride, so a session auto-linked to the wrong activity and actually *missed* fell out
+  of both of `get_week`'s deviation lists at once and `compliance_report` kept answering about that
+  ride. `update_planned_workout(clear=["linked_activity_id"])` is the way back to "nothing was
+  ridden for this".
+- **A race result filed against the wrong event could not be retracted.** A result is three things —
+  status, finish time, ride — and only the debrief was clearable, so an "undone" result left a
+  finish time on an again-upcoming race and a ride still read as that race's training.
+  `clear=["debrief", "finish_time_s", "linked_activity_id"]` retracts all three. Clearing is still
+  not a result, so it never completes an upcoming event.
+- **`get_form`'s tool docstring gave one reason for unscored rides where there are four.** No power
+  and no heart rate is only one of them; power with no FTP on that date, heart rate with no
+  threshold, and no duration are the others — and two of those are fixed by logging an earlier
+  figure, not by importing more rides. Both layers now enumerate all four.
+- **The `clear` documentation named one tool of five.** `docs/tools.md` and `docs/coaching.md` now
+  list each tool's clearable fields, and the profile example is anchored to `update_profile` rather
+  than sitting in a passage about `record_race_result`, where that exact call is refused.
+- **`clear` as a bare string worked in Python and died over MCP.** pydantic does not coerce a scalar
+  to a list, so the coach layer's tolerance was unreachable through the schema — the same
+  disagreement as the round-1 `str | int` ids, fixed the same way: the tool signatures say
+  `str | list[str]`. The sweep for that pattern found one more: `save_planned_workouts` promised
+  that valid sessions are stored when others are refused, while `workouts: list[dict]` had pydantic
+  reject the whole call over one malformed item. It takes `list[Any]` now, so the per-item refusal
+  it documents is reachable.
+
+Also from that review: the offset is split and parsed once rather than twice per timestamp;
+`_clear_notes` replaces the hand-threaded `(cleared, blanked, clearable)` triple and the default
+argument that existed only to be forgotten; the `assert` in `log_hr` is gone in favour of narrowing
+that survives (an `AssertionError` would have escaped `_coach`'s refusal rendering); the
+loop-invariant string build is hoisted out of the strptime loop; the clear-set comments say what the
+criterion actually is — clearable where empty is a state the record can be in, not "free text only";
+`_unscored_warning`'s subject and verb agree for all three callers, as do the lap sentences ("the 1
+timed lap sums to"); and the healed-injury rationale lives in `_stage_clear` alone.
+
 ### Notes
 
 Ingestion is model-mediated by design: Claude fetches from the Garmin MCP and passes the JSON here

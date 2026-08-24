@@ -466,9 +466,11 @@ def test_a_sentinel_timestamp_is_a_rejection_reason_not_an_exception():
     assert "start time" in reason
 
 
-def test_a_sentinel_utc_time_still_keeps_a_readable_local_one():
-    """The local wall clock needs no conversion, so it survives — the row is
-    stored with a null UTC time rather than discarded."""
+def test_a_sentinel_local_time_is_refused_even_though_it_reads_cleanly():
+    """Round 4 caught the sentinels whose UTC conversion overflowed. The local
+    wall clock needs no conversion, so it read fine and stored a ride in year 1
+    — convertible and plausible are different questions, and this one is
+    answered by the date band rather than by an exception."""
     from cycling_mcp.garmin_import import normalize_activity
 
     row, reason = normalize_activity(
@@ -479,9 +481,9 @@ def test_a_sentinel_utc_time_still_keeps_a_readable_local_one():
             "duration": 3600.0,
         }
     )
-    assert reason is None
-    assert row["start_time_utc"] is None
-    assert row["start_time_local"] == "0001-01-01T00:00:00"
+    assert row is None
+    assert "before 1990-01-01" in reason
+    assert "zero-date sentinel" in reason
 
 
 @pytest.mark.parametrize(
@@ -506,7 +508,8 @@ def test_the_hour_only_form_does_not_turn_a_date_into_an_offset():
     whose tail is "-20". `_split_offset` requires a time in front of it."""
     from cycling_mcp.garmin_import import _split_offset, _timestamp
 
-    assert _split_offset("2026-08-20") == ("2026-08-20", None)
+    split = _split_offset("2026-08-20")
+    assert (split.body, split.offset, split.tz) == ("2026-08-20", None, None)
     assert _timestamp("2026-08-20", to_utc=True) == "2026-08-20T00:00:00"
     assert _timestamp("2026-08-20") == "2026-08-20T00:00:00"
 
@@ -568,3 +571,133 @@ def test_the_lap_columns_and_the_lap_aliases_stay_in_step():
     from cycling_mcp.garmin_import import _LAP_ALIASES
 
     assert set(coach._LAP_OUT_FIELDS) == {"lap_index"} | set(_LAP_ALIASES)
+
+
+# --------------------------------------------------------------------------
+# review round 5 — the boundaries of the round 4 fixes
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [10**400, -(10**400), 10**20, float("nan"), float("inf")])
+def test_a_number_too_big_to_be_a_float_is_refused_not_raised(value):
+    """The round-4 guard started one line below `float(value)`, and JSON
+    integers are arbitrary-precision: `float(10**400)` raised OverflowError
+    outside the try and took the whole import call with it."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp(value, to_utc=True) is None
+    assert _timestamp(value) is None
+
+
+def test_an_oversized_epoch_is_a_rejection_reason_not_an_exception():
+    from cycling_mcp.garmin_import import normalize_activity
+
+    row, reason = normalize_activity(
+        {"activityId": 5150, "startTimeGMT": 10**400, "startTimeLocal": 10**400}
+    )
+    assert row is None
+    assert "no readable start time" in reason
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["2026-08-20-05:00", "2026-08-20+02:00", "2026-08-20+02", "2026-08-20+0200"],
+)
+def test_a_bare_date_with_an_offset_is_refused_on_the_native_path(value):
+    """`fromisoformat` on 3.11+ takes any separator, so it read the offset sign
+    as the date/time separator and the offset digits as a clock: a fabricated
+    time of day out of a timezone, naive, with `to_utc` doing nothing. On 3.10
+    the same input rejected, so the corruption was invisible on half the
+    matrix — hence the pair of tests."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp(value, to_utc=True) is None
+    assert _timestamp(value) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["2026-08-20-05:00", "2026-08-20+02:00", "2026-08-20+02", "2026-08-20+0200"],
+)
+def test_a_bare_date_with_an_offset_is_refused_on_the_fallback_path(value, monkeypatch):
+    garmin_import = _strict_fromisoformat(monkeypatch)
+    assert garmin_import._timestamp(value, to_utc=True) is None
+    assert garmin_import._timestamp(value) is None
+
+
+def test_a_bare_date_still_reads_on_both_paths(monkeypatch):
+    """The offset pattern matches inside every date — "2026-08-20" ends in
+    "-20" — so the rejection above must not swallow the date itself."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp("2026-08-20", to_utc=True) == "2026-08-20T00:00:00"
+    garmin_import = _strict_fromisoformat(monkeypatch)
+    assert garmin_import._timestamp("2026-08-20", to_utc=True) == "2026-08-20T00:00:00"
+
+
+@pytest.mark.parametrize(
+    "start_local,start_gmt",
+    [
+        ("0001-01-01T00:00:00-05:00", None),  # converts away from the underflow
+        ("0001-01-01 00:00:00", None),  # naive, never converted at all
+        (None, "0001-01-01T00:00:00-05:00"),
+        ("1899-12-31 00:00:00", None),
+    ],
+)
+def test_a_sentinel_date_is_refused_however_it_reads(start_local, start_gmt):
+    """Round 4 caught only the sentinels whose conversion overflowed. These
+    convert perfectly well and stored a ride in year 1, which then made
+    `get_form` walk two thousand years to reach the real training."""
+    from cycling_mcp.garmin_import import normalize_activity
+
+    item = {"activityId": 5151, "duration": 3600.0}
+    if start_local:
+        item["startTimeLocal"] = start_local
+    if start_gmt:
+        item["startTimeGMT"] = start_gmt
+    row, reason = normalize_activity(item)
+    assert row is None
+    assert "before 1990-01-01" in reason
+
+
+def test_a_ride_dated_in_the_future_is_refused():
+    from cycling_mcp.garmin_import import normalize_activity
+
+    row, reason = normalize_activity(
+        {"activityId": 5152, "startTimeLocal": "2099-01-01 08:00:00", "duration": 3600.0}
+    )
+    assert row is None
+    assert "in the future" in reason
+
+
+def test_today_and_tomorrow_are_still_plausible():
+    """The ceiling carries slop for a device in a timezone ahead of the server;
+    a guard that rejected today's ride would be worse than the bug."""
+    from datetime import date, timedelta
+
+    from cycling_mcp.garmin_import import implausible_date
+
+    today = date(2026, 8, 24)
+    assert implausible_date(today.isoformat(), today=today) is None
+    assert implausible_date((today + timedelta(days=1)).isoformat(), today=today) is None
+    assert implausible_date("1990-01-01", today=today) is None
+    assert implausible_date("1989-12-31", today=today) is not None
+
+
+@pytest.mark.parametrize("value", ["2026-08-20T+02:00", "2026-08-20T+0200", "2026-08-20T-05:00"])
+def test_an_offset_with_no_clock_between_is_refused(value):
+    """The spelling that reaches the pattern loop rather than the guard in
+    `_split_offset`: reading it as midnight in that zone invents the same time
+    of day out of the same digits, one branch over."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp(value, to_utc=True) is None
+    assert _timestamp(value) is None
+
+
+def test_an_offset_with_no_clock_is_refused_on_the_fallback_path_too(monkeypatch):
+    garmin_import = _strict_fromisoformat(monkeypatch)
+    assert garmin_import._timestamp("2026-08-20T+02:00", to_utc=True) is None
+    assert garmin_import._timestamp("2026-08-20T00:00:00+02:00", to_utc=True) == (
+        "2026-08-19T22:00:00"
+    ), "a real midnight with an offset is still an instant"

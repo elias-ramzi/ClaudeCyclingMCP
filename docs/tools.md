@@ -24,22 +24,22 @@ and what it holds.
 | Tool | Does |
 |---|---|
 | `get_profile` | Athlete, current FTP/weight/HR, and a `gaps` list naming everything still unknown. The onboarding agenda. |
-| `update_profile` | Partial update of the athlete fields: availability, equipment, constraints. Blank text is ignored; `clear=[...]` erases. |
+| `update_profile` | Partial update of the athlete fields: availability, equipment, constraints. Blank text is ignored; `clear` erases `display_name`, `availability`, `equipment`, `constraints`. |
 | `log_ftp` | Append a dated FTP, or a 20-minute test converted at 0.95 with the method recorded. |
 | `log_weight` · `log_hr` | Append a dated weight, or threshold / max / resting heart rate. |
 | `get_zones` | Power and HR zones from the figures in effect on a date — not necessarily today's. |
-| `add_event` · `update_event` · `list_events` | Objectives past and future; `list_events` returns the next A-event and the weeks to it. |
-| `record_race_result` | Link the race-day ride, store the finish time and the debrief. Refuses a date mismatch unless forced. |
+| `add_event` · `update_event` · `list_events` | Objectives past and future; `list_events` returns the next A-event and the weeks to it. `update_event` clears `note` (not the name — an event needs one). |
+| `record_race_result` | Link the race-day ride, store the finish time and the debrief. Refuses a date mismatch unless forced. `clear` retracts a result: `debrief`, `finish_time_s`, `linked_activity_id`. |
 | `import_activities` | Raw Garmin MCP output in, idempotent on `activityId`. |
 | `import_activity_laps` | One ride's splits, in execution order. `get_activity_splits`, not the summaries. |
-| `annotate_activity` | RPE, feel, free text — the half of a session no device records. |
+| `annotate_activity` | RPE, feel, free text — the half of a session no device records. `clear` erases `feel`, `note`. |
 | `list_activities` | Date range and sport family, with computed load. |
 | `link_activity` | Attach a ride to a planned session. `auto` proposes but links only when unambiguous. |
 | `save_planned_workouts` | Store sessions as specs. Validates each; refuses an invalid one. |
 | `get_week` | Plan against reality for a range, plus the deviations both ways. |
-| `update_planned_workout` | Status, reschedule, mark pushed, or replace the spec. |
+| `update_planned_workout` | Status, reschedule, mark pushed, or replace the spec. `clear` erases `note` and **unlinks** with `linked_activity_id`. |
 | `compute_load` | TSS per ride against the dated FTP, with an hrTSS fallback that says it is one. |
-| `get_form` | CTL/ATL/TSB on the standard 42/7-day constants. |
+| `get_form` | CTL/ATL/TSB on the standard 42/7-day constants. Five years per call at most; it returns a point per day. |
 | `compliance_report` | One planned session against the ride, block by block where the laps allow. |
 | `export_data` · `import_data` | Full backup with a digest; restore that refuses to overwrite by default. |
 

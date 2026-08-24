@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from .garmin_import import (
+    PLAUSIBLE_DATE_FLOOR,
     as_activity_list,
     as_lap_list,
     local_date_of,
@@ -63,17 +64,40 @@ PUSH_TARGETS = ("garmin", "mywhoosh")
 #: a decision the coach made, and a link is not a reason to reverse it.
 AUTO_COMPLETABLE_STATUSES = ("planned", "pushed")
 
+#: The widest window `get_form` will walk in one call. It steps a day at a time
+#: and returns a point per day, so the bound is on the answer's size as much as
+#: on the work: five years of daily CTL/ATL is already more than any reading
+#: needs, and "all of history" spelled as 0001..9999 is 3.65 million points.
+MAX_FORM_SPAN_DAYS = 1830
+
+#: How far before the window `get_form` will walk to build the CTL entering it.
+#: The span cap alone does not bound the work: the walk starts at the earliest
+#: stored ride, so a five-year window ending in 9999 still crosses eight
+#: thousand years to reach it. Ten years of run-up is far past the ~42 days CTL
+#: needs to stop being dominated by its starting value.
+MAX_FORM_RUNUP_DAYS = 3660
+
 # What each update tool will erase when asked explicitly, via `clear=[...]`.
-# Free text only, and only where empty is a meaning the record can carry: an
-# event's name is NOT NULL and a session without one is not a record, so it is
-# replaced, never emptied. Naming anything outside these is a refusal — a
-# caller clearing the wrong field is destroying something, and must not be told
-# it worked.
+# The criterion is not "free text" — it is that **empty is a meaning the record
+# can carry**. A note nobody wrote, a race with no finish time, a session with
+# no ride linked to it are all real states; an event with no name is not a
+# record at all, and `events.name` is NOT NULL, so a name is replaced rather
+# than emptied. Naming a field outside these is a refusal — a caller clearing
+# the wrong one is destroying something, and must not be told it worked.
 CLEARABLE_PROFILE_FIELDS = ("availability", "constraints", "display_name", "equipment")
 CLEARABLE_EVENT_FIELDS = ("note",)
-CLEARABLE_RESULT_FIELDS = ("debrief",)
+#: A result is three things — the status, the time, the ride — and undoing one
+#: filed against the wrong race means retracting all three. Clearing the
+#: debrief alone left a finish time on an again-upcoming event and a ride still
+#: read as that race's.
+CLEARABLE_RESULT_FIELDS = ("debrief", "finish_time_s", "linked_activity_id")
 CLEARABLE_ACTIVITY_FIELDS = ("feel", "note")
-CLEARABLE_PLANNED_FIELDS = ("note",)
+#: `linked_activity_id` is here because "no ride linked" is the state a
+#: mislinked session has to be able to return to. `link_activity` only ever
+#: re-links to another real ride, so a session auto-linked to the wrong one and
+#: actually missed could never be told apart from one that was ridden: the week
+#: dropped it from both deviation lists at once.
+CLEARABLE_PLANNED_FIELDS = ("linked_activity_id", "note")
 FTP_METHODS = (
     "stated",
     "20min_test",
@@ -193,6 +217,27 @@ def _project(row: sqlite3.Row | dict, fields: tuple[str, ...]) -> dict:
     return projected
 
 
+def _positive(value: float | None) -> float | None:
+    """A duration that is really one, or None for a placeholder.
+
+    Null, zero and negative are the same answer — "this row does not say how
+    long" — and only the first of the three used to be treated that way.
+    `compute_activity_load` has always refused to score a ride on `<= 0`; this
+    is that test, where the comparisons live.
+    """
+    return value if value is not None and value > 0 else None
+
+
+def _plural(count: int, noun: str) -> str:
+    """ "1 lap" / "3 laps" — the count and its noun, agreeing."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _agree(count: int, verb: str) -> str:
+    """The present-tense verb for a subject of `count`: "sums" / "sum"."""
+    return f"{verb}s" if count == 1 else verb
+
+
 def _text(value: Any) -> str | None:
     if value is None:
         return None
@@ -247,9 +292,19 @@ def _stage_clear(
     A field this tool does not own is a refusal, raised, because a caller who
     names the wrong one is trying to erase something and must not be told it
     worked.
+
+    Not only text. The criterion each tool's clearable set encodes is that
+    empty is a state the record can be in: a race with no finish time and no
+    ride linked, a planned session nothing is linked to. Those had the same gap
+    the notes did — `link_activity` re-links but never unlinks, so a session
+    auto-linked to the wrong ride could not be returned to "not ridden".
     """
     if clear is None:
         return []
+    # A bare name is taken as a one-element list. The tool signatures say
+    # `str | list[str]` for the same reason: pydantic will not coerce a scalar
+    # to a list, so a spelling this layer accepts but the schema rejects is a
+    # tool that behaves differently depending on which side you call it from.
     names = [clear] if isinstance(clear, str) else clear
     if not isinstance(names, (list, tuple)):
         raise CoachError(f"clear must be a list of field names, got {type(clear).__name__}")
@@ -264,10 +319,10 @@ def _stage_clear(
         if updates.get(key) is not None:
             # Both an erase and a replacement for one field, in one call. There
             # is no reading of that which is not a mistake, and guessing which
-            # half was meant would either destroy text or ignore an explicit
-            # instruction to destroy it.
+            # half was meant would either destroy the value or ignore an
+            # explicit instruction to destroy it.
             raise CoachError(
-                f"{key} was given both new text and a request to clear it. Pass one or the "
+                f"{key} was given both a new value and a request to clear it. Pass one or the "
                 "other. Nothing was changed."
             )
         updates[key] = None
@@ -287,7 +342,19 @@ def _blank_phrase(blanked: list[str]) -> str:
     return f"{names} {'was' if len(blanked) == 1 else 'were'} given as empty text"
 
 
-def _blank_text_note(blanked: list[str], clearable: tuple[str, ...] = ()) -> dict:
+def _clear_notes(cleared: list[str], blanked: list[str], clearable: tuple[str, ...]) -> dict:
+    """Everything an update has to say about the empty values it was given.
+
+    One call per tool rather than two. The pair was threaded by hand into every
+    update tool, and `_blank_text_note`'s `clearable` argument had a default
+    that existed only for a future caller to forget — at which point a blank
+    field would stop being told how to erase itself, in one tool and not the
+    others.
+    """
+    return {**_cleared_note(cleared), **_blank_text_note(blanked, clearable)}
+
+
+def _blank_text_note(blanked: list[str], clearable: tuple[str, ...]) -> dict:
     """What a blank field did — nothing — said out loud rather than silently."""
     if not blanked:
         return {}
@@ -737,9 +804,14 @@ def _unscored_warning(
     detraining — rather than as an unmeasured one.
     """
     where = f" (ids {', '.join(str(value) for value in ids)})" if ids else ""
+    # `understates` is a subject rather than the object of a relative clause,
+    # so the verb agrees whatever the caller passes: "which therefore
+    # understates" read as agreeing with `total`, and `get_form`'s plural
+    # "these figures" made the sentence ungrammatical.
     return (
         f"{count} {noun[0] if count == 1 else noun[1]} could not be scored{where} and "
-        f"contributed nothing to {total}, which therefore understates {understates}. {pointer}"
+        f"contributed nothing to {total}, so {understates} is understated by an unknown "
+        f"amount. {pointer}"
     )
 
 
@@ -953,11 +1025,10 @@ def update_profile(
     """Set any subset of the athlete fields. Omitted fields are left alone.
 
     So is a field given as empty text: blank never overwrites a stored value,
-    and the response names any field ignored for that reason. To retire a
-    stored note that has stopped being true — a healed injury sitting in
-    `constraints`, routing every future plan around nothing — name it in
-    `clear`: `clear=["constraints"]` empties it and reports `cleared_fields`.
-    Writing "none" instead leaves a constraint string downstream reads as real.
+    and the response names any field ignored for that reason. `clear=[...]` is
+    the explicit erase — `clear=["constraints"]` when the injury heals — and
+    writing "none" instead leaves a constraint string downstream reads as real.
+    See `_stage_clear` for why the erase is a verb.
     """
     updates: dict[str, Any] = {}
     if height_cm is not None:
@@ -993,8 +1064,7 @@ def update_profile(
     return {
         "updated_fields": sorted(updates),
         "athlete": _dict(row),
-        **_cleared_note(cleared),
-        **_blank_text_note(blanked, CLEARABLE_PROFILE_FIELDS),
+        **_clear_notes(cleared, blanked, CLEARABLE_PROFILE_FIELDS),
     }
 
 
@@ -1225,11 +1295,17 @@ def log_hr(
         "in_effect_today": in_effect,
         "is_current": not superseded_fields,
     }
-    # Zones only when this entry could have moved them. A lone resting-HR
-    # entry says nothing about where threshold sits.
-    shows_zones = bool(
-        (values["threshold_hr"] or values["max_hr"]) and on_date and on_date.get("threshold_hr")
-    )
+    # The threshold these zones would be of, or None for "no zones here".
+    # Zones only when this entry could have moved them — a lone resting-HR
+    # entry says nothing about where threshold sits — and only when a threshold
+    # resolves on the entry's own date. Carrying the *value* rather than a
+    # boolean is what lets the branch below read it without re-asserting a
+    # state the gate already decided; an assertion that could never fire would
+    # still have escaped `_coach`'s refusal rendering as an AssertionError if
+    # it ever did.
+    zone_threshold: int | None = None
+    if (values["threshold_hr"] or values["max_hr"]) and on_date:
+        zone_threshold = on_date.get("threshold_hr")
     if superseded_fields:
         # The backdating warning is unconditional; the sentence pointing at the
         # zones is not. It used to promise "the zones below" on a response that
@@ -1244,21 +1320,20 @@ def log_hr(
             )
             + (
                 f". The zones below are the ones in force on {when.isoformat()}, not today's."
-                if shows_zones
+                if zone_threshold
                 else ". It does not change what is in force today — see in_effect_today."
             )
         )
-    if shows_zones:
-        assert on_date is not None
-        result["hr_zones"] = hr_zones(on_date["threshold_hr"])
-        if on_date["threshold_hr_estimated"]:
-            result["threshold_hr_estimated"] = on_date["threshold_hr"]
+    if zone_threshold:
+        result["hr_zones"] = hr_zones(zone_threshold)
+        if (on_date or {}).get("threshold_hr_estimated"):
+            result["threshold_hr_estimated"] = zone_threshold
             # A separate key: `note` may already carry the backdating warning,
             # and reassigning it here dropped the statement that these zones
             # are not the ones in force today.
             result["estimation_note"] = (
                 f"No threshold HR on file for {when.isoformat()}, so these zones use "
-                f"{LTHR_FROM_MAX_HR:.0%} of max HR ({on_date['threshold_hr']} bpm) as an "
+                f"{LTHR_FROM_MAX_HR:.0%} of max HR ({zone_threshold} bpm) as an "
                 "estimate. A measured threshold routinely lands several bpm either side of "
                 "that, and every boundary moves with it."
             )
@@ -1422,8 +1497,7 @@ def update_event(
     return {
         "updated_fields": sorted(updates),
         "stored": _event_out(_dict(stored) or {}),
-        **_cleared_note(cleared),
-        **_blank_text_note(blanked, CLEARABLE_EVENT_FIELDS),
+        **_clear_notes(cleared, blanked, CLEARABLE_EVENT_FIELDS),
     }
 
 
@@ -1514,9 +1588,13 @@ def record_race_result(
     text and is the most valuable thing stored here: pacing, nutrition, where
     it went wrong, what to do differently. `list_events` hands it back the next
     time this event is planned for. An empty debrief is not an erase: blank
-    text never overwrites the stored one — see `_stage_text`. `clear=["debrief"]`
-    is the explicit way to empty one filed against the wrong race, and it is
-    not a result: it never completes an upcoming event.
+    text never overwrites the stored one — see `_stage_text`. `clear=[...]` is
+    the explicit way to empty one, and it is not a result: clearing never
+    completes an upcoming event. A result is three things, so all three are
+    clearable — `clear=["debrief", "finish_time_s", "linked_activity_id"]`
+    retracts one filed against the wrong race entirely. Clearing only the
+    debrief left a finish time on an again-upcoming event and a ride `get_week`
+    still read as that race's.
 
     A call carrying no result at all writes nothing, including the status: an
     upcoming event is completed by a result, not by being asked about.
@@ -1593,8 +1671,7 @@ def record_race_result(
     result: dict[str, Any] = {
         "stored": _event_out(stored or {}),
         "updated_fields": sorted(updates),
-        **_cleared_note(cleared),
-        **_blank_text_note(blanked, CLEARABLE_RESULT_FIELDS),
+        **_clear_notes(cleared, blanked, CLEARABLE_RESULT_FIELDS),
     }
     if "status" not in updates:
         result["status_unchanged"] = (
@@ -1831,7 +1908,10 @@ def import_activity_laps(
             )
         ]
 
-    timed = [lap for lap in stored if lap["duration_s"] is not None]
+    # A stored 0 counts as untimed, not as a zero-length lap: it is the same
+    # placeholder the ride's own duration can carry, and adding it to the sum
+    # would understate the total and manufacture a shortfall against the ride.
+    timed = [lap for lap in stored if _positive(lap["duration_s"]) is not None]
     total = sum(lap["duration_s"] for lap in timed)
     untimed = len(stored) - len(timed)
     result: dict[str, Any] = {
@@ -1848,7 +1928,15 @@ def import_activity_laps(
     # only add time, so a partial sum already past the activity's duration is a
     # mismatch no missing lap can explain, and suppressing that let a genuine
     # wrong-ride import through in silence.
-    ride_seconds = activity.get("duration_s")
+    # A stored zero goes with the null, not with the real durations. Manual
+    # entries and thin payloads carry `"duration": 0` and the importer stores
+    # the 0 as given, so reading it as a length made the ride's own splits get
+    # accused of belonging to a different ride — the zero-versus-null rule one
+    # comparison over: a placeholder zero is not a measurement, and comparing
+    # against it manufactures the deviation. Anything at or below zero, in
+    # fact, which is the same test `compute_activity_load` applies before it
+    # will score a ride.
+    ride_seconds = _positive(activity.get("duration_s"))
     overshoot = ride_seconds is not None and total - ride_seconds > 60
     shortfall = ride_seconds is not None and ride_seconds - total > 60
     if untimed:
@@ -1858,8 +1946,8 @@ def import_activity_laps(
     # absence as verification is the failure this key exists to prevent.
     if ride_seconds is None:
         result["duration_check"] = (
-            f"the activity carries no duration, so the {round(total)} s of laps could not be "
-            "checked against it."
+            f"the activity carries no usable duration, so the {round(total)} s of laps could "
+            "not be checked against it."
         )
     elif untimed:
         result["duration_check"] = (
@@ -1873,13 +1961,13 @@ def import_activity_laps(
         )
     else:
         result["duration_check"] = (
-            f"the {len(timed)} lap{'' if len(timed) == 1 else 's'} sum to {round(total)} s "
+            f"the {_plural(len(timed), 'lap')} {_agree(len(timed), 'sum')} to {round(total)} s "
             f"against the activity's {round(ride_seconds)} s"
             + ("." if not (overshoot or shortfall) else " — see warning.")
         )
     if overshoot or (shortfall and not untimed):
         result["warning"] = (
-            f"the {len(timed)} timed lap{'' if len(timed) == 1 else 's'} sum to "
+            f"the {_plural(len(timed), 'timed lap')} {_agree(len(timed), 'sum')} to "
             f"{round(total)} s but the activity is {round(ride_seconds)} s. Either these "
             "splits belong to a different ride, or the file has gaps the splits do not cover."
         )
@@ -1926,8 +2014,7 @@ def annotate_activity(
     return {
         "updated_fields": sorted(updates),
         "stored": _project(stored, _ACTIVITY_OUT_FIELDS),
-        **_cleared_note(cleared),
-        **_blank_text_note(blanked, CLEARABLE_ACTIVITY_FIELDS),
+        **_clear_notes(cleared, blanked, CLEARABLE_ACTIVITY_FIELDS),
     }
 
 
@@ -2023,7 +2110,11 @@ def link_activity(
     `planned` or `pushed`. A session the coach marked `skipped` or `missed`
     keeps that status and the response says so: a matching ride is evidence
     about the ride, not a reversal of the decision. An already-`completed`
-    session is simply re-linked, which is how a mislink is corrected.
+    session is simply re-linked, which corrects a mislink *to another ride*.
+    When the right answer is no ride at all — auto-link took the only activity
+    on the day and the session was actually missed — re-linking cannot say so:
+    unlink with `update_planned_workout(clear=["linked_activity_id"])`, then
+    set the status the session deserves.
     """
     with open_db() as conn:
         planned = _dict(
@@ -2271,7 +2362,11 @@ def update_planned_workout(
 
     Replacing `spec` re-validates it and refuses an invalid one, exactly as
     `save_planned_workouts` does. A blank `note` is ignored rather than stored;
-    `clear=["note"]` empties it.
+    `clear=["note"]` empties it, and `clear=["linked_activity_id"]` unlinks the
+    ride — the one way back to "nothing was ridden for this" once auto-link has
+    guessed wrong. Without it a session linked to the wrong ride and then
+    marked `missed` fell out of both of `get_week`'s deviation lists at once,
+    and `compliance_report` kept answering about that ride forever.
     """
     updates: dict[str, Any] = {}
     if status is not None:
@@ -2281,9 +2376,12 @@ def update_planned_workout(
     if pushed_to is not None:
         updates["pushed_to"] = _one_of(pushed_to, PUSH_TARGETS, "pushed_to")
     blanked = _stage_text(updates, {"note": note})
-    cleared = _stage_clear(updates, clear, CLEARABLE_PLANNED_FIELDS, blanked)
     if linked_activity_id is not None:
         updates["linked_activity_id"] = int(linked_activity_id)
+    # After every field is staged, so that asking to set and to clear the same
+    # one is caught as the contradiction it is rather than silently resolved by
+    # whichever line ran last.
+    cleared = _stage_clear(updates, clear, CLEARABLE_PLANNED_FIELDS, blanked)
 
     warnings: list[str] = []
     if spec is not None:
@@ -2306,7 +2404,10 @@ def update_planned_workout(
         ).fetchone()
         if row is None:
             raise CoachError(f"no planned workout with id {planned_workout_id}")
-        if "linked_activity_id" in updates:
+        if updates.get("linked_activity_id") is not None:
+            # Only a link *to* something needs a ride to exist. Clearing the
+            # column stages a None, and looking that up would refuse the unlink
+            # with "pass either activity_id or garmin_activity_id".
             _find_activity(conn, athlete_id, updates["linked_activity_id"], None)
         assignments = ", ".join(f"{key} = ?" for key in updates)
         conn.execute(
@@ -2323,8 +2424,7 @@ def update_planned_workout(
         "updated": True,
         "updated_fields": sorted(updates),
         "planned_workout": _planned_summary(stored or {}),
-        **_cleared_note(cleared),
-        **_blank_text_note(blanked, CLEARABLE_PLANNED_FIELDS),
+        **_clear_notes(cleared, blanked, CLEARABLE_PLANNED_FIELDS),
     }
     if warnings:
         result["spec_warnings"] = warnings
@@ -2680,11 +2780,20 @@ def get_form(
     weeks old has a CTL that says more about the import date than about them.
     Pass `seed_ctl`/`seed_atl` if better starting values are known.
 
-    A ride that could not be scored — no power, no heart rate, or a date before
-    the first FTP on file — contributes nothing, so its day steps as though it
-    were a rest day. No load is invented for it; instead `unscored` and
-    `unscored_warning` say how many there were, because a season with a dozen
-    of them produces a declining CTL indistinguishable from detraining.
+    At most five years (`MAX_FORM_SPAN_DAYS`) in one call: this walks a day at
+    a time and returns a point for each, so an unbounded "all history" window
+    is a hang rather than an answer. A wider range is refused with the bound
+    named.
+
+    A ride that could not be scored contributes nothing, so its day steps as
+    though it were a rest day. `compute_activity_load` leaves a TSS null for
+    four distinct reasons — no power and no heart rate; power but no FTP in
+    effect on that date; heart rate but no threshold HR; no duration — and two
+    of them are fixed by logging an earlier figure rather than by importing
+    more rides, which is why the count is reported rather than explained away.
+    No load is invented for it; instead `unscored` and `unscored_warning` say
+    how many there were, because a season with a dozen of them produces a
+    declining CTL indistinguishable from detraining.
 
     **Cross-check this against the Garmin MCP's `get_training_load_trend`.**
     Garmin computes from every activity it holds, this from what has been
@@ -2697,11 +2806,30 @@ def get_form(
     last = parse_date(end, "end")
     if last < first:
         raise CoachError(f"end ({end}) is before start ({start})")
+    # Unlike `get_week`, which is a SQL BETWEEN, this walks one day at a time
+    # and materialises a point per day. "All history" spelled as
+    # 0001-01-01..9999-12-31 — a plausible guess for a model that has not been
+    # told a bound — is 3.65 million of them: not slow, hung. A window nobody
+    # would ask for on purpose is a refusal with the bound named in it.
+    span = (last - first).days + 1
+    if span > MAX_FORM_SPAN_DAYS:
+        raise CoachError(
+            f"{start}..{end} is {span} days; get_form covers at most {MAX_FORM_SPAN_DAYS} "
+            f"({MAX_FORM_SPAN_DAYS // 365} years) in one call, because it steps a day at a "
+            "time and returns a point for each. Ask for the range you mean to read."
+        )
+
+    # The walk is bounded at both ends: the window by the span cap above, the
+    # run-up by this. Together they cap the number of days stepped whatever
+    # dates arrive, from the caller or from a stored row.
+    runup_floor = max(first - timedelta(days=MAX_FORM_RUNUP_DAYS), PLAUSIBLE_DATE_FLOOR)
 
     daily: dict[date, float] = {}
     methods: dict[str, int] = {}
     earliest: date | None = None
     unscored = 0
+    implausible: list[str] = []
+    capped = 0
     with open_db() as conn:
         history = History(conn, athlete_id)
         for row in conn.execute(
@@ -2711,7 +2839,20 @@ def get_form(
         ):
             activity = _dict(row) or {}
             day = parse_date(activity["local_date"], "local_date")
-            earliest = day if earliest is None else min(earliest, day)
+            if PLAUSIBLE_DATE_FLOOR <= day < runup_floor:
+                # Real training, just too far back to be worth walking to. It
+                # is counted so the response can say the run-up was cut, rather
+                # than reporting a shorter history than the log holds.
+                capped += 1
+            elif day < PLAUSIBLE_DATE_FLOOR:
+                # Import refuses these now, but a row stored before that rule
+                # existed would still drag `earliest` — and with it the walk —
+                # back to year 1. The run-up starts at the first date that
+                # could be a training date; the ride is still scored on its own
+                # day, which is outside every window anyone will ask for.
+                implausible.append(activity["local_date"])
+            else:
+                earliest = day if earliest is None else min(earliest, day)
             load = _activity_load(history, activity)
             methods[load.method] = methods.get(load.method, 0) + 1
             if load.tss is not None:
@@ -2724,6 +2865,8 @@ def get_form(
                 # here; saying it is missing is the whole of the fix.
                 unscored += 1
 
+    # The walk starts at the earliest day inside both bounds, never before it.
+    daily = {day: tss for day, tss in daily.items() if day >= runup_floor}
     points = form_series(daily, first, last, seed_ctl=seed_ctl, seed_atl=seed_atl)
     runup_days = (first - earliest).days if earliest else 0
 
@@ -2748,6 +2891,23 @@ def get_form(
             "needs about 42 to stop being dominated by its starting value. These figures are "
             "an underestimate — import more history, or pass seed_ctl/seed_atl."
         )
+    if capped:
+        result["runup_capped"] = (
+            f"{_plural(capped, 'ride')} {_agree(capped, 'sit')} more than "
+            f"{MAX_FORM_RUNUP_DAYS} days before {first.isoformat()} and did not feed the CTL "
+            "entering this window. Nothing needs that much run-up — 42 days is where CTL stops "
+            "depending on where it started — but it means these figures are not built from the "
+            "whole log."
+        )
+    if implausible:
+        result["excluded_implausible_dates"] = sorted(set(implausible))
+        result["excluded_implausible_note"] = (
+            f"{_plural(len(implausible), 'stored ride')} "
+            f"{_agree(len(implausible), 'carry')} a date before "
+            f"{PLAUSIBLE_DATE_FLOOR.isoformat()} and was left out of the run-up: a sentinel "
+            "date would otherwise start the walk two thousand years early. Import refuses "
+            "these now; these rows predate that."
+        )
     if unscored:
         result["unscored"] = unscored
         result["unscored_warning"] = _unscored_warning(
@@ -2755,9 +2915,8 @@ def get_form(
             ("activity", "activities"),
             "these figures",
             "An unscored ride's day is stepped as though it were a rest day, so CTL and ATL "
-            f"read low by an unknown amount. Counted over every ride up to {last.isoformat()}, "
-            "because the CTL entering the window is built from the run-up. compute_load says "
-            "why, per ride.",
+            f"read low. Counted over every ride up to {last.isoformat()}, because the CTL "
+            "entering the window is built from the run-up. compute_load says why, per ride.",
             understates="the load behind them",
         )
     if methods.get("hr"):
