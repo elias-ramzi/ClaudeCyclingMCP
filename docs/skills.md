@@ -1,11 +1,11 @@
 # Skills
 
-The bundled upload procedures: what each does, how it reaches a client, and what it needs to actually run.
+The bundled procedures: what each does, how it reaches a client, and what it needs to actually run.
 
 
-Two bundled skills in [`.claude/skills/`](../.claude/skills), each triggering on
-descriptions of a session — "create", "add", "send", "put it on" — not only on
-"upload".
+Four bundled skills in [`.claude/skills/`](../.claude/skills), each triggering
+on how the request actually arrives — "create", "add", "send", "put it on",
+"what am I doing this week" — not only on "upload".
 
 - **[`garmin-upload`](../.claude/skills/garmin-upload/SKILL.md)** — renders, uploads
   via the Garmin MCP's `upload_workout`, then verifies by fetching the workout
@@ -17,6 +17,20 @@ descriptions of a session — "create", "add", "send", "put it on" — not only 
   `.zwo` are right by construction. Each step states what it expects to see, so
   a run that breaks after a MyWhoosh redesign reports which assumption failed
   instead of silently producing nothing.
+- **[`coaching`](../.claude/skills/coaching/SKILL.md)** — how to coach an athlete
+  with this server's [coach layer](coaching.md): the onboarding interview,
+  driven by whatever the profile is still missing rather than by a hardcoded
+  script; the weekly loop of reading reality before asking about it, comparing
+  it to the plan, then writing the next week; and the adaptation rules that
+  make it a plan rather than a template. It is generic — no athlete's facts are
+  in it — and it always proposes rather than pushing.
+- **[`nutrition`](../.claude/skills/nutrition/SKILL.md)** — how to coach eating
+  with this server's [nutrition layer](nutrition.md): seeding a food base from
+  whatever the athlete already tracks, the daily logging loop where "can I eat
+  X?" is answered by subtraction rather than by a yes or a no, and the fuelling
+  rules around big sessions and races. Equally generic — the athlete's own
+  foods, portions and preparation quirks belong in their database, where they
+  can be corrected, not in a skill that ships to everyone.
 
 ## Two ways a skill runs
 
@@ -46,6 +60,7 @@ but it can only finish if its dependencies are present:
 |---|---|
 | `garmin-upload` | this server + the Garmin Connect MCP |
 | `mywhoosh-upload` | this server + browser control (Claude in Chrome) |
+| `coaching` | this server + the Garmin Connect MCP (to read the athlete's data) |
 
 So the Garmin path is portable to any client with both MCP servers connected,
 while the MyWhoosh path only works where a browser is drivable. In a client

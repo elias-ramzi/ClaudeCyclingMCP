@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from .render_garmin import target_band_watts
 from .spec import Block, Repeat, Workout, format_duration
+from .training import training_stress_score
 
 # A free-ride block has no target, so it cannot contribute a real number. It is
 # scored at this fraction of FTP so the totals stay meaningful, and any workout
@@ -92,7 +93,10 @@ def compute_metrics(workout: Workout) -> Metrics:
     total = len(samples)
     np_watts = normalised_power(samples)
     intensity = np_watts / workout.ftp if workout.ftp else 0.0
-    tss = (total / 3600.0) * intensity**2 * 100.0
+    # The same function that scores a ride. compliance_report puts a plan's TSS
+    # beside an activity's, and two copies of this formula would make that
+    # comparison a report on the arithmetic rather than on the session.
+    tss = training_stress_score(total, intensity)
     average = sum(samples) / total if total else 0.0
     return Metrics(
         total_seconds=total,
