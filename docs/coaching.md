@@ -421,10 +421,11 @@ next migration.
 | 1 | `athlete`, `ftp_history`, `weight_history`, `hr_history`, `activities`, `activity_laps` |
 | 2 | `events`, `planned_workouts`, and the subjective columns (`rpe`, `feel`, `note`) on `activities` |
 | 3 | `flags_json` on `activities` — the import's data-quality notes, kept rather than reported once |
+| 4 | `gender` on `athlete`, and the [nutrition layer](nutrition.md)'s tables: `nutrition_goals`, `ingredients`, `meals`, `meal_items`, `food_log`, `daily_targets` |
 
 Every table carries an `athlete_id`, defaulting to `1`. One athlete is the whole use case today; the
 column exists so adding a second is a schema no-op rather than a rewrite.
 
 ---
 
-Back to the [README](../README.md) · the [tool reference](tools.md) · the [skills](skills.md).
+Back to the [README](../README.md) · the [tool reference](tools.md) · the [nutrition layer](nutrition.md) · the [skills](skills.md).

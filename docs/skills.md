@@ -1,9 +1,9 @@
 # Skills
 
-The bundled upload procedures: what each does, how it reaches a client, and what it needs to actually run.
+The bundled procedures: what each does, how it reaches a client, and what it needs to actually run.
 
 
-Three bundled skills in [`.claude/skills/`](../.claude/skills), each triggering
+Four bundled skills in [`.claude/skills/`](../.claude/skills), each triggering
 on how the request actually arrives — "create", "add", "send", "put it on",
 "what am I doing this week" — not only on "upload".
 
@@ -24,6 +24,13 @@ on how the request actually arrives — "create", "add", "send", "put it on",
   it to the plan, then writing the next week; and the adaptation rules that
   make it a plan rather than a template. It is generic — no athlete's facts are
   in it — and it always proposes rather than pushing.
+- **[`nutrition`](../.claude/skills/nutrition/SKILL.md)** — how to coach eating
+  with this server's [nutrition layer](nutrition.md): seeding a food base from
+  whatever the athlete already tracks, the daily logging loop where "can I eat
+  X?" is answered by subtraction rather than by a yes or a no, and the fuelling
+  rules around big sessions and races. Equally generic — the athlete's own
+  foods, portions and preparation quirks belong in their database, where they
+  can be corrected, not in a skill that ships to everyone.
 
 ## Two ways a skill runs
 

@@ -13,8 +13,8 @@ What the server exposes, and the format details each renderer is pinned to.
 | `verify_garmin_upload` | Compares a sent payload against what `get_workout_by_id` returns. Pure. |
 | `verify_mywhoosh_import` | Compares a scraped MyWhoosh builder header against the rendered session, including the pre-import snapshot that catches a silent no-op. Pure. |
 | `verify_mywhoosh_library_entry` | Checks a MyWhoosh library card against the exported session, in the card's own formats. The credit is already spent, so this says what it bought. Pure. |
-| `server_info` | Version, package path, skills served, and the coaching database's path and schema version. A tool surface dates a session; this makes the build sayable in one call. Reports the database without creating it. |
-| `get_skill` | Fetch a bundled procedure by name — the two upload flows or `coaching` — so a model asked to "use the mywhoosh-upload skill" can retrieve it. |
+| `server_info` | Version, package path, skills served, and the database's path and schema version. A tool surface dates a session; this makes the build sayable in one call. Reports the database without creating it. |
+| `get_skill` | Fetch a bundled procedure by name — the two upload flows, `coaching` or `nutrition` — so a model asked to "use the mywhoosh-upload skill" can retrieve it. |
 | `spec_schema` | The spec's JSON schema and authoring notes. |
 
 Those are pure: nothing is stored, and the same inputs always give the same answer. The tools below
@@ -98,6 +98,24 @@ Emitted shape, per step:
 - No heart-rate target is ever emitted.
 
 
+The tools below are the nutrition layer, in the same database and for the same athlete — see
+[the nutrition layer](nutrition.md).
+
+| Tool | Does |
+|---|---|
+| `add_ingredients` | Bulk-add foods, per-100 g. Per-item accept or reject with the reason; built for pasting a whole food base. |
+| `update_ingredient` | Correct one food. Already-logged entries keep the macros and cost they were logged with. |
+| `search_ingredients` | Find a food by name or alias, blind to accents and casing. Omit the query to list the base. |
+| `save_meal` · `list_meals` | Standard meals as ingredients and grams. Macros are computed from current rows, never stored. |
+| `log_food` | One row per ingredient, macros and cost frozen at log time. Unresolvable names are rejected with near-matches, never guessed. |
+| `log_meal` | A standard meal expanded into its ingredients, with per-ingredient `overrides` and `extras`. |
+| `edit_log_entry` · `delete_log_entry` | Correct a quantity, slot, date or note; or remove an entry. |
+| `set_goal` · `close_goal` · `get_goal` | The active goal — type, target, milestone, signed rate. Setting a new one closes the previous. |
+| `suggest_targets` | Proposes kcal/protein/fibre from BMR, the day's training and the goal, showing every intermediate. Stores nothing. |
+| `confirm_targets` | Files the targets, as `confirmed` or `overridden`. Refuses anything below computed BMR. |
+| `day_summary` | The bilan: entries per slot grouped by meal, totals, targets, and what remains. |
+| `week_summary` | Daily rows, weekly averages against targets, the 7-day weight trend, and the food cost. |
+
 ## Coach-layer notes
 
 - **FTP is resolved per ride, not globally.** Every load number uses the FTP entry in effect on that
@@ -118,7 +136,33 @@ Emitted shape, per step:
 - **Nothing is pushed automatically.** The coach tools store and compute; uploading still goes
   through `render_garmin` / `render_zwo` and the upload skills, with a human in the loop.
 
-Full detail, including every formula and its limits: [the coach layer](coaching.md).
+## Nutrition-layer notes
+
+- **The server does every gram of the arithmetic.** Macro sums, running totals, BMR, the remainder,
+  the weekly average. Nothing above it should be adding food up.
+- **A log entry is frozen; a meal is not.** An entry stores the macros and cost computed at log
+  time, so correcting an ingredient never rewrites a day already eaten. A meal stores only
+  ingredients and grams, so its macros follow every correction. A log entry is a measurement; a
+  meal is a recipe.
+- **A name resolves exactly or not at all.** An exact match on the folded name or on any alias, or
+  a refusal carrying near-matches. A fuzzy hit taken as exact logs the wrong food and reads as a
+  perfectly ordinary day afterwards.
+- **Raw and cooked are different ingredients.** 100 g of dry rice is ~350 kcal; the same rice cooked
+  is ~130. `state` records which, and storing a `raw` one returns a warning.
+- **Incomplete proteins count in kcal and never in protein.** `counts_toward_protein: false`. They
+  are shown in every summary with the excluded grams named.
+- **Estimates are never priced.** A restaurant plate contributes calories and no cost, and every
+  summary says how many entries could not be priced — a total treating them as free is a wrong one.
+- **Targets are suggestions until confirmed**, and never below computed BMR: `suggest_targets`
+  clamps, `confirm_targets` refuses.
+- **Day type comes from the training tables**, not from a question. An event makes its date `race`
+  and the day before `race_eve`; a long or hard ride makes it `big_session`. On those days the
+  goal's deficit is withheld, and the response says how much was withheld.
+- **The deficit is judged on the weekly average**, and the weight on the 7-day moving average of
+  morning weigh-ins. A day with nothing logged is unlogged, not a zero-calorie day.
+
+Full detail, including every formula and its limits: [the coach layer](coaching.md) and
+[the nutrition layer](nutrition.md).
 
 ---
 

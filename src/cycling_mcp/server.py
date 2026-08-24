@@ -1,15 +1,17 @@
 """MCP server: author a cycling workout once, render it for both platforms.
 
-Two layers. The renderers and verifiers are pure and deterministic — a spec in,
-a file or a comparison out, nothing stored. The coach layer above them keeps the
-athlete's file in a local SQLite database: profile, dated FTP/weight/HR history,
-objectives, imported activities, planned sessions, and the load arithmetic over
-all of it.
+Three layers. The renderers and verifiers are pure and deterministic — a spec
+in, a file or a comparison out, nothing stored. The coach layer above them keeps
+the athlete's file in a local SQLite database: profile, dated FTP/weight/HR
+history, objectives, imported activities, planned sessions, and the load
+arithmetic over all of it. The nutrition layer sits beside the coach layer in
+the same database: the ingredient base, standard meals, the food log, and
+targets computed from the athlete's profile *and* that date's training.
 
 Neither layer makes a network call or holds a credential. Activities reach this
 server because the model fetched them from the Garmin MCP and passed them in;
 uploads leave it the same way, through the bundled skills, with a human in the
-loop — see `.claude/skills/garmin-upload`, `mywhoosh-upload` and `coaching`.
+loop — see `.claude/skills/garmin-upload`, `mywhoosh-upload`, `coaching` and `nutrition`.
 
 Filesystem access is limited to the coaching database and to explicit `out_path`
 writes. `server_info` reports where that database is.
@@ -28,10 +30,11 @@ try:  # mcp SDK 2.x
 except ImportError:  # mcp SDK 1.x, where the same class is called FastMCP
     from mcp.server.fastmcp import FastMCP as _Server
 
-from . import __version__, coach
+from . import __version__, coach, nutrition
 from .coach import CoachError
 from .garmin_import import GarminPayloadError
 from .metrics import compute_metrics, describe
+from .nutrition import NutritionError
 from .render_garmin import render_garmin as _render_garmin
 from .render_zwo import render_zwo as _render_zwo
 from .render_zwo import zwo_filename
@@ -786,7 +789,7 @@ def server_info() -> str:
 
 @app.tool()
 def get_skill(name: str | None = None) -> str:
-    """Fetch a bundled procedure by name: the two upload flows, or coaching.
+    """Fetch a bundled procedure by name: the upload flows, coaching, or nutrition.
 
     Read `garmin-upload` or `mywhoosh-upload` before uploading, scheduling or
     exporting a rendered cycling workout — a .zwo to MyWhoosh, or a Garmin
@@ -797,6 +800,11 @@ def get_skill(name: str | None = None) -> str:
     than about one workout file: what to do this week, a session they missed, a
     race they are building toward. It covers the onboarding interview, the
     weekly loop, and the adaptation rules.
+
+    Read `nutrition` when they are talking about food or weight: what they ate,
+    where the day stands, whether something fits, a meal idea, a restaurant, or
+    fuelling around a race. It covers seeding the food base, the daily logging
+    loop, and why a big session is not a deficit day.
 
     Call this whenever you are asked to follow, use, or run one of this
     server's skills by name — for example "use the mywhoosh-upload skill" — or
@@ -813,8 +821,9 @@ def get_skill(name: str | None = None) -> str:
     which is what this tool is for.
 
     The upload skills stop and ask before doing anything irreversible — a
-    MyWhoosh export spends a finite slot credit — and `coaching` proposes a
-    week rather than pushing it. Follow them as written rather than summarising
+    MyWhoosh export spends a finite slot credit — `coaching` proposes a week
+    rather than pushing it, and `nutrition` proposes targets rather than
+    filing them. Follow them as written rather than summarising
     them.
     """
     skills = load_skills()
@@ -895,7 +904,7 @@ def _coach(function, **kwargs) -> str:
                 "hint": "Restore from an export_data backup, or repair the row by hand.",
             }
         )
-    except (CoachError, StoreError, GarminPayloadError, ValueError) as exc:
+    except (CoachError, NutritionError, StoreError, GarminPayloadError, ValueError) as exc:
         return _dump({"ok": False, "error": str(exc)})
     except sqlite3.Error as exc:
         # A database that cannot be read is the caller's problem to act on —
@@ -916,6 +925,16 @@ def _coach(function, **kwargs) -> str:
         # is reported as a success.
         raise RuntimeError(f"{function.__name__} returned its own 'ok' key; it should raise")
     return _dump({"ok": True, **result})
+
+
+def _nutrition(function, **kwargs) -> str:
+    """Run a nutrition operation. Same contract as `_coach`, same reasons.
+
+    Separate only because the two modules raise different refusal types; a
+    refusal here — an unresolvable ingredient name, a target under BMR — is an
+    answer the caller acts on, not a crash.
+    """
+    return _coach(function, **kwargs)
 
 
 @app.tool()
@@ -943,6 +962,7 @@ def update_profile(
     display_name: str | None = None,
     height_cm: float | None = None,
     birth_year: int | None = None,
+    gender: str | None = None,
     availability: str | None = None,
     equipment: str | None = None,
     constraints: str | None = None,
@@ -965,6 +985,11 @@ def update_profile(
     - `constraints` — injuries, travel, shift work, anything the plan has to
       route around.
 
+    `gender` ("male", "female", "other") is asked for by the nutrition layer
+    alone: Mifflin-St Jeor's male and female constants differ by 166 kcal/day,
+    which is more than a meal, so it is not something to assume. It has no
+    effect on any training number.
+
     Empty text is ignored, never stored: passing `constraints=""` leaves the
     stored constraint exactly as it was. To retire one that has stopped being
     true — the collarbone healed — pass `clear=["constraints"]`, which empties
@@ -979,6 +1004,7 @@ def update_profile(
         display_name=display_name,
         height_cm=height_cm,
         birth_year=birth_year,
+        gender=gender,
         availability=availability,
         equipment=equipment,
         constraints=constraints,
@@ -1689,6 +1715,503 @@ def import_data(data: dict, force: bool = False, expected_digest: str | None = N
     Export from a newer schema than this build knows is refused outright.
     """
     return _coach(coach.import_data, data=data, force=force, expected_digest=expected_digest)
+
+
+# --------------------------------------------------------------------------
+# the nutrition layer
+#
+# Same database, same athlete. These do every gram of the arithmetic — macro
+# sums, running totals, BMR, the day's remainder — so nothing downstream has to
+# add numbers in its head. The coaching over the answers lives in the bundled
+# `nutrition` skill.
+# --------------------------------------------------------------------------
+
+
+@app.tool()
+def add_ingredients(ingredients: list | dict) -> str:
+    """Add foods to the athlete's ingredient base, in bulk. Per-item accept or reject.
+
+    Built for onboarding: ask the athlete to paste whatever food base they
+    already keep and pass the lot in one call. One malformed row does not lose
+    the rest — every rejection comes back with the reason and nothing was
+    written for it.
+
+    Each item: `name`, `kcal_100g`, `protein_100g`, `fiber_100g` are required;
+    `aliases` (a list, or a comma-separated string) is what makes terse logging
+    work — "skyr" resolving to "Skyr nature 0%". Optional: `carbs_100g`,
+    `fat_100g`, `sat_fat_100g`, `sugar_100g`, `salt_100g`, and leaving them out
+    is expected rather than sloppy: many packets print four numbers.
+
+    **Everything is per 100 g, never per portion.** The portion goes in
+    `default_portion_g` with a `portion_label` ("1 pot = 200 g", "1 egg ~ 55 g")
+    so `portions: 1` has a meaning. Mixing the two is what turns an egg into
+    155 kcal.
+
+    `state` is `raw`, `cooked` or `as_sold`, and it matters more than it looks:
+    100 g of dry rice is ~350 kcal and the same rice cooked is ~130. Both are
+    "rice, 100 g" to someone weighing a bowl. Store the form the athlete
+    actually weighs, and the response warns when you store a raw one.
+
+    `counts_toward_protein: false` is for incomplete proteins — collagen and
+    the like. They count in full toward calories and never toward the protein
+    target, because hitting a protein number with a powder that does not do
+    protein's job is hitting nothing.
+
+    `note` is where the athlete's own know-how goes: "weigh it, this is where
+    eyeballing drifts", a rice-cooker water ratio, which shop it comes from.
+    `package_price` with `package_weight_g` gives the cost per 100 g that the
+    weekly food cost is built from.
+
+    A name already stored is reported as a duplicate, not overwritten — use
+    `update_ingredient` for that.
+    """
+    return _nutrition(nutrition.add_ingredients, items=ingredients)
+
+
+@app.tool()
+def update_ingredient(
+    ingredient_id: int | None = None,
+    name: str | None = None,
+    new_name: str | None = None,
+    aliases: list | str | None = None,
+    kcal_100g: float | None = None,
+    protein_100g: float | None = None,
+    fiber_100g: float | None = None,
+    carbs_100g: float | None = None,
+    fat_100g: float | None = None,
+    sat_fat_100g: float | None = None,
+    sugar_100g: float | None = None,
+    salt_100g: float | None = None,
+    state: str | None = None,
+    default_portion_g: float | None = None,
+    portion_label: str | None = None,
+    package_price: float | None = None,
+    package_weight_g: float | None = None,
+    counts_toward_protein: bool | None = None,
+    note: str | None = None,
+) -> str:
+    """Correct a stored ingredient. Only the fields given change.
+
+    **This never rewrites history.** Every food_log entry froze its macros and
+    its cost at the moment it was logged, so correcting a mistyped protein
+    figure or a price that went up changes what happens from now on and leaves
+    every day already eaten exactly as it was. The response says how many
+    existing entries kept their old figures. That is deliberate: a day that has
+    been lived is a measurement, not a view over current data.
+
+    Identify by `ingredient_id`, or by `name` — which resolves exactly, the same
+    way logging does. `new_name` renames.
+    """
+    return _nutrition(
+        nutrition.update_ingredient,
+        ingredient_id=ingredient_id,
+        name=name,
+        new_name=new_name,
+        **{
+            key: value
+            for key, value in {
+                "aliases": aliases,
+                "kcal_100g": kcal_100g,
+                "protein_100g": protein_100g,
+                "fiber_100g": fiber_100g,
+                "carbs_100g": carbs_100g,
+                "fat_100g": fat_100g,
+                "sat_fat_100g": sat_fat_100g,
+                "sugar_100g": sugar_100g,
+                "salt_100g": salt_100g,
+                "state": state,
+                "default_portion_g": default_portion_g,
+                "portion_label": portion_label,
+                "package_price": package_price,
+                "package_weight_g": package_weight_g,
+                "counts_toward_protein": counts_toward_protein,
+                "note": note,
+            }.items()
+            if value is not None
+        },
+    )
+
+
+@app.tool()
+def search_ingredients(query: str | None = None, limit: int = 25) -> str:
+    """Find a stored food by name or alias. Accent- and case-insensitive.
+
+    Use this to check whether something is already in the base before adding it
+    twice, and to find the exact name when a log entry was rejected as
+    unresolvable. Omit `query` to list the whole base — which is what to do
+    after a bulk paste, to show the athlete what landed.
+
+    This lookup is allowed to be approximate; logging is not. `log_food`
+    accepts an exact name or alias only, so a partial match here is a name to
+    confirm, not one to log with.
+    """
+    return _nutrition(nutrition.search_ingredients, query=query, limit=limit)
+
+
+@app.tool()
+def save_meal(
+    name: str,
+    items: list | dict,
+    default_for_slot: str | None = None,
+    note: str | None = None,
+) -> str:
+    """Store a standard meal: a name and its ingredients with their grams.
+
+    `items` is a list of `{"ingredient": "skyr", "grams": 200}` — or `portions`
+    where the ingredient carries a default portion. Save the athlete's real
+    recurring meals during onboarding, starting with the default breakfast:
+    that one meal turns the most-repeated logging of the week into one call.
+
+    `default_for_slot` ("breakfast", "lunch", "dinner", "snack") is where
+    `log_meal` files it when no slot is given.
+
+    **No macros are stored on the meal.** They are computed from the ingredient
+    rows every time it is read, so correcting a yoghurt's protein fixes every
+    meal containing it. That is the opposite of a log entry, which freezes —
+    and for the opposite reason: a meal is a recipe, a log entry is a
+    measurement.
+
+    Saving over an existing name replaces its items, which is what "the usual
+    breakfast, but less cruesli now" means.
+    """
+    return _nutrition(
+        nutrition.save_meal,
+        name=name,
+        items=items,
+        default_for_slot=default_for_slot,
+        note=note,
+    )
+
+
+@app.tool()
+def list_meals() -> str:
+    """Every standard meal with its computed macros. Read this before proposing a meal.
+
+    The macros are computed from the ingredients as they stand now, so they
+    follow any correction made since the meal was saved. Use it with
+    `day_summary`'s remainder to compose an evening: the meal that fits is the
+    one whose totals land inside what is left, and both numbers are here rather
+    than being estimated.
+    """
+    return _nutrition(nutrition.list_meals)
+
+
+@app.tool()
+def log_food(
+    entries: list | dict,
+    log_date: str | None = None,
+    slot: str | None = None,
+) -> str:
+    """Log what was eaten — one row per ingredient, macros frozen at log time.
+
+    Log as the athlete reports, in fragments through the day, rather than
+    waiting for a complete picture. Each entry is either:
+
+    - an ingredient plus a quantity — `{"ingredient": "skyr", "grams": 200}` or
+      `{"ingredient": "egg", "portions": 2}` when the ingredient has a default
+      portion; or
+    - a free-form estimate — `{"label": "canteen: chicken and chips",
+      "kcal": 700, "protein_g": 35, "fiber_g": 5, "is_estimate": true}` — for
+      restaurant or canteen food not worth a row in the base.
+
+    **A name resolves exactly or not at all.** An unresolvable or ambiguous name
+    is rejected with near-matches attached and nothing is written for it; the
+    other entries in the same call still go in. Never retry a rejection by
+    picking one of the suggestions on the athlete's behalf — a fuzzy match
+    taken as exact logs the wrong food, and the day's total looks entirely
+    reasonable afterwards.
+
+    An estimate is flagged in every summary and is never priced, so it cannot
+    quietly pull the week's food cost down.
+
+    `log_date` defaults to the **server's** today, which is not reliably the
+    athlete's. Pass theirs when logging late at night or from another timezone:
+    a dinner filed on tomorrow breaks two days at once.
+
+    Returns the stored entries and the day's summary, so the answer to "and
+    where am I now?" needs no second call.
+    """
+    return _nutrition(nutrition.log_food, entries=entries, log_date=log_date, slot=slot)
+
+
+@app.tool()
+def log_meal(
+    meal: str | int,
+    log_date: str | None = None,
+    slot: str | None = None,
+    overrides: list | dict | None = None,
+    extras: list | dict | None = None,
+) -> str:
+    """Log a standard meal, expanded into one row per ingredient.
+
+    The expansion is the point: "the usual breakfast" stored as a single 620
+    kcal row cannot say how much protein came from the skyr and cannot be
+    corrected a gram at a time. Each ingredient is logged separately, tagged
+    with the meal's name, and `day_summary` groups them back together.
+
+    `overrides` adjusts one ingredient for this logging only — "usual
+    breakfast but 30 g of cruesli" is
+    `overrides=[{"ingredient": "cruesli", "grams": 30}]`. `grams: 0` leaves an
+    ingredient out today. The stored meal is untouched either way. `extras`
+    adds things that are not part of the meal, in `log_food`'s shape.
+
+    An ingredient that is not in the meal is refused rather than added
+    silently — it belongs in `extras`, where it reads as an addition instead of
+    a correction nobody made.
+    """
+    return _nutrition(
+        nutrition.log_meal,
+        meal=meal,
+        log_date=log_date,
+        slot=slot,
+        overrides=overrides,
+        extras=extras,
+    )
+
+
+@app.tool()
+def edit_log_entry(
+    entry_id: int,
+    grams: float | None = None,
+    portions: float | None = None,
+    slot: str | None = None,
+    log_date: str | None = None,
+    note: str | None = None,
+) -> str:
+    """Correct one logged entry — usually a weight guessed and then measured.
+
+    A new quantity recomputes that entry's macros from the ingredient as it
+    stands now. This is the one case where a stored entry moves, and it is the
+    right one: the athlete is restating what they ate, not re-reading old data.
+    No other row is touched.
+
+    A free-form estimate has no ingredient behind it, so a new weight cannot be
+    recomputed for it — delete it and log it again with the corrected figures.
+
+    `log_date` moves an entry to another day, which is the fix for a late
+    dinner filed after midnight. Both days come back in the response.
+    """
+    return _nutrition(
+        nutrition.edit_log_entry,
+        entry_id=entry_id,
+        grams=grams,
+        portions=portions,
+        slot=slot,
+        log_date=log_date,
+        note=note,
+    )
+
+
+@app.tool()
+def delete_log_entry(entry_id: int) -> str:
+    """Remove one logged entry. Returns what was removed and the day it left behind."""
+    return _nutrition(nutrition.delete_log_entry, entry_id=entry_id)
+
+
+@app.tool()
+def set_goal(
+    goal_type: str,
+    target_weight_kg: float | None = None,
+    milestone_weight_kg: float | None = None,
+    rate_kg_per_week: float | None = None,
+    effective_date: str | None = None,
+    note: str | None = None,
+) -> str:
+    """Set the active nutrition goal: lose, maintain or gain, and how fast.
+
+    `rate_kg_per_week` is **signed** and checked against the goal type — a
+    `lose` goal takes a negative rate. It is not inferred, because a rate whose
+    sign was guessed sets the deficit the wrong way round and the resulting
+    targets look perfectly plausible.
+
+    Faster than about 1 kg/week is stored as asked and warned about: past that,
+    most of what moves is water and muscle, and training quality goes with it.
+
+    `milestone_weight_kg` is an intermediate figure worth aiming at when the
+    real target is months away.
+
+    One goal is active at a time; setting a new one closes the previous as
+    `abandoned` rather than deleting it, so a deficit run in March stays
+    readable against the goal that was active in March. Use `close_goal` when
+    one is reached.
+    """
+    return _nutrition(
+        nutrition.set_goal,
+        goal_type=goal_type,
+        target_weight_kg=target_weight_kg,
+        milestone_weight_kg=milestone_weight_kg,
+        rate_kg_per_week=rate_kg_per_week,
+        effective_date=effective_date,
+        note=note,
+    )
+
+
+@app.tool()
+def close_goal(
+    status: str = "reached", closed_date: str | None = None, note: str | None = None
+) -> str:
+    """Retire the active goal as `reached` or `abandoned`. The record stays on file.
+
+    With no active goal, `suggest_targets` computes maintenance: BMR, daily
+    activity and training, with no deficit or surplus. That is the right state
+    after a target weight is hit and the right state during a race block.
+    """
+    return _nutrition(nutrition.close_goal, status=status, closed_date=closed_date, note=note)
+
+
+@app.tool()
+def get_goal() -> str:
+    """The active nutrition goal, the goals before it, and where the weight is against it."""
+    return _nutrition(nutrition.get_goal)
+
+
+@app.tool()
+def suggest_targets(
+    date: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    protein_g_per_kg: float = 2.0,
+    baseline_factor: float = 1.3,
+    exercise_kcal_override: float | None = None,
+) -> str:
+    """Propose kcal / protein / fibre targets for a date or range, showing every step.
+
+    Deterministic, and **nothing is stored** — this proposes and
+    `confirm_targets` files. The whole derivation comes back in `steps` and
+    `working`: show it to the athlete, because a target whose arithmetic is
+    invisible can only be accepted or refused, never corrected.
+
+    The chain, per day: Mifflin-St Jeor BMR from the weight in effect on that
+    date plus height, age and gender → x `baseline_factor` for everything that
+    is not training → **+ exercise calories** → +/- the active goal's rate.
+
+    Exercise calories come from Garmin's figure on the imported activity where
+    there is one. For a date still in the future, from the planned session's
+    own mechanical work at cycling's gross efficiency. Where there is neither,
+    zero — said out loud, not hidden — and `exercise_kcal_override` is how you
+    supply an estimate for a race or a ride that was never imported.
+
+    **Day type is read off the training tables, never asked for.** An event
+    makes its own date `race` and the day before `race_eve`; a long or hard
+    ride, imported or planned, makes it `big_session`; any other ride makes it
+    `training`; nothing makes it `rest`. On a `big_session`, `race` or
+    `race_eve` day the goal's deficit is **withheld** — under-fuelling a hard
+    session costs the session and the recovery from it, and those are the least
+    useful calories in the week to save. The response says how many were
+    withheld.
+
+    A target that would fall below computed BMR is **clamped up to BMR** and
+    the response says so. That is a signal to revisit the goal's rate, not a
+    number to work around.
+
+    With the profile incomplete — no weight, height, birth year or gender —
+    this returns what is missing instead of guessing. A BMR from an assumed
+    gender is out by 166 kcal/day.
+
+    Pass `date` for one day, or `start`/`end` for a range. A week is the useful
+    unit: the deficit is judged on the weekly average, never on one day.
+    """
+    return _nutrition(
+        nutrition.suggest_targets,
+        date_str=date,
+        start=start,
+        end=end,
+        protein_g_per_kg=protein_g_per_kg,
+        baseline_factor=baseline_factor,
+        exercise_kcal_override=exercise_kcal_override,
+    )
+
+
+@app.tool()
+def confirm_targets(
+    date: str | None = None,
+    kcal: float | None = None,
+    protein_g: float | None = None,
+    fiber_g: float | None = None,
+    day_type: str | None = None,
+    note: str | None = None,
+    days: list | dict | None = None,
+) -> str:
+    """Store the day's targets — the suggestion as it stands, or with overrides.
+
+    Call with just a date to accept what `suggest_targets` proposed. The
+    suggestion is **recomputed here** rather than passed back in, so nothing can
+    be filed that this server would not have proposed.
+
+    Pass any of `kcal` / `protein_g` / `fiber_g` to override; `source` is then
+    recorded as `overridden` rather than `confirmed`, so a later reading can
+    tell which numbers were the athlete's own.
+
+    A kcal override below computed BMR is refused, whoever asked for it. If the
+    goal keeps producing one, the goal's rate is what needs to change — and a
+    sustained intake under BMR alongside training is a conversation to have
+    with a dietitian, not a number to file.
+
+    `days` confirms several dates at once:
+    `[{"date": "2026-08-24", "kcal": 2600}, {"date": "2026-08-25"}]`.
+
+    Until a date has targets, `day_summary` has no remainder and "can I eat X?"
+    has no arithmetic behind it.
+    """
+    return _nutrition(
+        nutrition.confirm_targets,
+        date_str=date,
+        kcal=kcal,
+        protein_g=protein_g,
+        fiber_g=fiber_g,
+        day_type=day_type,
+        note=note,
+        days=days,
+    )
+
+
+@app.tool()
+def day_summary(date: str | None = None) -> str:
+    """The day's bilan: entries per slot, running totals, targets, and what is left.
+
+    Read this before answering anything about food, and answer from it rather
+    than from memory of what was logged earlier in the conversation.
+
+    **"Can I eat X?" is a subtraction, shown.** Where the day stands, what
+    remains, where X fits — never a bare yes or no, and never a judgement.
+    Entries logged as part of a standard meal are grouped under its name;
+    free-form estimates are flagged as approximate; an incomplete protein
+    appears in the calorie total and is excluded from the protein line, with
+    the excluded grams named.
+
+    `date` defaults to the **server's** today. Pass the athlete's when they
+    might differ — this otherwise reports a day that has barely started as
+    though it were nearly over.
+
+    `training` carries what the training tables say about the date, which is
+    where the day type came from.
+    """
+    return _nutrition(nutrition.day_summary, date_str=date)
+
+
+@app.tool()
+def week_summary(start: str, end: str) -> str:
+    """The week: each day against its targets, the averages, the weight trend, the cost.
+
+    **This is where the deficit is judged — never a single day.** A restaurant
+    on Saturday inside a week that averaged on target is a week that went to
+    plan, and reading it a day at a time turns a normal life into a series of
+    failures.
+
+    The weight trend is the 7-day moving average of the morning weigh-ins
+    against the goal's rate, not the scale reading. Day-to-day weight is water,
+    glycogen and salt: two kilos can appear after a race and be gone by
+    Thursday, and it needs three or four weeks before it means anything.
+
+    Food cost counts only what could be priced. Free-form estimates are never
+    priced and ingredients with no package price contribute none; both are
+    counted and reported, because a total that treats unpriced entries as free
+    reads as a cheap week and is a wrong one.
+
+    A day with nothing logged is reported as unlogged and excluded from the
+    averages rather than counted as a zero-calorie day.
+    """
+    return _nutrition(nutrition.week_summary, start=start, end=end)
 
 
 def _register_skill_prompts() -> list[str]:

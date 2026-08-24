@@ -512,3 +512,160 @@ def test_one_malformed_item_does_not_lose_the_rest_of_the_week(coach_client):
     assert result["refused"] == 1
     assert result["refusals"][0] == {"index": 0, "errors": ["item must be an object"]}
     assert result["planned_workouts"][0]["scheduled_date"] == "2026-07-09"
+
+
+# --------------------------------------------------------------------------
+# the nutrition layer over the wire
+#
+# Same risk as the coach layer, in a different shape: these tools take lists of
+# free-form objects — a pasted food base, a day's entries, a set of overrides —
+# and a schema that flattens or rejects one of those spellings is invisible to
+# a test that calls the Python function directly.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def nutrition_client(tmp_path_factory):
+    """A second server on its own database, with a complete profile."""
+    from cycling_mcp.store import ENV_DB_PATH
+
+    path = tmp_path_factory.mktemp("nutrition") / "coach.db"
+    client = Client(env={ENV_DB_PATH: str(path)})
+    client.call("update_profile", height_cm=178, birth_year=1995, gender="male")
+    client.call("log_weight", value_kg=72.0, effective_date="2026-08-01")
+    client.call(
+        "add_ingredients",
+        ingredients=[
+            {
+                "name": "Skyr nature 0%",
+                "aliases": ["skyr"],
+                "kcal_100g": 63,
+                "protein_100g": 11,
+                "fiber_100g": 0,
+                "default_portion_g": 200,
+            },
+            {"name": "Cruesli", "kcal_100g": 450, "protein_100g": 8, "fiber_100g": 6},
+        ],
+    )
+    yield client
+    client.close()
+
+
+def test_a_bulk_ingredient_paste_survives_the_tool_schema(nutrition_client):
+    """`ingredients: list[dict]` would make pydantic refuse the whole paste for
+    one bad row, which defeats the per-item rejection the tool documents."""
+    result = nutrition_client.call(
+        "add_ingredients",
+        ingredients=[
+            "not an ingredient",
+            {"name": "Oeuf", "kcal_100g": 155, "protein_100g": 13, "fiber_100g": 0},
+        ],
+    )
+    assert "_error" not in result, result
+    assert result["ok"] is True
+    assert result["inserted"] == 1
+    assert result["rejected"] == 1
+
+
+def test_a_single_entry_can_be_logged_without_wrapping_it_in_a_list(nutrition_client):
+    """A scalar the schema refuses is a tool that behaves differently depending
+    on which side you call it from — the same fix as the coach layer's `clear`."""
+    result = nutrition_client.call(
+        "log_food",
+        entries={"ingredient": "skyr", "grams": 200},
+        log_date="2026-08-24",
+        slot="breakfast",
+    )
+    assert "_error" not in result, result
+    assert result["ok"] is True and result["logged"] == 1
+    assert result["entries"][0]["kcal"] == 126.0
+
+
+def test_a_meal_and_its_overrides_round_trip_through_the_schema(nutrition_client):
+    saved = nutrition_client.call(
+        "save_meal",
+        name="Petit-dej",
+        items=[{"ingredient": "skyr", "grams": 200}, {"ingredient": "Cruesli", "grams": 50}],
+        default_for_slot="breakfast",
+    )
+    assert saved["ok"] is True, saved
+    logged = nutrition_client.call(
+        "log_meal",
+        meal="Petit-dej",
+        log_date="2026-08-23",
+        overrides=[{"ingredient": "Cruesli", "grams": 30}],
+    )
+    assert "_error" not in logged, logged
+    assert logged["ok"] is True and logged["logged"] == 2
+    assert logged["totals"]["kcal"] == 261.0
+
+
+def test_a_meal_can_be_named_or_numbered(nutrition_client):
+    """`meal: str` alone would refuse an id, which is what list_meals returns."""
+    meals = nutrition_client.call("list_meals")
+    meal_id = meals["meals"][0]["id"]
+    result = nutrition_client.call("log_meal", meal=meal_id, log_date="2026-08-22")
+    assert "_error" not in result, result
+    assert result["ok"] is True
+
+
+def test_an_unresolvable_name_is_a_refusal_with_suggestions_not_an_error(nutrition_client):
+    result = nutrition_client.call(
+        "log_food", entries=[{"ingredient": "skyrr", "grams": 200}], log_date="2026-08-24"
+    )
+    assert "_error" not in result
+    assert result["ok"] is True and result["logged"] == 0
+    assert "Skyr nature 0%" in result["rejections"][0]["reason"]
+
+
+def test_the_target_flow_works_end_to_end_over_stdio(nutrition_client):
+    suggested = nutrition_client.call("suggest_targets", date="2026-08-24")
+    assert suggested["ok"] is True
+    assert suggested["stored"] is False
+    day = suggested["days"][0]
+    assert day["working"]["bmr_kcal"] == 1682
+
+    confirmed = nutrition_client.call("confirm_targets", date="2026-08-24")
+    assert confirmed["ok"] is True and confirmed["stored"] == 1
+
+    summary = nutrition_client.call("day_summary", date="2026-08-24")
+    assert summary["ok"] is True
+    assert summary["remaining"]["kcal"] == pytest.approx(day["suggested"]["kcal"] - 126.0)
+
+
+def test_a_target_under_bmr_is_refused_as_an_answer_over_the_wire(nutrition_client):
+    result = nutrition_client.call("confirm_targets", date="2026-08-21", kcal=1100)
+    assert "_error" not in result
+    assert result["ok"] is True and result["stored"] == 0
+    assert "resting metabolic rate" in result["rejections"][0]["reason"]
+
+
+def test_every_nutrition_tool_answers_over_stdio(nutrition_client):
+    assert nutrition_client.call("search_ingredients")["ok"] is True
+    assert nutrition_client.call("list_meals")["ok"] is True
+    assert nutrition_client.call("get_goal")["ok"] is True
+    assert (
+        nutrition_client.call(
+            "set_goal", goal_type="lose", target_weight_kg=68, rate_kg_per_week=-0.5
+        )["ok"]
+        is True
+    )
+    assert nutrition_client.call("close_goal", status="reached")["ok"] is True
+    assert nutrition_client.call("day_summary")["ok"] is True
+    assert nutrition_client.call("week_summary", start="2026-08-24", end="2026-08-30")["ok"] is True
+    assert nutrition_client.call("get_skill", name="nutrition")["ok"] is True
+
+
+def test_editing_and_deleting_a_log_entry_survive_the_schema(nutrition_client):
+    logged = nutrition_client.call(
+        "log_food", entries=[{"ingredient": "skyr", "grams": 200}], log_date="2026-08-20"
+    )
+    entry_id = logged["entries"][0]["id"]
+
+    edited = nutrition_client.call("edit_log_entry", entry_id=entry_id, grams=100)
+    assert edited["ok"] is True
+    assert edited["entry"]["kcal"] == 63.0
+
+    deleted = nutrition_client.call("delete_log_entry", entry_id=entry_id)
+    assert deleted["ok"] is True
+    assert deleted["day"]["entry_count"] == 0

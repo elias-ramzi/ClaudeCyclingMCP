@@ -28,6 +28,7 @@ from .garmin_import import (
     row_flags,
 )
 from .metrics import compute_metrics, describe
+from .nutrition import GENDERS
 from .spec import (
     FTP_PLAUSIBLE_W,
     FTP_USUAL_W,
@@ -922,7 +923,8 @@ def _planned_summary(row: dict) -> dict:
 _GAP_REASONS = {
     "display_name": "what to call the athlete when writing a plan",
     "height_cm": "context for weight; not used in any computation here",
-    "birth_year": "age-based HR estimates, and how much recovery a block needs",
+    "birth_year": "age-based HR estimates, how much recovery a block needs, and BMR",
+    "gender": "the Mifflin-St Jeor BMR every calorie target is built on — the male and female constants differ by 166 kcal/day, so it cannot be guessed",
     "availability": "how many sessions a week fit, and which day the long ride goes on",
     "equipment": "whether indoor sessions are possible, and whether power is measured at all",
     "constraints": "injuries, travel, work patterns — what the plan must route around",
@@ -955,7 +957,14 @@ def get_profile(athlete_id: int = DEFAULT_ATHLETE_ID) -> dict:
         ).fetchone()["n"]
 
     gaps: list[dict] = []
-    for field in ("display_name", "height_cm", "birth_year", "availability", "equipment"):
+    for field in (
+        "display_name",
+        "height_cm",
+        "birth_year",
+        "gender",
+        "availability",
+        "equipment",
+    ):
         if not athlete.get(field):
             gaps.append({"field": field, "matters_for": _GAP_REASONS[field]})
     if not ftp:
@@ -991,6 +1000,7 @@ def get_profile(athlete_id: int = DEFAULT_ATHLETE_ID) -> dict:
                 "display_name",
                 "height_cm",
                 "birth_year",
+                "gender",
                 "availability",
                 "equipment",
                 "constraints",
@@ -1016,6 +1026,7 @@ def update_profile(
     display_name: str | None = None,
     height_cm: float | None = None,
     birth_year: int | None = None,
+    gender: str | None = None,
     availability: str | None = None,
     equipment: str | None = None,
     constraints: str | None = None,
@@ -1039,6 +1050,11 @@ def update_profile(
         if not (1900 <= year <= date.today().year):
             raise CoachError(f"birth_year of {year} is not a year an athlete was born in")
         updates["birth_year"] = year
+    if gender is not None:
+        # Only ever asked for because Mifflin-St Jeor needs it; `other` takes
+        # the midpoint of its two constants, and the nutrition layer flags
+        # every target computed that way as the compromise it is.
+        updates["gender"] = _one_of(gender, GENDERS, "gender")
     blanked = _stage_text(
         updates,
         {
@@ -3200,6 +3216,9 @@ def compliance_report(
 #: both carry a `linked_activity_id`, so they must be inserted after the
 #: activities they point at or the restore fails on a foreign key. Deletion
 #: walks this list in reverse for the same reason.
+#: `meal_items` and `food_log` point at ingredients and meals, so those come
+#: first; `activity_laps` and `meal_items` carry no athlete of their own and
+#: are scoped through their parent below.
 _EXPORT_TABLES = (
     "athlete",
     "ftp_history",
@@ -3209,7 +3228,27 @@ _EXPORT_TABLES = (
     "activity_laps",
     "events",
     "planned_workouts",
+    "nutrition_goals",
+    "ingredients",
+    "meals",
+    "meal_items",
+    "food_log",
+    "daily_targets",
 )
+
+#: Tables with no `athlete_id`, and the query that scopes each to one athlete.
+#: Exporting all of their rows for a single athlete would ship another
+#: athlete's data; the coach layer's `activity_laps` had this shape first.
+_PARENT_SCOPED = {
+    "activity_laps": (
+        "SELECT * FROM activity_laps WHERE activity_id IN "
+        "(SELECT id FROM activities WHERE athlete_id = ?) ORDER BY rowid"
+    ),
+    "meal_items": (
+        "SELECT * FROM meal_items WHERE meal_id IN "
+        "(SELECT id FROM meals WHERE athlete_id = ?) ORDER BY rowid"
+    ),
+}
 
 
 def export_data(athlete_id: int | None = None) -> dict:
@@ -3230,15 +3269,8 @@ def export_data(athlete_id: int | None = None) -> dict:
         for table in _EXPORT_TABLES:
             if athlete_id is None:
                 rows = conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
-            elif table == "activity_laps":
-                # Laps carry no athlete of their own; they belong to whichever
-                # activity they hang off. Exporting all of them for a single
-                # athlete would ship another athlete's ride data.
-                rows = conn.execute(
-                    "SELECT * FROM activity_laps WHERE activity_id IN "
-                    "(SELECT id FROM activities WHERE athlete_id = ?) ORDER BY rowid",
-                    (athlete_id,),
-                ).fetchall()
+            elif table in _PARENT_SCOPED:
+                rows = conn.execute(_PARENT_SCOPED[table], (athlete_id,)).fetchall()
             else:
                 rows = conn.execute(
                     f"SELECT * FROM {table} WHERE athlete_id = ? ORDER BY rowid", (athlete_id,)

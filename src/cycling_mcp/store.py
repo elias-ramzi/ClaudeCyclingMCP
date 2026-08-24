@@ -5,9 +5,14 @@ This is the one module in the package that touches state. Everything above it
 pure functions of what is stored plus what is passed in.
 
 The database holds an athlete profile, dated FTP/weight/HR history, objectives,
-a normalised cache of imported Garmin activities, and planned sessions. It is
-the athlete's file, not a mirror of Garmin: anything not stored here is still
-Garmin's to answer for.
+a normalised cache of imported Garmin activities, planned sessions, and the
+nutrition layer over the same athlete: ingredients, standard meals, the food
+log and its dated targets. It is the athlete's file, not a mirror of Garmin:
+anything not stored here is still Garmin's to answer for.
+
+Training and nutrition share one file deliberately. A calorie target computed
+without the day's ride is a target for somebody else, and that join is only
+free while both live here.
 
 Location, in order: the ``CLAUDE_CYCLING_DB`` environment variable, else
 ``~/.claude-cycling/coach.db``. Parent directories are created on first write.
@@ -238,10 +243,167 @@ def _migrate_3_import_flags() -> list[str]:
     return ["ALTER TABLE activities ADD COLUMN flags_json TEXT"]
 
 
+def _migrate_4_nutrition() -> list[str]:
+    """The nutrition layer: what is eaten, what it costs, and what to aim at.
+
+    Kept in the same database as the training log on purpose. A calorie target
+    that ignores what the athlete rode that day is a target for somebody else,
+    and joining across two files would mean either a second store to keep in
+    step or a target computed from numbers passed in by hand.
+
+    `gender` goes on the athlete because Mifflin-St Jeor needs it and nothing
+    before this did. Height and birth year are already there; weight is not,
+    and deliberately stays in `weight_history` — a BMR is computed against the
+    weight in effect on the day being planned, not against a column somebody
+    last updated in March.
+    """
+    return [
+        # NULL means "not asked yet", which `suggest_targets` reports as a gap
+        # rather than guessing. A guessed gender moves BMR by 166 kcal/day.
+        "ALTER TABLE athlete ADD COLUMN gender TEXT",
+        # Append-only and dated, like ftp_history: what the athlete was aiming
+        # at in March explains a March deficit, and overwriting it makes every
+        # past target unreadable.
+        """
+        CREATE TABLE nutrition_goals (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            athlete_id        INTEGER NOT NULL DEFAULT 1,
+            goal_type         TEXT NOT NULL,
+            target_weight_kg  REAL,
+            milestone_weight_kg REAL,
+            rate_kg_per_week  REAL,
+            status            TEXT NOT NULL DEFAULT 'active',
+            note              TEXT,
+            effective_date    TEXT NOT NULL,
+            closed_date       TEXT,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX ix_nutrition_goals ON nutrition_goals(athlete_id, status, effective_date)",
+        # `name_key` is the accent- and case-folded name. Stored rather than
+        # folded per query so the uniqueness constraint sees what the resolver
+        # sees: without it "Skyr" and "skyr" are two rows, and logging one of
+        # them is a coin toss.
+        #
+        # kcal/protein/fibre are NOT NULL because every target is computed from
+        # them and a NULL would silently read as zero — an ingredient with no
+        # calories is a rounding error that eats a day's deficit. The rest are
+        # nullable: forcing a full macro breakdown out of a packet that only
+        # prints four numbers is how a food base stops being filled in.
+        """
+        CREATE TABLE ingredients (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            athlete_id            INTEGER NOT NULL DEFAULT 1,
+            name                  TEXT NOT NULL,
+            name_key              TEXT NOT NULL,
+            aliases_json          TEXT,
+            kcal_100g             REAL NOT NULL,
+            protein_100g          REAL NOT NULL,
+            fiber_100g            REAL NOT NULL,
+            carbs_100g            REAL,
+            fat_100g              REAL,
+            sat_fat_100g          REAL,
+            sugar_100g            REAL,
+            salt_100g             REAL,
+            state                 TEXT NOT NULL DEFAULT 'as_sold',
+            default_portion_g     REAL,
+            portion_label         TEXT,
+            package_price         REAL,
+            package_weight_g      REAL,
+            counts_toward_protein INTEGER NOT NULL DEFAULT 1,
+            note                  TEXT,
+            created_at            TEXT NOT NULL,
+            updated_at            TEXT NOT NULL
+        )
+        """,
+        "CREATE UNIQUE INDEX ux_ingredients_name ON ingredients(athlete_id, name_key)",
+        """
+        CREATE TABLE meals (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            athlete_id       INTEGER NOT NULL DEFAULT 1,
+            name             TEXT NOT NULL,
+            name_key         TEXT NOT NULL,
+            default_for_slot TEXT,
+            note             TEXT,
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL
+        )
+        """,
+        "CREATE UNIQUE INDEX ux_meals_name ON meals(athlete_id, name_key)",
+        # No macros here, by design. A meal is a list of ingredients and their
+        # grams; its calories are computed from the ingredient rows every time
+        # it is read. Denormalising them would freeze a breakfast's protein at
+        # whatever the skyr pot said the day the meal was saved.
+        """
+        CREATE TABLE meal_items (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            meal_id       INTEGER NOT NULL REFERENCES meals(id) ON DELETE CASCADE,
+            position      INTEGER NOT NULL,
+            ingredient_id INTEGER NOT NULL REFERENCES ingredients(id),
+            grams         REAL NOT NULL
+        )
+        """,
+        "CREATE UNIQUE INDEX ux_meal_items ON meal_items(meal_id, position)",
+        # The opposite rule to `meals`, for the opposite reason. A log entry's
+        # macros and cost are frozen at log time: the athlete ate what the
+        # ingredient said *then*, and correcting a mistyped protein figure
+        # today must not rewrite last month's days into ones that never
+        # happened. `label` is likewise the name as it stood, so an entry stays
+        # readable after a rename — and readable at all for a free-form
+        # estimate, which has no ingredient row behind it.
+        """
+        CREATE TABLE food_log (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            athlete_id            INTEGER NOT NULL DEFAULT 1,
+            log_date              TEXT NOT NULL,
+            slot                  TEXT NOT NULL,
+            ingredient_id         INTEGER REFERENCES ingredients(id) ON DELETE SET NULL,
+            label                 TEXT NOT NULL,
+            grams                 REAL,
+            kcal                  REAL NOT NULL,
+            protein_g             REAL NOT NULL,
+            fiber_g               REAL NOT NULL,
+            carbs_g               REAL,
+            fat_g                 REAL,
+            cost                  REAL,
+            counts_toward_protein INTEGER NOT NULL DEFAULT 1,
+            is_estimate           INTEGER NOT NULL DEFAULT 0,
+            meal_id               INTEGER REFERENCES meals(id) ON DELETE SET NULL,
+            meal_name             TEXT,
+            note                  TEXT,
+            logged_at             TEXT NOT NULL,
+            updated_at            TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX ix_food_log_date ON food_log(athlete_id, log_date, slot)",
+        # One row per date: a day has one set of targets, and two would leave
+        # every remainder depending on which was read.
+        """
+        CREATE TABLE daily_targets (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            athlete_id     INTEGER NOT NULL DEFAULT 1,
+            target_date    TEXT NOT NULL,
+            kcal           REAL NOT NULL,
+            protein_g      REAL NOT NULL,
+            fiber_g        REAL NOT NULL,
+            day_type       TEXT NOT NULL,
+            source         TEXT NOT NULL,
+            rationale_json TEXT,
+            note           TEXT,
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        )
+        """,
+        "CREATE UNIQUE INDEX ux_daily_targets ON daily_targets(athlete_id, target_date)",
+    ]
+
+
 MIGRATIONS: list[tuple[int, Callable[[], list[str]]]] = [
     (1, _migrate_1_training_log),
     (2, _migrate_2_plan_and_debrief),
     (3, _migrate_3_import_flags),
+    (4, _migrate_4_nutrition),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

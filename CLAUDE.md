@@ -5,14 +5,19 @@ Architecture and conventions for anyone — human or agent — working in this r
 ## The shape of it
 
 One canonical spec in, two renderers out — and above that, a coach layer that stores the athlete
-and computes from what they actually rode:
+and computes from what they actually rode, and a nutrition layer over the same file:
 
 ```
 spec (JSON) → validate → resolved Workout tree ──┬── render_zwo    → .zwo   (MyWhoosh)
                        (power as fractions of FTP)└── render_garmin → JSON   (Garmin)
 
 Garmin MCP ──(the model pastes the JSON)──> coach.py ──> coach.db ──> load · form · compliance
+                                                            ↕
+                                       nutrition.py ──> food log · targets · the week
 ```
+
+The two arrows meet on purpose: a calorie target is computed from the athlete's profile **and** from
+what the training tables say about that date.
 
 | Module | Holds |
 |---|---|
@@ -25,6 +30,7 @@ Garmin MCP ──(the model pastes the JSON)──> coach.py ──> coach.db �
 | `garmin_import.py` | normalise raw Garmin MCP payloads into stored rows. Pure — it reads what was pasted in. |
 | `training.py` | zones, TSS (power and HR), CTL/ATL/TSB, block-vs-lap comparison. Pure arithmetic over stored numbers. |
 | `coach.py` | the coaching operations: read and write the athlete's file, compute from it. |
+| `nutrition.py` | the food base, the log over it, and the target arithmetic. Every gram of it — the model never adds food up. |
 | `skills.py` | load `.claude/skills/*/SKILL.md` and serve them as MCP prompts. |
 | `server.py` | the MCP tool surface. Thin — logic lives in the modules above. |
 
@@ -83,7 +89,32 @@ mistyped average power is a load that is wrong and looks reasonable. Tolerate th
 unknown keys, and never overwrite a stored value with a null.
 
 **Coaching judgement lives in the `coaching` skill, not in code.** The server stores, computes and
-refuses. What to do about a missed Tuesday is the skill's business.
+refuses. What to do about a missed Tuesday is the skill's business. The same split holds for
+`nutrition`: the server sums, the skill decides what to eat.
+
+**The server does every gram of the nutrition arithmetic.** Macro sums, running totals, BMR, the
+day's remainder, the weekly average. Never design a nutrition tool that hands a model numbers to add
+up — a plausible calorie total is worse than none, because nobody checks it.
+
+**A log entry freezes; a meal does not.** `food_log` stores the macros and cost computed at log
+time, so correcting an ingredient never rewrites a day already eaten. `meals` stores only
+ingredients and grams, so its macros follow every correction. A log entry is a measurement; a meal
+is a recipe. Do not "fix" either to match the other.
+
+**An ingredient name resolves exactly or not at all.** Exact match on the folded name or on any
+alias, else a refusal carrying near-matches — including when two rows share an alias. A fuzzy hit
+taken as exact logs the wrong food, and the day's total looks entirely reasonable afterwards.
+
+**Raw and cooked are different ingredients.** ~350 kcal/100 g against ~130 for the same rice. The
+`state` column records which, and storing a `raw` one warns.
+
+**A big session, a race and a race eve are not deficit days.** `suggest_targets` withholds the
+goal's adjustment on them and reports how much it withheld. Under-fuelling a hard session costs the
+session and the recovery from it. And no target this server produces or files is below computed
+BMR — `suggest_targets` clamps, `confirm_targets` refuses.
+
+**Personal facts live in data, never in a bundled skill.** Specific foods, habitual portions,
+preparation quirks are ingredient and meal rows and their notes. A skill ships to everyone.
 
 **Migrations are append-only.** Never edit a migration that has run anywhere — only a version that
 has not been applied ever runs again. Add the next one.

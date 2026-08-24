@@ -14,7 +14,7 @@ UPLOAD_SKILLS = ("garmin-upload", "mywhoosh-upload")
 
 def test_every_bundled_skill_loads():
     names = [s.name for s in load_skills(SKILLS_DIR)]
-    assert names == ["coaching", "garmin-upload", "mywhoosh-upload"]
+    assert names == ["coaching", "garmin-upload", "mywhoosh-upload", "nutrition"]
 
 
 def test_frontmatter_name_matches_the_directory():
@@ -189,6 +189,7 @@ def test_get_skill_lists_when_no_name_given():
         "coaching",
         "garmin-upload",
         "mywhoosh-upload",
+        "nutrition",
     ]
 
 
@@ -262,3 +263,23 @@ def test_a_skill_without_the_override_keeps_the_upload_framing():
     message = build_skill_message(skills["garmin-upload"])
     assert "Ask what session to build" in message
     assert "confirm the FTP" in message
+
+
+def test_the_nutrition_description_triggers_on_talking_about_food():
+    """Nobody asks their coach to "invoke the nutrition skill" either.
+
+    These are how the request actually arrives — mid-day, in fragments, about
+    one meal — and each has to be recognisable in the description or the skill
+    never fires.
+    """
+    skill = next(s for s in load_skills(SKILLS_DIR) if s.name == "nutrition")
+    lowered = skill.description.lower()
+    for phrasing in ("ate", "eat", "restaurant", "weight", "race", "day"):
+        assert phrasing in lowered, phrasing
+
+
+def test_the_bundled_skills_carry_no_personal_facts():
+    """A bundled skill ships to everyone; the athlete's own foods and figures
+    belong in their database, where they can be corrected."""
+    for skill in load_skills(SKILLS_DIR):
+        assert "elias" not in skill.body.lower(), skill.name

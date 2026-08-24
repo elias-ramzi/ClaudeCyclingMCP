@@ -9,6 +9,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A nutrition layer**, in the same database and for the same athlete. An ingredient base (per-100 g
+  macros, aliases, habitual portions, raw-versus-cooked state, package price, and a note for the
+  athlete's own preparation know-how), standard meals, a per-ingredient food log, dated targets, and
+  weekly summaries with food cost. Sixteen new tools — see
+  [docs/nutrition.md](docs/nutrition.md).
+- **Calorie targets computed from the day's training.** `suggest_targets` chains Mifflin-St Jeor BMR
+  (from the weight in effect on that date, plus height, age and gender) x a sedentary baseline, plus
+  Garmin's own calories for that date's imported ride — or, for a date still ahead, the planned
+  session's mechanical work converted at cycling's gross efficiency — then the active goal's rate at
+  7700 kcal/kg spread across the week. Every input and intermediate is in the response. It stores
+  nothing; `confirm_targets` files what the athlete agreed to, as `confirmed` or `overridden`.
+- **Day type read off the training tables, not asked for.** An event makes its date `race` and the day
+  before `race_eve`; a ride of 3 h or 1500 kcal, imported or planned, makes it `big_session`. **On
+  those days the goal's deficit is withheld** and the response says how much: under-fuelling a hard
+  session costs the session and the recovery from it. Fibre is suggested at 15 g rather than 30 g on
+  a race or race eve.
+- **Two refusals that hold.** A target below computed BMR is clamped by `suggest_targets` and refused
+  outright by `confirm_targets`, whoever asked. An ingredient name resolves on an exact name or alias
+  match or is rejected with near-matches — a fuzzy hit taken as exact logs the wrong food and reads
+  as a perfectly ordinary day afterwards.
+- **A `nutrition` skill**, bundled alongside `coaching` and the two upload flows. Generic — the
+  athlete's own foods, portions and quirks live in their database, where they can be corrected.
+  Covers seeding a food base from whatever they already track, the daily logging loop where "can I
+  eat X?" is answered by subtraction rather than a yes or no, fuelling around big sessions and
+  races, and when to stop optimising numbers and recommend professional guidance.
+- **`athlete.gender`**, asked for by the nutrition layer alone. Mifflin-St Jeor's male and female
+  constants differ by 166 kcal/day, so it is not something to assume; it affects no training number.
 - **A coach layer.** The server now keeps the athlete's file in a local SQLite database at
   `~/.claude-cycling/coach.db` (override with `CLAUDE_CYCLING_DB`), created on the first coaching
   call. It holds the profile, append-only dated FTP / weight / HR history, objectives, a normalised
@@ -28,6 +55,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without creating it.
 
 ### Changed
+
+- **Schema v4** adds the nutrition tables and `athlete.gender`. Applied automatically on the next
+  call; a database from the coach layer alone migrates in place.
+- **`export_data` / `import_data` now cover the nutrition tables** too. An export taken before this
+  release does not contain them, and restoring one leaves the food base empty rather than corrupt.
 
 - **The purity note is narrower and true.** It said "this server is pure: no network, no
   credentials, no uploads", and the only filesystem access was an `out_path` write. It now says
