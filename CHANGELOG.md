@@ -7,7 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **A null in a payload no longer folds to a number in the duration check.** `total_step_seconds`
+  treated a missing repeat count as 1 and a missing step duration as 0, so a payload corrupted by
+  a dropped `conditionTypeId 7` summed to a plausible smaller total — and when the fetched side
+  carried the same null, `verify_garmin_upload` reported a corrupted workout as matching. The
+  total is now reported as unknown (`null`), `check_garmin_payload` and `verify_garmin_upload`
+  say explicitly what could not be checked, and `ui_checklist` prints `unknown` where it used to
+  print a confident `0:00`. A real zero still sums and still prints as a clock.
 
 ## [0.2.0] - 2026-08-21
 
