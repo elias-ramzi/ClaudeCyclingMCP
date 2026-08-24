@@ -333,7 +333,7 @@ def _timestamp(value: Any, to_utc: bool = False) -> str | None:
             moment = datetime(1970, 1, 1) + timedelta(seconds=seconds)
         except OverflowError:
             return None
-        return moment.strftime("%Y-%m-%dT%H:%M:%S")
+        return _iso(moment)
     if not isinstance(value, str):
         return None
 
@@ -365,7 +365,7 @@ def _timestamp(value: Any, to_utc: bool = False) -> str | None:
         return None
     if parsed.tzinfo is not None:
         try:
-            parsed = parsed.astimezone(timezone.utc) if to_utc else parsed.replace(tzinfo=None)
+            parsed = parsed.astimezone(timezone.utc) if to_utc else parsed
         except OverflowError:
             # A sentinel date with an offset — "0001-01-01T00:00:00+0200", the
             # zero date some exporters write — cannot be moved to UTC without
@@ -377,7 +377,11 @@ def _timestamp(value: Any, to_utc: bool = False) -> str | None:
             # *without* overflowing are caught by `implausible_date`, because
             # convertible and plausible are not the same question.)
             return None
-    return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+        # Naive either way: `start_time_utc` is UTC by contract and
+        # `start_time_local` is a wall clock, so the offset has done its job by
+        # here. Dropped explicitly rather than left for the formatter to omit.
+        parsed = parsed.replace(tzinfo=None)
+    return _iso(parsed)
 
 
 class _Split(NamedTuple):
@@ -398,6 +402,19 @@ class _Split(NamedTuple):
     def normalised(self) -> str:
         """The timestamp with its offset in the one spelling `fromisoformat` takes."""
         return self.body + self.offset if self.offset else self.body
+
+
+def _iso(moment: datetime) -> str:
+    """A naive datetime as `YYYY-MM-DDTHH:MM:SS`, four-digit year on every platform.
+
+    Not `strftime("%Y-...")`. That delegates the year to the platform's C
+    library, and glibc writes year 1 as "1" where macOS and Windows write
+    "0001" — so a sentinel timestamp became "1-01-01T00:00:00", `local_date`
+    sliced the first ten characters into "1-01-01T00", and a test written on
+    one platform passed while CI failed on another. `isoformat` is Python's
+    own, and pads.
+    """
+    return moment.isoformat(sep="T", timespec="seconds")
 
 
 def _split_offset(iso: str) -> _Split | None:

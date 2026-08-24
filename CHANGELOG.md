@@ -399,6 +399,14 @@ fixed by moving the boundary rather than by adding another case beside it.
   reject the whole call over one malformed item. It takes `list[Any]` now, so the per-item refusal
   it documents is reachable.
 
+One more, found by CI rather than by review: **a year below 1000 lost its leading zeros on glibc.**
+`strftime("%Y")` delegates the year to the platform's C library, which writes year 1 as "1" on Linux
+and "0001" on macOS and Windows — so a sentinel timestamp read back as `"1-01-01T00:00:00"`,
+`local_date` sliced its first ten characters into `"1-01-01T00"`, and the date band above could not
+judge it. Timestamps are formatted with `isoformat`, which is Python's own and pads, and the
+converted instant now drops its tzinfo explicitly rather than relying on the formatter to omit it.
+The tests that pinned the sentinel shape had been green locally and red on CI since round 4.
+
 Also from that review: the offset is split and parsed once rather than twice per timestamp;
 `_clear_notes` replaces the hand-threaded `(cleared, blanked, clearable)` triple and the default
 argument that existed only to be forgotten; the `assert` in `log_hr` is gone in favour of narrowing

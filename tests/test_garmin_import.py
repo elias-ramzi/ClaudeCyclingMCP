@@ -701,3 +701,31 @@ def test_an_offset_with_no_clock_is_refused_on_the_fallback_path_too(monkeypatch
     assert garmin_import._timestamp("2026-08-20T00:00:00+02:00", to_utc=True) == (
         "2026-08-19T22:00:00"
     ), "a real midnight with an offset is still an instant"
+
+
+def test_a_year_below_1000_still_writes_a_four_digit_year():
+    """`strftime("%Y")` delegates the year to the platform's C library: glibc
+    writes year 1 as "1" where macOS and Windows write "0001". The sentinel
+    then read back as "1-01-01T00:00:00", `local_date` sliced its first ten
+    characters into "1-01-01T00", and the date band could not judge it — so it
+    was refused as unreadable rather than as the sentinel it is. Green locally,
+    red on CI, for two rounds.
+    """
+    from datetime import datetime
+
+    from cycling_mcp.garmin_import import _iso, _timestamp, local_date_of
+
+    assert _iso(datetime(1, 1, 1)) == "0001-01-01T00:00:00"
+    assert _iso(datetime(999, 12, 31, 23, 59, 59)) == "0999-12-31T23:59:59"
+    assert _timestamp("0001-01-01 00:00:00") == "0001-01-01T00:00:00"
+    assert local_date_of({"start_time_local": _timestamp("0001-01-01 00:00:00")}) == "0001-01-01"
+
+
+def test_a_converted_instant_is_stored_naive():
+    """`isoformat` writes the offset that `strftime("%Y-%m-%dT%H:%M:%S")` used
+    to drop, so the tzinfo has to come off explicitly rather than by omission."""
+    from cycling_mcp.garmin_import import _timestamp
+
+    assert _timestamp("2026-08-20T23:12:33+02:00", to_utc=True) == "2026-08-20T21:12:33"
+    assert _timestamp("2026-08-20T23:12:33+02:00") == "2026-08-20T23:12:33"
+    assert _timestamp("2026-08-20T23:12:33Z", to_utc=True) == "2026-08-20T23:12:33"
