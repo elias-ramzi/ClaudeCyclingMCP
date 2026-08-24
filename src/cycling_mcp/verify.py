@@ -345,24 +345,41 @@ def percent_targets(raw: dict) -> list[int]:
     return found
 
 
-def total_step_seconds(payload: dict) -> float:
-    """Sum every step's duration, expanding repeats.
+def total_step_seconds(payload: dict) -> float | None:
+    """Sum every step's duration, expanding repeats. None if any input is null.
+
+    A null is never folded to a number here: a repeat that lost its iteration
+    count — the missing-conditionTypeId corruption — or a step that lost its
+    duration would sum to a plausible smaller total, indistinguishable from a
+    real one. Unknown has to stay unknown.
 
     Garmin's own `estimated_duration_seconds` follows different rules and
     disagrees with this figure, so compare structure, not that field.
     """
 
-    def walk(steps: list[dict]) -> float:
+    def walk(steps: list[dict]) -> float | None:
         total = 0.0
         for step in steps:
             if step.get("type") == "RepeatGroupDTO":
-                iterations = step.get("numberOfIterations") or 1
-                total += iterations * walk(step.get("workoutSteps", []))
+                iterations = _number(step.get("numberOfIterations"))
+                inner = walk(step.get("workoutSteps", []))
+                if iterations is None or inner is None:
+                    return None
+                total += iterations * inner
             else:
-                total += float(step.get("endConditionValue") or 0)
+                duration = _number(step.get("endConditionValue"))
+                if duration is None:
+                    return None
+                total += duration
         return total
 
-    return sum(walk(s.get("workoutSteps", [])) for s in payload.get("workoutSegments", []))
+    total = 0.0
+    for segment in payload.get("workoutSegments", []):
+        seconds = walk(segment.get("workoutSteps", []))
+        if seconds is None:
+            return None
+        total += seconds
+    return total
 
 
 # --- MyWhoosh -----------------------------------------------------------
@@ -643,8 +660,14 @@ def ui_checklist(payload: dict) -> list[str]:
                 describe(child, prefix + "  ")
             return
         label = STEP_LABELS.get(step.get("stepType", {}).get("stepTypeId"), "Step")
-        seconds = int(float(step.get("endConditionValue") or 0))
-        clock = f"{seconds // 60}:{seconds % 60:02d}"
+        # A null duration reads "unknown", never "0:00" — a confident zero
+        # would send the reader hunting for a step the UI does not show.
+        duration = _number(step.get("endConditionValue"))
+        if duration is None:
+            clock = "unknown"
+        else:
+            seconds = int(duration)
+            clock = f"{seconds // 60}:{seconds % 60:02d}"
         target = step.get("targetType", {}).get("workoutTargetTypeId")
         if target == 2:
             low, high = step.get("targetValueOne"), step.get("targetValueTwo")

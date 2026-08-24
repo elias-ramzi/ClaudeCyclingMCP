@@ -448,6 +448,15 @@ criterion actually is — clearable where empty is a state the record can be in,
 `_unscored_warning`'s subject and verb agree for all three callers, as do the lap sentences ("the 1
 timed lap sums to"); and the healed-injury rationale lives in `_stage_clear` alone.
 
+
+- **A null in a payload no longer folds to a number in the duration check.** `total_step_seconds`
+  treated a missing repeat count as 1 and a missing step duration as 0, so a payload corrupted by
+  a dropped `conditionTypeId 7` summed to a plausible smaller total — and when the fetched side
+  carried the same null, `verify_garmin_upload` reported a corrupted workout as matching. The
+  total is now reported as unknown (`null`), `check_garmin_payload` and `verify_garmin_upload`
+  say explicitly what could not be checked, and `ui_checklist` prints `unknown` where it used to
+  print a confident `0:00`. A real zero still sums and still prints as a clock.
+
 ### Notes
 
 Ingestion is model-mediated by design: Claude fetches from the Garmin MCP and passes the JSON here

@@ -172,6 +172,29 @@ def test_verify_fails_a_payload_that_garmin_stored_faithfully_but_was_mistyped(r
     assert any("not the payload render_garmin produced" in d for d in result["differences"])
 
 
+def test_check_garmin_payload_reports_an_unknown_total_not_a_smaller_one(rendered):
+    """A step that lost its duration must not quietly shrink step_seconds."""
+    mangled = json.loads(json.dumps(rendered["payload"]))
+    mangled["workoutSegments"][0]["workoutSteps"][1]["endConditionValue"] = None
+    result = json.loads(check_garmin_payload(mangled, rendered["payload_digest"]))
+    assert result["step_seconds"] is None
+    assert any("unknown" in c for c in result["could_not_check"])
+
+
+def test_verify_garmin_upload_flags_a_null_it_cannot_sum_past():
+    """When both sides carry the same null, the diff is clean — the corruption
+    hides in the total, so the total has to say it could not be computed."""
+    recorded = json.loads((GOLDEN / "recorded_roundtrip.json").read_text(encoding="utf-8"))
+    sent = json.loads(json.dumps(recorded["sent"]))
+    fetched = json.loads(json.dumps(recorded["fetched"]))
+    sent["workoutSegments"][0]["workoutSteps"][1]["numberOfIterations"] = None
+    fetched["segments"][0]["steps"][1]["repeat_count"] = None
+    result = json.loads(verify_garmin_upload(sent, fetched))
+    assert result["differences"] == []
+    assert result["sent_step_seconds"] is None
+    assert any("conditionTypeId 7" in c for c in result["could_not_check"])
+
+
 def test_render_garmin_warns_that_a_flat_ramp_is_lossy(rendered):
     """The athlete sees "hold 130-180 W", not "climb". Nothing else says so."""
     assert any("ramp renders on Garmin" in w for w in rendered["warnings"])
