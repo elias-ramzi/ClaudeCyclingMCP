@@ -2,8 +2,7 @@ export const meta = {
   name: 'fix-review-round',
   description: 'Fix one review round: fable plans, sonnet implements, opus verifies, fable signs off',
   whenToUse:
-    'After a review round is posted on the PR: Workflow({name: "fix-review-round", args: {review: "<comment URL>"}}). ' +
-    'Optional args: {max_attempts: 2, commit: true}. Batches run sequentially (shared files), so wall-clock is the sum of batches.',
+    'After a review round is posted on the PR: Workflow({name: "fix-review-round", args: {review: "<comment URL>"}}). Optional args: {max_attempts: 2, commit: true}. Batches run sequentially (shared files), so wall-clock is the sum of batches.',
   phases: [
     { title: 'Plan', detail: 'fable reads the review and batches the findings into coherent fixes', model: 'fable' },
     { title: 'Implement', detail: 'sonnet fixes one batch at a time, tests first', model: 'sonnet' },
@@ -135,15 +134,29 @@ git diff). The spec it had to satisfy:
 
 ${batch.spec}
 
+MEMORY SAFETY — non-negotiable. This machine has been OOM-killed (48 GB peak) three times by
+earlier verification attempts. The rules:
+- NEVER execute the pre-fix code path. No git stash, no git checkout/restore of src files, no
+  reverting hunks to "watch the tests fail". Establish that a test would fail pre-fix by
+  READING the diff and the test, in your head. The working tree is read-only state for you
+  except scratch files under /private/tmp/claude-501/ — inspect with git diff/status only.
+- Probe inputs sit just outside the guard (cap+1, 0, -1, the empty case), NEVER far outside
+  it. An input designed to exhaust a resource (a huge count, duration, repeat, or string) is
+  never run, not even once — reason about it instead.
+- Every pytest run carries --timeout=120. Every ad-hoc probe script must finish in seconds;
+  if one hangs, kill it and treat the hang as the finding, do not retry bigger.
+
 Verify adversarially, in this order:
 1. Does each fix land at the boundary, not one value inside it? For EVERY new or moved guard,
    try/except, comparison, or cap in the diff, construct and RUN the input just outside it
-   (use .venv/bin/python with CLAUDE_CYCLING_DB at a scratch path under /private/tmp/claude-501/).
+   (use .venv/bin/python with CLAUDE_CYCLING_DB at a scratch path under /private/tmp/claude-501/),
+   subject to the memory-safety rules above.
    Six rounds of this PR's history say boundary misses are the dominant regression class.
-2. Did the fix break what the earlier rounds fixed? Run the full offline suite; also re-probe
-   the specific behaviors the spec says interact with earlier batches.
-3. Are the new tests real? They must fail on the pre-fix code path (check by reasoning or by
-   reverting the fix hunk mentally) and assert response contents, not counts.
+2. Did the fix break what the earlier rounds fixed? Run the full offline suite (with
+   --timeout=120); also re-probe the specific behaviors the spec says interact with earlier
+   batches.
+3. Are the new tests real? They must fail on the pre-fix code path — establish this by
+   reading only, per the memory-safety rules — and assert response contents, not counts.
 4. Any survivor of the batch's pattern left in src/cycling_mcp/ (except verify.py)? Grep.
 Approve ONLY if all four pass. If rejecting, give file:line-precise rework instructions.`,
       { model: 'opus', label: `verify:${batch.name}#${attempt}`, phase: 'Verify', schema: VERDICT_SCHEMA },
@@ -169,8 +182,9 @@ Batch outcomes: ${JSON.stringify(results)}
    interactions the per-batch verifiers could not see: one batch's helper move breaking
    another's caller, duplicate helpers introduced twice, docstrings describing pre-fix
    behavior of another batch, CHANGELOG collisions.
-2. Run the complete gate. Fix trivial gate failures (format, an import) yourself; anything
-   substantive gets reported, not patched.
+2. Run the complete gate, with --timeout=120 on the pytest step. Never run pre-fix code paths
+   or resource-exhaustion inputs; never git stash. Fix trivial gate failures (format, an
+   import) yourself; anything substantive gets reported, not patched.
 3. Self-review for the boundary class: for every guard in the diff, name the value just
    outside it and confirm a test covers it.
 4. Update CHANGELOG.md under the unreleased section with this round's entries if the

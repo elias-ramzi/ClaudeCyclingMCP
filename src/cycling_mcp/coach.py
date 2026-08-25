@@ -46,6 +46,7 @@ from .training import (
     LTHR_FROM_MAX_HR,
     TWENTY_MINUTE_FACTOR,
     Load,
+    _positive,
     classify_block,
     compare_block,
     compute_activity_load,
@@ -55,10 +56,23 @@ from .training import (
     parse_date,
     power_zones,
 )
+from .training import (
+    agree as _agree,
+)
+from .training import one_of as _training_one_of
+from .training import (
+    plural as _plural,
+)
 from .verify import payload_digest
 
 PLANNED_STATUSES = ("planned", "pushed", "completed", "missed", "skipped")
 EVENT_STATUSES = ("upcoming", "completed", "abandoned", "dns")
+#: Statuses that mean the event will not be, or was not, started. Race-day
+#: fuelling — the protected day, the halved fibre — only makes sense for an
+#: event that actually happens; nutrition.py imports this rather than
+#: inlining the two strings, so the definition of "not happening" stays in
+#: one place.
+NON_STARTING_EVENT_STATUSES = ("abandoned", "dns")
 EVENT_PRIORITIES = ("A", "B", "C")
 PUSH_TARGETS = ("garmin", "mywhoosh")
 #: Statuses that linking a ride may turn into `completed`. Anything else is
@@ -86,13 +100,22 @@ MAX_FORM_RUNUP_DAYS = 3660
 # than emptied. Naming a field outside these is a refusal — a caller clearing
 # the wrong one is destroying something, and must not be told it worked.
 CLEARABLE_PROFILE_FIELDS = ("availability", "constraints", "display_name", "equipment")
+#: `distance_km`/`elevation_m` are deliberately NOT here, unlike `note`. Those
+#: are the event's own facts — the race's distance, not a comment about it —
+#: and there is no "unknown distance" state for a named race that a coach or
+#: athlete would ever ask to clear rather than correct; `update_event` still
+#: replaces either with a right number. Revisit if a use case for "delete the
+#: distance and leave it unknown" turns up.
 CLEARABLE_EVENT_FIELDS = ("note",)
 #: A result is three things — the status, the time, the ride — and undoing one
 #: filed against the wrong race means retracting all three. Clearing the
 #: debrief alone left a finish time on an again-upcoming event and a ride still
 #: read as that race's.
 CLEARABLE_RESULT_FIELDS = ("debrief", "finish_time_s", "linked_activity_id")
-CLEARABLE_ACTIVITY_FIELDS = ("feel", "note")
+#: `rpe` is here because an unrated ride is a real state, same as no `note` —
+#: the write path still forces 1-10 when a value is given; clearing is the only
+#: way back to "not rated" once one was logged in error.
+CLEARABLE_ACTIVITY_FIELDS = ("feel", "note", "rpe")
 #: `linked_activity_id` is here because "no ride linked" is the state a
 #: mislinked session has to be able to return to. `link_activity` only ever
 #: re-links to another real ride, so a session auto-linked to the wrong one and
@@ -216,27 +239,6 @@ def _project(row: sqlite3.Row | dict, fields: tuple[str, ...]) -> dict:
         raw = projected.pop("flags_json")
         projected["flags"] = json.loads(raw) if raw else []
     return projected
-
-
-def _positive(value: float | None) -> float | None:
-    """A duration that is really one, or None for a placeholder.
-
-    Null, zero and negative are the same answer — "this row does not say how
-    long" — and only the first of the three used to be treated that way.
-    `compute_activity_load` has always refused to score a ride on `<= 0`; this
-    is that test, where the comparisons live.
-    """
-    return value if value is not None and value > 0 else None
-
-
-def _plural(count: int, noun: str) -> str:
-    """ "1 lap" / "3 laps" — the count and its noun, agreeing."""
-    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
-
-
-def _agree(count: int, verb: str) -> str:
-    """The present-tense verb for a subject of `count`: "sums" / "sum"."""
-    return f"{verb}s" if count == 1 else verb
 
 
 def _text(value: Any) -> str | None:
@@ -419,12 +421,11 @@ def _check_range(value: float, limits: tuple[float, float], what: str, unit: str
 
 
 def _one_of(value: str | None, allowed: tuple[str, ...], what: str) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if text not in allowed:
-        raise CoachError(f"{what} must be one of {list(allowed)}, got {text!r}")
-    return text
+    """See `training.one_of`: case-insensitive, returns the stored spelling."""
+    try:
+        return _training_one_of(value, allowed, what)
+    except ValueError as exc:
+        raise CoachError(str(exc)) from exc
 
 
 def _ensure_athlete(conn: sqlite3.Connection, athlete_id: int) -> dict:
@@ -1188,7 +1189,15 @@ def log_weight(
     the question rather than refusing — but every W/kg computed from a pounds
     figure is wrong by a factor of 2.2, so the question is worth asking.
     """
-    value = float(value_kg)
+    try:
+        value = float(value_kg)
+    except (TypeError, ValueError, OverflowError) as exc:
+        # OverflowError: a JSON integer has no size limit, so a pasted
+        # 400-digit value_kg reaches float() directly, with no earlier point
+        # where a too-large int could have been refused. `_coach`'s own
+        # OverflowError clause is the backstop, not the fix — this is the
+        # named refusal a caller can act on.
+        raise CoachError(f"value_kg must be a number, got {value_kg!r}") from exc
     _check_range(value, WEIGHT_LIMITS_KG, "weight", "kg")
     when = parse_date(effective_date, "effective_date") if effective_date else date.today()
 
@@ -1612,6 +1621,18 @@ def record_race_result(
     debrief left a finish time on an again-upcoming event and a ride `get_week`
     still read as that race's.
 
+    Retracting all three at once, on a call that actually cleared something
+    and left the event with no result at all, reverts `status` from
+    `completed` back to `upcoming` — the same way a result completed it,
+    undone — unless `status` is given explicitly in the same call. Otherwise
+    the full retraction recommended above leaves a `completed` event with no
+    time, no ride and no debrief, which is not a state a result ever produces
+    on its own. The response names the revert in `status_reverted_note`. A
+    call that cleared nothing never reverts status this way, whatever result
+    fields happen to be empty — a bare existence probe on an event a
+    past-dated `add_event` already completed with no result must not rewrite
+    it to `upcoming`.
+
     A call carrying no result at all writes nothing, including the status: an
     upcoming event is completed by a result, not by being asked about.
     """
@@ -1626,6 +1647,13 @@ def record_race_result(
             seconds = parse_duration(finish_time)
         except ValueError as exc:
             raise CoachError(f"finish_time: {exc}") from None
+        # parse_duration has no sign check of its own — spec blocks do their
+        # own <= 0 refusal at their own call site, and a race result is the
+        # other caller. Unchecked, finish_time=-272 stored and auto-completed
+        # the event with a finish time that renders as "-1:55:28"; finish_time
+        # =0 did the same while the display hid the problem entirely.
+        if seconds <= 0:
+            raise CoachError(f"finish_time must be greater than zero, got {seconds}s")
 
     with open_db() as conn:
         event = _dict(
@@ -1657,6 +1685,36 @@ def record_race_result(
             updates["finish_time_s"] = seconds
         blanked = _stage_text(updates, {"debrief": debrief})
         cleared = _stage_clear(updates, clear, CLEARABLE_RESULT_FIELDS, blanked)
+
+        # A result is three fields; retracting all three — the docstring's own
+        # recipe, `clear=["debrief", "finish_time_s", "linked_activity_id"]` —
+        # left `completed` standing over an event with no time, no ride and no
+        # debrief. Reverting mirrors the auto-complete below, the other way.
+        def _final(field: str) -> Any:
+            return updates[field] if field in updates else event.get(field)
+
+        no_result_left = not (
+            _final("finish_time_s") or _final("linked_activity_id") or _final("debrief")
+        )
+        # Gated on an actual retraction, not just on "nothing survives": a
+        # call that never removed anything (an existence probe, a clear on a
+        # column that was already NULL) also satisfies no_result_left, and
+        # reverting THAT rewrites a status somebody chose into one nobody
+        # asked for — a past-dated add_event defaults a race to completed
+        # with no result at all. `cleared` alone is not that evidence:
+        # `_stage_clear` records a name whether or not the column held
+        # anything, so the gate reads the stored row — every name in
+        # `cleared` is a result field, and "did this call remove something
+        # real" is exactly whether the event held any of them.
+        retracted = any(event.get(field) for field in cleared)
+        status_reverted = (
+            retracted
+            and no_result_left
+            and "status" not in updates
+            and event["status"] == "completed"
+        )
+        if status_reverted:
+            updates["status"] = "upcoming"
 
         # After the fields, not before them, and on the result itself rather
         # than on "did anything change". Auto-completing first meant a bare
@@ -1695,6 +1753,13 @@ def record_race_result(
             if updates
             else f"'{event['name']}' stays {event['status']}, and nothing else was given. "
             "Pass a finish time, a debrief, an activity, or an explicit status."
+        )
+    if status_reverted:
+        result["status_reverted_note"] = (
+            f"'{event['name']}' had its debrief, finish time and linked ride all cleared, "
+            "leaving no result — so status reverted from completed to upcoming rather than "
+            "standing over nothing. Pass status explicitly ('abandoned', 'dns') if that is "
+            "what actually happened."
         )
     if activity is not None:
         result["linked_activity"] = _project(activity, _ACTIVITY_OUT_FIELDS)
@@ -2057,6 +2122,12 @@ def list_activities(
     missed-session narrative.
     """
     sport = _one_of(sport, SPORTS, "sport")
+    if int(limit) < 1:
+        # limit=0 used to report count 0 with truncated=True — a caller reading
+        # that as "no activities" instead of "the limit was nonsense" would
+        # believe an empty log. Negative limits hit the same LIMIT clause with
+        # the same silent misread.
+        raise CoachError(f"limit must be at least 1, got {limit}")
     clauses = ["athlete_id = ?"]
     params: list[Any] = [athlete_id]
     if start:
@@ -2383,6 +2454,15 @@ def update_planned_workout(
     guessed wrong. Without it a session linked to the wrong ride and then
     marked `missed` fell out of both of `get_week`'s deviation lists at once,
     and `compliance_report` kept answering about that ride forever.
+
+    `link_activity` is what sets `completed`; clearing the only ride behind it
+    without saying otherwise once left a `completed` session with no ride at
+    all — invisible to `planned_not_ridden` (no AUTO_COMPLETABLE status left to
+    walk back from) and to `ridden_not_planned` (there is no ride). Clearing a
+    real link with no explicit `status` in the same call now reverts `status`
+    from `completed` back to `planned` — the same way linking set it, undone —
+    and the response says so in `status_reverted_note`. Pass `status`
+    explicitly to keep `completed` (or set anything else) instead.
     """
     updates: dict[str, Any] = {}
     if status is not None:
@@ -2425,6 +2505,21 @@ def update_planned_workout(
             # column stages a None, and looking that up would refuse the unlink
             # with "pass either activity_id or garmin_activity_id".
             _find_activity(conn, athlete_id, updates["linked_activity_id"], None)
+
+        # `"linked_activity_id" in cleared` is true even when the column was
+        # already NULL, so this also requires a link to have actually
+        # existed — otherwise a manually `completed` session with no link
+        # (ridden on another app) had its status reverted by an unrelated
+        # clear. An explicit `status` in the same call always wins.
+        status_reverted = (
+            "linked_activity_id" in cleared
+            and row["linked_activity_id"] is not None
+            and "status" not in updates
+            and row["status"] == "completed"
+        )
+        if status_reverted:
+            updates["status"] = "planned"
+
         assignments = ", ".join(f"{key} = ?" for key in updates)
         conn.execute(
             f"UPDATE planned_workouts SET {assignments}, updated_at = ? WHERE id = ?",
@@ -2448,6 +2543,14 @@ def update_planned_workout(
         result["note"] = (
             "Status is 'pushed' but pushed_to is unset. Record which platform it went to — "
             "otherwise nothing distinguishes a session on the head unit from one in MyWhoosh."
+        )
+    if status_reverted:
+        result["status_reverted_note"] = (
+            "linked_activity_id was cleared with no explicit status, so status reverted from "
+            "completed to planned — the same way link_activity set it, undone. A completed "
+            "session with no ride at all would otherwise be invisible to both deviation lists "
+            "in get_week. Pass status explicitly ('missed', 'skipped') if that is what "
+            "actually happened."
         )
     return result
 
@@ -2838,7 +2941,16 @@ def get_form(
     # The walk is bounded at both ends: the window by the span cap above, the
     # run-up by this. Together they cap the number of days stepped whatever
     # dates arrive, from the caller or from a stored row.
-    runup_floor = max(first - timedelta(days=MAX_FORM_RUNUP_DAYS), PLAUSIBLE_DATE_FLOOR)
+    #
+    # Clamp before subtracting, not after: `first - timedelta(...)` for any
+    # `first` within MAX_FORM_RUNUP_DAYS of date.min overflows (`OverflowError`,
+    # an ArithmeticError _coach's catch list did not cover) before `max()` ever
+    # runs. date - date never overflows, so compare durations instead of
+    # computing the out-of-range date at all.
+    if (first - PLAUSIBLE_DATE_FLOOR) < timedelta(days=MAX_FORM_RUNUP_DAYS):
+        runup_floor = PLAUSIBLE_DATE_FLOOR
+    else:
+        runup_floor = first - timedelta(days=MAX_FORM_RUNUP_DAYS)
 
     daily: dict[date, float] = {}
     methods: dict[str, int] = {}
@@ -2856,19 +2968,23 @@ def get_form(
             activity = _dict(row) or {}
             day = parse_date(activity["local_date"], "local_date")
             if PLAUSIBLE_DATE_FLOOR <= day < runup_floor:
-                # Real training, just too far back to be worth walking to. It
-                # is counted so the response can say the run-up was cut, rather
-                # than reporting a shorter history than the log holds.
+                # Real training, just too far back to feed the walk at all —
+                # counted so the response can say the run-up was cut, and
+                # skipped before scoring, so a ride the walk will never use
+                # cannot still show up in `methods` or `unscored`. Scoring it
+                # anyway and filtering the result afterward is exactly what
+                # let a stray HR ride outside the window trip
+                # mixed_methods_warning for a window it played no part in.
                 capped += 1
-            elif day < PLAUSIBLE_DATE_FLOOR:
+                continue
+            if day < PLAUSIBLE_DATE_FLOOR:
                 # Import refuses these now, but a row stored before that rule
                 # existed would still drag `earliest` — and with it the walk —
-                # back to year 1. The run-up starts at the first date that
-                # could be a training date; the ride is still scored on its own
-                # day, which is outside every window anyone will ask for.
+                # back to year 1. Excluded from the walk entirely, same as a
+                # capped ride: it is outside every window anyone will ask for.
                 implausible.append(activity["local_date"])
-            else:
-                earliest = day if earliest is None else min(earliest, day)
+                continue
+            earliest = day if earliest is None else min(earliest, day)
             load = _activity_load(history, activity)
             methods[load.method] = methods.get(load.method, 0) + 1
             if load.tss is not None:
@@ -2881,8 +2997,9 @@ def get_form(
                 # here; saying it is missing is the whole of the fix.
                 unscored += 1
 
-    # The walk starts at the earliest day inside both bounds, never before it.
-    daily = {day: tss for day, tss in daily.items() if day >= runup_floor}
+    # Every entry in `daily` is already inside [runup_floor, last] — capped and
+    # implausible rows never reached the scoring branch above, so there is
+    # nothing left to filter out here.
     points = form_series(daily, first, last, seed_ctl=seed_ctl, seed_atl=seed_atl)
     runup_days = (first - earliest).days if earliest else 0
 
@@ -2920,9 +3037,9 @@ def get_form(
         result["excluded_implausible_note"] = (
             f"{_plural(len(implausible), 'stored ride')} "
             f"{_agree(len(implausible), 'carry')} a date before "
-            f"{PLAUSIBLE_DATE_FLOOR.isoformat()} and was left out of the run-up: a sentinel "
-            "date would otherwise start the walk two thousand years early. Import refuses "
-            "these now; these rows predate that."
+            f"{PLAUSIBLE_DATE_FLOOR.isoformat()} and {_agree(len(implausible), 'was')} left out "
+            "of the run-up: a sentinel date would otherwise start the walk two thousand years "
+            "early. Import refuses these now; these rows predate that."
         )
     if unscored:
         result["unscored"] = unscored
@@ -3110,12 +3227,14 @@ def compliance_report(
         alignment = "mismatch"
 
     planned_seconds = metrics.total_seconds
-    # Not `or 0`. A ride imported from a thin payload carries no duration — it
-    # is tolerated and flagged `no_duration`, not rejected — and folding that
-    # to zero reported "rode 0:00" and then asserted the ride was the whole
-    # planned session shorter than planned, in the field the docstring says to
-    # read first. A deviation nobody rode is worse than no answer.
-    actual_seconds = activity.get("duration_s")
+    # Through `_positive`, not `activity.get("duration_s")` alone. A ride
+    # imported from a thin payload carries no duration — tolerated and
+    # flagged `no_duration`, not rejected — and a stored 0 is the same
+    # placeholder, not a ride that took no time. Either one, read as a
+    # measurement, reported "rode 00:00" and then asserted the ride was the
+    # whole planned session shorter than planned. A deviation nobody rode is
+    # worse than no answer.
+    actual_seconds = _positive(activity.get("duration_s"))
     actual_np = activity.get("normalized_power") or activity.get("avg_power")
     summary_sentences: list[str] = [
         f"Planned {format_duration(planned_seconds)} at IF "

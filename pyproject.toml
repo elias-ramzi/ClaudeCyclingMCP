@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-cycling-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Author a structured cycling workout once; render it to MyWhoosh .zwo and Garmin Connect JSON."
 readme = "README.md"
 license = { text = "MIT" }
@@ -21,6 +21,10 @@ dependencies = ["mcp>=1.2.0"]
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    # A runaway test (an unbounded 1 Hz expansion, an accidental network wait)
+    # once ballooned to tens of GB before anyone noticed; the suite-wide
+    # timeout below kills it in seconds instead.
+    "pytest-timeout>=2.3",
     "ruff>=0.6",
     # 3.10 has no stdlib tomllib; without this the version lock-step test would
     # skip there rather than run.
@@ -87,3 +91,6 @@ line-ending = "lf"
 testpaths = ["tests"]
 markers = ["live: touches the real Garmin Connect API (deselect with -m 'not live')"]
 addopts = "-m 'not live'"
+# No single offline test has a reason to run longer than this; one that does is
+# hanging or allocating without bound, and must die before the machine does.
+timeout = 120

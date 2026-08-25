@@ -2,7 +2,7 @@
 
 The same database and the same athlete as [the coach layer](coaching.md): an ingredient base,
 standard meals, a per-ingredient food log, day-type-aware targets, and weekly summaries with food
-cost. Sixteen tools, no network, nothing uploaded anywhere.
+cost. Eighteen tools, no network, nothing uploaded anywhere.
 
 The division of labour is the whole design. **The server does every gram of the arithmetic** — macro
 sums, running totals, BMR, the day's remainder, the weekly average — so nothing above it ever adds
@@ -45,6 +45,13 @@ A log entry is a measurement; a meal is a recipe. The one exception is `edit_log
 quantity, which recomputes — because there the athlete is restating what they ate, not re-reading old
 data.
 
+**Blank text never overwrites; `clear=[...]` is the only path to null.** `update_ingredient` and
+`save_meal` (there is no separate `update_meal`) each take a `clear` list for their own optional
+fields — a wrong package price or a stale note can return to unknown, the same erase-is-a-verb rule
+`update_profile` and the other coach-layer update tools follow. `delete_ingredient` and `delete_meal`
+remove a row outright: a meal always may, since every entry already logged from it keeps its own
+frozen macros and meal name; an ingredient is refused while any log entry or meal still points at it.
+
 ## Resolving a name
 
 Terse logging is the point: "skyr, 200" has to work. So every ingredient carries aliases, and names
@@ -79,6 +86,13 @@ true}`. They count toward calories and protein, are flagged as approximate in ev
 numbers nobody measured. `week_summary` reports how many entries it could not price, because a total
 treating them as free reads as a cheap week and is a wrong one.
 
+`protein_g` and `fiber_g` are optional on an estimate, the way `carbs_g`/`fat_g` already were — a
+restaurant plate states its calories and nothing else. An unstated figure comes back `null`, never a
+folded `0`; `day_summary`'s totals still sum what *is* known (a day with nothing logged reports a real
+`0.0`, not `null`) and name how many entries did not say, with a note that the remainder above
+overstates by that much. A stated `protein_g: 0` (black coffee) still stores `0.0` and is not counted
+as missing — a stated zero is a measurement.
+
 ## Suggesting a target
 
 `suggest_targets` is deterministic and **stores nothing**. Every input and intermediate comes back in
@@ -95,13 +109,18 @@ treating them as free reads as a cheap week and is a wrong one.
    measurement beats a model. For a future date, the planned session's mechanical work converted at
    cycling's gross efficiency (24%, and 4.184 kJ/kcal — which is why a ride's kJ and its kcal come out
    near enough equal). Where there is neither, zero, said out loud; `exercise_kcal_override` supplies
-   an estimate for a race or an unimported ride. Where a date has both, the import wins and the
-   estimate is reported beside it.
-4. **± the goal's rate**, at 7700 kcal/kg spread evenly across the week — **except** on a
-   `big_session`, `race` or `race_eve` day, where it is withheld. Under-fuelling a hard session costs
+   an estimate for a race or an unimported ride. Where a date has an import AND a still-planned
+   session that is not linked to that import, the two are summed — a second session that has not
+   happened yet is not the same session as the one that has. A planned session that is completed,
+   or explicitly linked to one of the day's activities (`link_activity` / `update_planned_workout`),
+   is that same session under a different id and is never added on top.
+4. **± the goal's rate**, at 7700 kcal/kg spread evenly across the week — **except** a deficit on a
+   `big_session`, `race` or `race_eve` day, which is withheld. Under-fuelling a hard session costs
    the session and the recovery from it, and those are the least useful calories in the week to save.
    The response says how many were withheld, so the weekly average being slightly shallower than the
-   stated rate is visible rather than a discrepancy.
+   stated rate is visible rather than a discrepancy. A **surplus** (a `gain` goal) is applied in full
+   on those same days instead of withheld — under-fuelling is the risk a protected day runs, not
+   over-fuelling.
 5. **Clamped up to BMR.** A target below resting metabolic rate is not a target this server will
    produce. It clamps and says the goal's rate is what should change. `confirm_targets` refuses one
    outright, whoever asked.

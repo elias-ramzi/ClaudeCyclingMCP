@@ -2239,3 +2239,336 @@ def test_a_normal_window_is_never_capped():
     form = coach.get_form("2026-07-05", "2026-07-31")
     assert "runup_capped" not in form
     assert "excluded_implausible_dates" not in form
+
+
+# --------------------------------------------------------------------------
+# review round 6
+# --------------------------------------------------------------------------
+
+
+def test_get_form_near_year_one_does_not_overflow_the_runup_clamp():
+    """`first - timedelta(days=MAX_FORM_RUNUP_DAYS)` used to be evaluated
+    before `max()` ever saw the result, so any window starting inside about
+    the first ten years of the representable range raised OverflowError — an
+    ArithmeticError, outside every refusal `_coach` knows how to catch."""
+    result = coach.get_form("0001-06-01", "0001-08-01")
+    assert result["start"] == "0001-06-01"
+    assert result["end"] == "0001-08-01"
+    assert len(result["series"]) == 62
+    assert "warmup_incomplete" in result
+
+
+def test_get_form_starting_exactly_at_the_plausible_date_floor_is_unchanged():
+    result = coach.get_form("1990-01-01", "1990-01-10")
+    assert result["start"] == "1990-01-01"
+    assert len(result["series"]) == 10
+
+
+def test_compliance_report_zero_duration_ride_is_not_a_measurement():
+    """A stored 0 is the same placeholder as a null duration, not a ride that
+    took no time at all — comparing it against the plan asserted a deviation
+    nobody actually rode."""
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities(
+        [
+            {
+                "activityId": 9500,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-05 08:00:00",
+                "duration": 0,
+            }
+        ]
+    )
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.link_activity(planned_id, auto=True)
+    report = coach.compliance_report(planned_id)
+    assert report["actual"]["duration_s"] is None
+    assert any("carries no duration" in s for s in report["sentences"])
+    assert not any(
+        "shorter than planned" in s or "longer than planned" in s for s in report["sentences"]
+    )
+
+
+def test_unlinking_an_auto_completed_session_reverts_status_to_planned():
+    planned_id = _week_with_a_plan_and_a_ride()
+    coach.link_activity(planned_id, auto=True)
+    result = coach.update_planned_workout(planned_id, clear=["linked_activity_id"])
+    assert result["planned_workout"]["status"] == "planned"
+    assert result["planned_workout"]["linked_activity_id"] is None
+    assert "status_reverted_note" in result
+    assert "reverted from completed to planned" in result["status_reverted_note"]
+
+
+def test_unlinking_with_an_explicit_status_does_not_revert():
+    planned_id = _week_with_a_plan_and_a_ride()
+    coach.link_activity(planned_id, auto=True)
+    result = coach.update_planned_workout(planned_id, clear=["linked_activity_id"], status="missed")
+    assert result["planned_workout"]["status"] == "missed"
+    assert "status_reverted_note" not in result
+
+
+def test_unlinking_an_already_planned_session_has_no_revert_note():
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    result = coach.update_planned_workout(planned_id, clear=["linked_activity_id"])
+    assert result["planned_workout"]["status"] == "planned"
+    assert "status_reverted_note" not in result
+
+
+def test_full_race_retraction_reverts_status_to_upcoming():
+    coach.import_activities([RIDE])
+    event = coach.add_event("Club 100", "2026-07-05", priority="B")["stored"]
+    coach.record_race_result(
+        event["id"], garmin_activity_id="5001", finish_time="4:32:10", debrief="wrong race"
+    )
+    result = coach.record_race_result(
+        event["id"], clear=["debrief", "finish_time_s", "linked_activity_id"]
+    )
+    assert result["stored"]["status"] == "upcoming"
+    assert "status_reverted_note" in result
+    assert "reverted from completed to upcoming" in result["status_reverted_note"]
+
+
+def test_partial_race_clear_with_a_finish_time_remaining_stays_completed():
+    event = coach.add_event("Club 100", "2026-07-04", priority="B")["stored"]
+    coach.record_race_result(event["id"], finish_time="4:32:10", debrief="held on")
+    result = coach.record_race_result(event["id"], clear=["debrief"])
+    assert result["stored"]["status"] == "completed"
+    assert "status_reverted_note" not in result
+
+
+def test_a_no_op_clear_on_a_completed_event_with_no_result_does_not_revert_status():
+    """`_stage_clear` records a field name even when the column was already
+    NULL, so a clear that removed nothing is not evidence a result was
+    retracted. A past-dated add_event defaults a race to completed with no
+    result at all; a no-op clear on it must not un-complete it, and must not
+    report a retraction that did not happen."""
+    event = coach.add_event("Past Sportive", "2026-06-01")["stored"]
+    assert event["status"] == "completed"
+    result = coach.record_race_result(event["id"], clear=["debrief"])
+    assert result["stored"]["status"] == "completed"
+    assert "status_reverted_note" not in result
+
+
+def test_explicit_status_wins_over_the_retraction_revert():
+    coach.import_activities([RIDE])
+    event = coach.add_event("Club 100", "2026-07-05", priority="B")["stored"]
+    coach.record_race_result(
+        event["id"], garmin_activity_id="5001", finish_time="4:32:10", debrief="wrong race"
+    )
+    result = coach.record_race_result(
+        event["id"], status="dns", clear=["debrief", "finish_time_s", "linked_activity_id"]
+    )
+    assert result["stored"]["status"] == "dns"
+    assert "status_reverted_note" not in result
+
+
+def test_bare_probe_on_a_past_dated_completed_event_does_not_revert_status():
+    """add_event on a past date defaults status to completed with no result at
+    all. A bare record_race_result — an existence probe, a partial retry —
+    must not un-complete a race the athlete already rode just because it
+    finds no_result_left true; status_reverted also requires that THIS call
+    cleared something."""
+    event = coach.add_event("Past Sportive", "2026-06-01")["stored"]
+    assert event["status"] == "completed"
+    result = coach.record_race_result(event["id"])
+    assert result["updated_fields"] == []
+    assert result["stored"]["status"] == "completed"
+    assert "stays completed" in result["status_unchanged"]
+    assert "status_reverted_note" not in result
+
+
+def test_blank_debrief_on_a_deliberately_completed_event_does_not_revert_status():
+    """A blank debrief (not a `clear`) is ignored text, per _stage_text — it
+    must not be read as retracting the result and reverting a status that was
+    set on purpose with no result attached."""
+    event = coach.add_event("Club 100", "2026-07-05", priority="B")["stored"]
+    coach.record_race_result(event["id"], status="completed")
+    result = coach.record_race_result(event["id"], debrief="   ")
+    assert result["stored"]["status"] == "completed"
+    assert "status_reverted_note" not in result
+
+
+def test_unlinking_a_manually_completed_session_with_no_link_does_not_revert():
+    """status='completed' set manually (ridden on another app, no Garmin
+    link) followed by clear=['linked_activity_id'] must not revert status —
+    'linked_activity_id' in cleared is true even though nothing was linked."""
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.update_planned_workout(planned_id, status="completed")
+    result = coach.update_planned_workout(planned_id, clear=["linked_activity_id"])
+    assert result["planned_workout"]["status"] == "completed"
+    assert "status_reverted_note" not in result
+
+
+def _upcoming_status(event_id):
+    return next(e for e in coach.list_events("all")["events"] if e["id"] == event_id)["status"]
+
+
+def test_zero_finish_time_is_refused():
+    # A future date, so the event starts `upcoming` rather than defaulting to
+    # `completed` at creation (add_event completes anything already past) —
+    # otherwise the assertion below could not tell a real refusal from a
+    # status that was `completed` before the call ever ran.
+    event = coach.add_event("Club 100", "2026-09-04", priority="B")["stored"]
+    with pytest.raises(coach.CoachError, match="finish_time"):
+        coach.record_race_result(event["id"], finish_time=0)
+    assert _upcoming_status(event["id"]) == "upcoming"
+
+
+def test_a_negative_finish_time_is_refused():
+    event = coach.add_event("Club 100", "2026-09-04", priority="B")["stored"]
+    with pytest.raises(coach.CoachError, match="finish_time"):
+        coach.record_race_result(event["id"], finish_time=-272)
+    assert _upcoming_status(event["id"]) == "upcoming"
+
+
+def test_a_finish_time_of_one_second_is_accepted():
+    event = coach.add_event("Club 100", "2026-09-04", priority="B")["stored"]
+    result = coach.record_race_result(event["id"], finish_time=1)
+    assert result["stored"]["finish_time_s"] == 1
+    assert result["stored"]["status"] == "completed"
+
+
+def test_capped_rides_do_not_pollute_methods_or_the_mixed_methods_warning():
+    """A ride that cannot feed the walk must not feed `methods` either — it
+    was scored on its own day and then thrown away by the post-loop filter,
+    so `mixed_methods_warning` fired about a ride nothing downstream ever saw."""
+    coach.log_ftp(value_watts=266, effective_date="2015-01-01")
+    coach.log_hr(threshold_hr=170, effective_date="2015-01-01")
+    coach.import_activities([RIDE])  # 2026-07-05, power, inside the window
+    hr_only = {k: v for k, v in RIDE.items() if k not in ("avgPower", "normPower")}
+    coach.import_activities(
+        [
+            {
+                **hr_only,
+                "activityId": 9700,
+                "startTimeLocal": "2015-07-05 07:00:00",
+                "startTimeGMT": "2015-07-05 05:00:00",
+            }
+        ]
+    )
+    form = coach.get_form("2026-07-05", "2026-07-06")
+    assert "hr" not in form["methods"]
+    assert "mixed_methods_warning" not in form
+    assert form.get("unscored", 0) == 0
+    assert "1 ride sits more than 3660 days before" in form["runup_capped"]
+
+
+def test_a_capped_rides_null_tss_does_not_count_as_unscored():
+    coach.log_ftp(value_watts=266, effective_date="2015-01-01")
+    coach.import_activities([RIDE])  # inside the window, scored
+    coach.import_activities(
+        [
+            {
+                "activityId": 9701,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2015-07-05 07:00:00",
+                "startTimeGMT": "2015-07-05 05:00:00",
+                "duration": 3600.0,
+            }
+        ]
+    )  # no power, no HR — would be unscored if it were walked at all
+    form = coach.get_form("2026-07-05", "2026-07-06")
+    assert form.get("unscored", 0) == 0
+    assert "1 ride sits more than 3660 days before" in form["runup_capped"]
+
+
+def test_an_implausible_dated_rides_null_tss_does_not_count_as_unscored():
+    import sqlite3
+
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities([RIDE])
+    conn = sqlite3.connect(store.db_path())
+    conn.execute(
+        "INSERT INTO activities (athlete_id, garmin_activity_id, local_date, "
+        "start_time_local, source, imported_at) "
+        "VALUES (1, '9800', '0001-01-01', '0001-01-01T00:00:00', 'garmin', 'x')"
+    )
+    conn.commit()
+    conn.close()
+
+    form = coach.get_form("2026-07-01", "2026-07-31")
+    assert form.get("unscored", 0) == 0
+    assert form["excluded_implausible_dates"] == ["0001-01-01"]
+
+
+def test_agree_handles_consonant_y_verbs():
+    """`_agree(1, "carry")` used to read "carrys"."""
+    assert coach._agree(1, "carry") == "carries"
+    assert coach._agree(2, "carry") == "carry"
+    assert coach._agree(1, "sum") == "sums"
+    assert coach._agree(3, "sum") == "sum"
+
+
+def test_the_implausible_note_agrees_with_a_single_ride():
+    import sqlite3
+
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities([RIDE])
+    conn = sqlite3.connect(store.db_path())
+    conn.execute(
+        "INSERT INTO activities (athlete_id, garmin_activity_id, local_date, "
+        "start_time_local, duration_s, avg_power, source, imported_at) "
+        "VALUES (1, '9600', '0001-01-01', '0001-01-01T00:00:00', 3600, 200, 'garmin', 'x')"
+    )
+    conn.commit()
+    conn.close()
+
+    form = coach.get_form("2026-07-01", "2026-07-31")
+    assert form["excluded_implausible_note"] == (
+        "1 stored ride carries a date before 1990-01-01 and was left out of the run-up: a "
+        "sentinel date would otherwise start the walk two thousand years early. Import refuses "
+        "these now; these rows predate that."
+    )
+
+
+def test_the_implausible_note_agrees_with_several_rides():
+    import sqlite3
+
+    coach.log_ftp(value_watts=266, effective_date="2026-01-01")
+    coach.import_activities([RIDE])
+    conn = sqlite3.connect(store.db_path())
+    for gid in ("9601", "9602"):
+        conn.execute(
+            "INSERT INTO activities (athlete_id, garmin_activity_id, local_date, "
+            "start_time_local, duration_s, avg_power, source, imported_at) "
+            "VALUES (1, ?, '0001-01-01', '0001-01-01T00:00:00', 3600, 200, 'garmin', 'x')",
+            (gid,),
+        )
+    conn.commit()
+    conn.close()
+
+    form = coach.get_form("2026-07-01", "2026-07-31")
+    assert form["excluded_implausible_note"] == (
+        "2 stored rides carry a date before 1990-01-01 and were left out of the run-up: a "
+        "sentinel date would otherwise start the walk two thousand years early. Import refuses "
+        "these now; these rows predate that."
+    )
+
+
+def test_rpe_can_be_cleared():
+    coach.import_activities([RIDE])
+    coach.annotate_activity(garmin_activity_id="5001", rpe=7)
+    result = coach.annotate_activity(garmin_activity_id="5001", clear=["rpe"])
+    assert result["cleared_fields"] == ["rpe"]
+    assert result["stored"]["rpe"] is None
+
+
+def test_clearing_rpe_when_none_is_stored_still_succeeds():
+    coach.import_activities([RIDE])
+    result = coach.annotate_activity(garmin_activity_id="5001", clear=["rpe"])
+    assert result["cleared_fields"] == ["rpe"]
+    assert result["stored"]["rpe"] is None
+
+
+def test_list_activities_limit_of_one_still_works():
+    coach.import_activities([RIDE])
+    assert coach.list_activities(limit=1)["count"] == 1
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_list_activities_limit_below_one_is_refused(limit):
+    with pytest.raises(coach.CoachError, match="limit must be at least 1"):
+        coach.list_activities(limit=limit)

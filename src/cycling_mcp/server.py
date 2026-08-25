@@ -921,7 +921,21 @@ def _coach(function, **kwargs) -> str:
                 "hint": "Restore from an export_data backup, or repair the row by hand.",
             }
         )
-    except (CoachError, NutritionError, StoreError, GarminPayloadError, ValueError) as exc:
+    except (
+        CoachError,
+        NutritionError,
+        StoreError,
+        GarminPayloadError,
+        ValueError,
+        OverflowError,
+    ) as exc:
+        # OverflowError is an ArithmeticError, not a ValueError, so it needs
+        # its own name here rather than riding along with ValueError. Defense
+        # in depth: `get_form`'s own date-minus-date arithmetic cannot
+        # overflow any more (it is clamped before subtracting), but this is
+        # the backstop for the next date arithmetic that gets that order
+        # wrong, in this tool or another one — a refusal here, not a crash
+        # across the MCP boundary with no structure a caller can act on.
         return _dump({"ok": False, "error": str(exc)})
     except sqlite3.Error as exc:
         # A database that cannot be read is the caller's problem to act on —
@@ -1263,13 +1277,18 @@ def record_race_result(
     parts of a result, and retracting one filed against the wrong race means
     all three — a cleared debrief alone leaves a finish time on the
     again-upcoming event and a ride get_week still reads as that race's.
-    Clearing is not a result, so it never completes an upcoming event.
+    Clearing is not a result, so it never completes an upcoming event. A full
+    retraction of all three, on a `completed` event, reverts `status` back to
+    `upcoming` on its own — named in `status_reverted_note` — unless `status`
+    is given explicitly in the same call.
 
-    `finish_time` takes "4:32:10" or a number of seconds. The **debrief is the
-    point**: what the pacing was, what was eaten and when, what went wrong.
-    Write it from the ride data plus what the athlete says, in their terms, and
-    store it while it is fresh. A year later it is the only part of this record
-    that still teaches anything.
+    `finish_time` takes "4:32:10" or a number of seconds, and must be
+    positive: zero or negative is refused rather than stored as a race that
+    finishes before it starts. The **debrief is the point**: what the pacing
+    was, what was eaten and when, what went wrong. Write it from the ride data
+    plus what the athlete says, in their terms, and store it while it is
+    fresh. A year later it is the only part of this record that still teaches
+    anything.
     """
     return _coach(
         coach.record_race_result,
@@ -1531,6 +1550,12 @@ def update_planned_workout(
     the unlink, a session marked `missed` with a link still attached vanishes
     from both of get_week's deviation lists and compliance_report keeps
     answering about the wrong ride.
+
+    Unlinking alone, with no `status` given, on a session link_activity had set
+    to `completed` reverts it to `planned` — the same way it was set, undone —
+    so it does not sit `completed` with no ride behind it, invisible to both
+    deviation lists. The response names the revert; pass `status` explicitly
+    (`missed`, `skipped`) in the same call to record what actually happened.
     """
     return _coach(
         coach.update_planned_workout,
@@ -1806,6 +1831,7 @@ def update_ingredient(
     package_weight_g: float | None = None,
     counts_toward_protein: bool | None = None,
     note: str | None = None,
+    clear: list[str] | str | None = None,
 ) -> str:
     """Correct a stored ingredient. Only the fields given change.
 
@@ -1818,12 +1844,20 @@ def update_ingredient(
 
     Identify by `ingredient_id`, or by `name` — which resolves exactly, the same
     way logging does. `new_name` renames.
+
+    `clear=["package_price"]` (or `package_weight_g`, `default_portion_g`,
+    `portion_label`, `note`, or any of the optional per-100g macros) returns
+    that field to unknown. `name`, the required macros and `state` cannot be
+    cleared — an ingredient with no calories is a corrupt row, not one with an
+    unknown figure — and a name outside that set is refused rather than quietly
+    ignored.
     """
     return _nutrition(
         nutrition.update_ingredient,
         ingredient_id=ingredient_id,
         name=name,
         new_name=new_name,
+        clear=clear,
         **{
             key: value
             for key, value in {
@@ -1866,11 +1900,26 @@ def search_ingredients(query: str | None = None, limit: int = 25) -> str:
 
 
 @app.tool()
+def delete_ingredient(ingredient_id: int | None = None, name: str | None = None) -> str:
+    """Remove a stored ingredient — refused while anything still points at it.
+
+    A logged entry's macros are frozen, so deleting the ingredient behind it
+    would not corrupt the past day directly — but `edit_log_entry` recomputes
+    from the ingredient row on a new weight, and a saved meal's macros are
+    computed from it on every read. Refused by name and count rather than
+    silently cascading; correct the row with `update_ingredient` instead, or
+    remove what references it first if it genuinely should not exist.
+    """
+    return _nutrition(nutrition.delete_ingredient, ingredient_id=ingredient_id, name=name)
+
+
+@app.tool()
 def save_meal(
     name: str,
     items: list | dict,
     default_for_slot: str | None = None,
     note: str | None = None,
+    clear: list[str] | str | None = None,
 ) -> str:
     """Store a standard meal: a name and its ingredients with their grams.
 
@@ -1889,7 +1938,9 @@ def save_meal(
     measurement.
 
     Saving over an existing name replaces its items, which is what "the usual
-    breakfast, but less cruesli now" means.
+    breakfast, but less cruesli now" means. There is no separate update tool;
+    `clear=["note"]` / `clear=["default_for_slot"]` returns one of the meal's
+    own optional fields to unknown when saving over an existing meal.
     """
     return _nutrition(
         nutrition.save_meal,
@@ -1897,7 +1948,20 @@ def save_meal(
         items=items,
         default_for_slot=default_for_slot,
         note=note,
+        clear=clear,
     )
+
+
+@app.tool()
+def delete_meal(meal: str | int) -> str:
+    """Remove a standard meal, by name or id. Always allowed.
+
+    A meal is a recipe, not a measurement: every entry already logged from it
+    keeps the macros and the meal name it was logged with (see `log_meal`'s
+    freeze), so deleting the recipe does not touch a single day already eaten
+    — only the link from those old rows back to this meal is cleared.
+    """
+    return _nutrition(nutrition.delete_meal, meal=meal)
 
 
 @app.tool()
@@ -2104,9 +2168,14 @@ def suggest_targets(
 
     Exercise calories come from Garmin's figure on the imported activity where
     there is one. For a date still in the future, from the planned session's
-    own mechanical work at cycling's gross efficiency. Where there is neither,
-    zero — said out loud, not hidden — and `exercise_kcal_override` is how you
-    supply an estimate for a race or a ride that was never imported.
+    own mechanical work at cycling's gross efficiency. Where a date has both an
+    import AND a still-planned session that import does not account for — not
+    completed, not linked to it — the two are **summed**
+    (`exercise_source: "imported_activity+planned_workout"`), because a second
+    session that has not happened yet is not the same session as the one that
+    has; the response names it and flags its figure as an estimate. Where there
+    is neither, zero — said out loud, not hidden — and `exercise_kcal_override`
+    is how you supply an estimate for a race or a ride that was never imported.
 
     **Day type is read off the training tables, never asked for.** An event
     makes its own date `race` and the day before `race_eve`; a long or hard
@@ -2148,6 +2217,9 @@ def confirm_targets(
     day_type: str | None = None,
     note: str | None = None,
     days: list | dict | None = None,
+    protein_g_per_kg: float | None = None,
+    baseline_factor: float | None = None,
+    exercise_kcal_override: float | None = None,
 ) -> str:
     """Store the day's targets — the suggestion as it stands, or with overrides.
 
@@ -2155,9 +2227,17 @@ def confirm_targets(
     suggestion is **recomputed here** rather than passed back in, so nothing can
     be filed that this server would not have proposed.
 
-    Pass any of `kcal` / `protein_g` / `fiber_g` to override; `source` is then
-    recorded as `overridden` rather than `confirmed`, so a later reading can
-    tell which numbers were the athlete's own.
+    `protein_g_per_kg`, `baseline_factor` and `exercise_kcal_override` are the
+    same three knobs `suggest_targets` takes, and matter here for the same
+    reason: a suggestion shown with `exercise_kcal_override=800` has to be
+    recomputed with that same 800, or a different number gets filed than the
+    one the athlete agreed to. They are inputs to the derivation, not
+    overrides of its result — passing them alone does not flip `source` to
+    `overridden`.
+
+    Pass any of `kcal` / `protein_g` / `fiber_g` to override the *result*;
+    `source` is then recorded as `overridden` rather than `confirmed`, so a
+    later reading can tell which numbers were the athlete's own.
 
     A kcal override below computed BMR is refused, whoever asked for it. If the
     goal keeps producing one, the goal's rate is what needs to change — and a
@@ -2165,7 +2245,11 @@ def confirm_targets(
     with a dietitian, not a number to file.
 
     `days` confirms several dates at once:
-    `[{"date": "2026-08-24", "kcal": 2600}, {"date": "2026-08-25"}]`.
+    `[{"date": "2026-08-24", "kcal": 2600}, {"date": "2026-08-25"}]`. Any of
+    the three knobs can be set per date inside `days` too, and a per-date value
+    wins over the top-level one. `exercise_kcal_override` only ever describes
+    one day, so a top-level one is refused across a multi-date `days` call —
+    pass it per date instead.
 
     Until a date has targets, `day_summary` has no remainder and "can I eat X?"
     has no arithmetic behind it.
@@ -2179,6 +2263,9 @@ def confirm_targets(
         day_type=day_type,
         note=note,
         days=days,
+        protein_g_per_kg=protein_g_per_kg,
+        baseline_factor=baseline_factor,
+        exercise_kcal_override=exercise_kcal_override,
     )
 
 

@@ -171,11 +171,14 @@ get_activity_splits(1662651131)   →   import_activity_laps(payload=..., garmin
   reclassify a `virtual_ride` as unknown, dropping it out of every cycling filter while its
   `sub_sport` still said otherwise.
 - Rejections come back individually, with a reason each, and one bad row never costs the batch: an
-  activity with no `activityId`, no readable start time, or a date outside 1990-01-01..today is
-  rejected, and the valid rides beside it are still stored. The date band is the last of those
-  because *convertible* and *plausible* are different questions — a zero-date sentinel reads
-  perfectly well and puts a ride in year 1, which every date-walking tool downstream then has to
-  cross.
+  activity with no `activityId`, or with no timestamp that reads as a date inside
+  1990-01-01..today+2 days, is rejected, and the valid rides beside it are still stored. The date
+  band is judged on each timestamp separately, not only on the derived `local_date` — a sentinel
+  `startTimeLocal` beside a genuine `startTimeGMT` nulls only the local one and falls back to UTC,
+  and a sentinel `startTimeGMT` beside a genuine local time nulls only `start_time_utc` (flagged
+  `no_utc_time`); a row is rejected only when neither survives. *Convertible* and *plausible* are
+  different questions — a zero-date sentinel reads perfectly well and puts a ride in year 1, which
+  every date-walking tool downstream then has to cross.
 
 ### On dates
 

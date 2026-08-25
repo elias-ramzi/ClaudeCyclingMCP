@@ -180,8 +180,16 @@
       "description": "Find a stored food by name or alias, tolerant of accents and casing"
     },
     {
+      "name": "delete_ingredient",
+      "description": "Remove an ingredient; refused while any log entry or meal still references it"
+    },
+    {
       "name": "save_meal",
       "description": "Store a standard meal as ingredients and grams; macros stay computed, never frozen"
+    },
+    {
+      "name": "delete_meal",
+      "description": "Remove a standard meal; existing log entries keep the macros and name they were logged with"
     },
     {
       "name": "list_meals",

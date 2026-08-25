@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from typing import Any
 
 from .spec import format_duration
 
@@ -275,6 +276,85 @@ def hr_tss(duration_s: float, avg_hr: float, threshold_hr: int) -> float:
     return training_stress_score(duration_s, avg_hr / threshold_hr)
 
 
+def _positive(value: float | None) -> float | None:
+    """A duration (or other measured quantity) that is really one, or None.
+
+    Null, zero and negative are the same answer — "this row does not say" —
+    and only the first of the three used to be treated that way. Shared by
+    every reader that would otherwise fold a stored placeholder zero into a
+    real measurement: a lap with no power meter reads `avg_power` as 0, not
+    absent, and comparing that against a target reported it as "under" rather
+    than as unverifiable.
+    """
+    return value if value is not None and value > 0 else None
+
+
+def plural(count: int, noun: str) -> str:
+    """ "1 lap" / "3 laps" — the count and its noun, agreeing.
+
+    The consonant-y swap English makes on the plural — "entry" -> "entries",
+    never "entrys" — is the one spelling rule needed beyond +s. Shared by the
+    coach and nutrition layers, which each hand-rolled it per message before.
+    """
+    if count == 1:
+        return f"{count} {noun}"
+    if len(noun) >= 2 and noun[-1] == "y" and noun[-2] not in "aeiou":
+        return f"{count} {noun[:-1]}ies"
+    return f"{count} {noun}s"
+
+
+#: The irregular pairs these layers conjugate: "was left out" / "were left
+#: out", "is unknown" / "are unknown". Everything else is regular present
+#: tense.
+_IRREGULAR_AGREEMENT = {"was": "were", "is": "are"}
+
+
+def agree(count: int, verb: str) -> str:
+    """The verb form for a subject of `count`, singular or plural.
+
+    Regular present tense: `sum` -> `sums`/`sum`, and the consonant-y spelling
+    swap English always makes on the singular — `carry` -> `carries`, never
+    `carrys`. Plus the irregular pairs the layers need, `was`/`were` and
+    `is`/`are`, via `_IRREGULAR_AGREEMENT`.
+    """
+    if verb in _IRREGULAR_AGREEMENT:
+        return verb if count == 1 else _IRREGULAR_AGREEMENT[verb]
+    if count != 1:
+        return verb
+    if len(verb) >= 2 and verb[-1] == "y" and verb[-2] not in "aeiou":
+        return verb[:-1] + "ies"
+    return f"{verb}s"
+
+
+def one_of(value: Any, allowed: tuple[str, ...], what: str) -> str | None:
+    """A fixed vocabulary, matched case-insensitively and returned in its stored spelling.
+
+    Shared by `coach._one_of` and `nutrition._one_of`, which used to disagree on
+    this exact point — nutrition folded case before matching, coach did not, so
+    `status="PLANNED"` was a valid datum in one layer and a refusal in the other
+    for the same word. Living here rather than in either layer: `coach.py`
+    imports `GENDERS` from `nutrition.py` at module load, so a module-level
+    import in the other direction would be a real circular import, and this
+    module has no dependency on either.
+
+    Returns the *canonical* spelling from `allowed` (not a lowercased one) so a
+    vocabulary that is not itself lowercase — `EVENT_PRIORITIES = ("A", "B",
+    "C")` — still round-trips to its own stored form rather than to "a"/"b"/"c".
+    Raises a plain `ValueError` naming `what`; each caller wraps that in its own
+    refusal type (`CoachError` / `NutritionError`) so every existing
+    `except NutritionError` in `nutrition.py`'s per-item loops keeps catching
+    what it always caught.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    folded = text.lower()
+    for candidate in allowed:
+        if candidate.lower() == folded:
+            return candidate
+    raise ValueError(f"{what} must be one of {list(allowed)}, got {value!r}")
+
+
 def compute_activity_load(
     activity: dict,
     ftp: int | None,
@@ -293,8 +373,8 @@ def compute_activity_load(
     diverge sharply — a café stop, autopause off — the stored
     `moving_duration_s` is the place to look.
     """
-    duration = activity.get("duration_s")
-    if not duration or duration <= 0:
+    duration = _positive(activity.get("duration_s"))
+    if duration is None:
         return Load(None, "none", reason="the activity has no duration")
 
     np_watts = activity.get("normalized_power")
@@ -483,8 +563,13 @@ def compare_block(
     against a 250 W target", and assembling that from six numeric fields is
     exactly the step where a wrong one gets asserted confidently.
     """
-    actual_power = lap.get("avg_power")
-    actual_seconds = lap.get("duration_s")
+    # A lap with no power meter (or no timer running) reports 0, not a null —
+    # Garmin does not distinguish "measured zero" from "nothing measured" on
+    # these fields, and a stationary block never legitimately averages 0 W or
+    # takes 0 s. Treated as a placeholder rather than a measurement, the same
+    # rule compute_activity_load applies to duration.
+    actual_power = _positive(lap.get("avg_power"))
+    actual_seconds = _positive(lap.get("duration_s"))
     actual_hr = lap.get("avg_hr")
     label = f"the {ordinal(index)} block"
 

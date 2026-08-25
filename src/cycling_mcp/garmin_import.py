@@ -572,6 +572,14 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
     Wednesday's plan. When `startTimeLocal` is absent the UTC date is used and
     the row is flagged `local_date_from_utc`, which is a fact worth reporting
     rather than a detail worth hiding.
+
+    Plausibility is judged per timestamp, not only on the date this settles
+    on. A sentinel `startTimeLocal` beside a real `startTimeGMT` nulls only
+    the local one and falls back to UTC, flagged the same way an absent local
+    time is; a sentinel `startTimeGMT` beside a real local time nulls only
+    `start_time_utc`, flagged `no_utc_time` since that column is what breaks
+    same-day ties elsewhere. The row is rejected only when neither timestamp
+    survives being read at all.
     """
     values: dict[str, Any] = {}
     for field, keys in _ALIASES.items():
@@ -586,7 +594,22 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
 
     local = _timestamp(values["start_time_local"])
     utc = _timestamp(values["start_time_utc"], to_utc=True)
+    # Each timestamp is judged on its own date, not only the derived
+    # `local_date`. A sentinel `startTimeLocal` beside a genuine `startTimeGMT`
+    # used to reject the whole row even though the UTC fallback below exists
+    # for exactly this case; a sentinel `startTimeGMT` beside a genuine local
+    # time used to store a year-1 `start_time_utc` unflagged, and that column
+    # is the ordering tiebreak everywhere rides are listed or linked.
+    local_problem = implausible_date(local[:10]) if local is not None else None
+    utc_problem = implausible_date(utc[:10]) if utc is not None else None
+    if local_problem:
+        local = None
+    if utc_problem:
+        utc = None
     if local is None and utc is None:
+        reason = local_problem or utc_problem
+        if reason:
+            return None, f"activity {activity_id} {reason}"
         return None, f"activity {activity_id} has no readable start time (startTimeLocal/GMT)"
 
     type_key = _type_key(item)
@@ -622,10 +645,10 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
         else:
             row[field] = number
 
+    # Both `start_time_local` and `start_time_utc` were already judged
+    # individually above, so whichever one `local_date_of` reads from here is
+    # already known plausible — there is nothing left to reject the row for.
     row["local_date"] = local_date_of(row)
-    problem = implausible_date(row["local_date"])
-    if problem:
-        return None, f"activity {activity_id} {problem}"
     return row, None
 
 
@@ -644,6 +667,13 @@ def row_flags(row: dict) -> list[str]:
         # The plan date came from UTC, which is a different day for an
         # early-morning or late-evening ride.
         flags.append("local_date_from_utc")
+    if not row.get("start_time_utc"):
+        # Absent because the payload never carried one, or because it did and
+        # was implausible and got nulled. Either way `start_time_utc` is the
+        # ordering tiebreak in list_activities/link_activity/get_week, and a
+        # row missing it silently sorts by local time alone among rides on the
+        # same `local_date` — worth knowing, the same way the local flag is.
+        flags.append("no_utc_time")
     if not row.get("sub_sport"):
         flags.append("no_sport_type")
     if row.get("duration_s") is None:

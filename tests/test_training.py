@@ -120,6 +120,32 @@ def test_power_without_an_ftp_says_which_half_is_missing():
 
 
 # --------------------------------------------------------------------------
+# review round 6 — placeholder zeros are not measurements
+# --------------------------------------------------------------------------
+
+
+def test_a_stored_zero_duration_is_the_same_refusal_as_no_duration():
+    """`_positive`, shared with `compare_block` below, moved here from coach.py
+    — this is the same gate `compute_activity_load` has always applied, now
+    named rather than inlined as `not duration or duration <= 0`."""
+    load = compute_activity_load({"duration_s": 0, "normalized_power": 250}, 250, None)
+    assert load.tss is None
+    assert load.method == "none"
+    assert "no duration" in load.reason
+
+
+def test_a_negative_stored_duration_is_the_same_refusal_too():
+    load = compute_activity_load({"duration_s": -5, "normalized_power": 250}, 250, None)
+    assert load.tss is None
+    assert load.method == "none"
+
+
+def test_a_duration_of_one_second_is_a_real_ride_not_a_placeholder():
+    load = compute_activity_load({"duration_s": 1, "normalized_power": 250}, 250, None)
+    assert load.tss is not None
+
+
+# --------------------------------------------------------------------------
 # form
 # --------------------------------------------------------------------------
 
@@ -229,6 +255,48 @@ def test_a_block_with_no_recorded_power_says_so_rather_than_scoring_it():
     comparison = compare_block(1, "interval", 600, 250, 250, {"duration_s": 600})
     assert comparison.verdict == "no_power"
     assert "cannot be checked" in comparison.sentence
+
+
+def test_zero_avg_power_is_no_power_not_a_missed_target():
+    """Garmin does not distinguish "measured zero" from "no power meter" on
+    this field, and a stationary block never legitimately averages 0 W. Read
+    as a real measurement, 0 W against a 250 W target used to read as `under`
+    — a deviation the athlete never actually rode."""
+    comparison = compare_block(2, "interval", 600, 250, 250, {"duration_s": 600, "avg_power": 0})
+    assert comparison.verdict == "no_power"
+    assert comparison.sentence == (
+        "the second block was ridden for 10:00 but recorded no power, so the 250 W target "
+        "cannot be checked"
+    )
+
+
+def test_zero_avg_power_on_a_recovery_block_is_no_power_not_compliant():
+    """The role branch that reads an under-target recovery as compliant must
+    never see a placeholder zero as the "under" it is built to forgive."""
+    comparison = compare_block(3, "recovery", 300, 140, 140, {"duration_s": 300, "avg_power": 0})
+    assert comparison.verdict == "no_power"
+    assert comparison.verdict != "easier_than_target"
+
+
+def test_zero_duration_is_an_unknown_duration_not_a_short_one():
+    comparison = compare_block(2, "interval", 600, 250, 250, {"duration_s": 0, "avg_power": 228})
+    assert comparison.duration_verdict == "unknown"
+
+
+def test_zero_power_and_zero_duration_together_still_read_sensibly():
+    """Both placeholders at once: the no_power sentence's own duration clause
+    must not fall back to a confident "00:00"."""
+    comparison = compare_block(2, "interval", 600, 250, 250, {"duration_s": 0, "avg_power": 0})
+    assert comparison.verdict == "no_power"
+    assert comparison.duration_verdict == "unknown"
+    assert "an unknown time" in comparison.sentence
+    assert "00:00" not in comparison.sentence
+
+
+def test_one_watt_and_one_second_are_compared_normally_not_treated_as_placeholders():
+    comparison = compare_block(2, "interval", 600, 250, 250, {"duration_s": 1, "avg_power": 1})
+    assert comparison.verdict == "under"
+    assert comparison.duration_verdict == "short"
 
 
 def test_ordinals_stop_pretending_past_ten():

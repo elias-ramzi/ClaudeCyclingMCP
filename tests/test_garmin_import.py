@@ -729,3 +729,81 @@ def test_a_converted_instant_is_stored_naive():
     assert _timestamp("2026-08-20T23:12:33+02:00", to_utc=True) == "2026-08-20T21:12:33"
     assert _timestamp("2026-08-20T23:12:33+02:00") == "2026-08-20T23:12:33"
     assert _timestamp("2026-08-20T23:12:33Z", to_utc=True) == "2026-08-20T23:12:33"
+
+
+# --------------------------------------------------------------------------
+# review round 6 — plausibility is judged per timestamp, not per row
+# --------------------------------------------------------------------------
+
+
+def test_a_sentinel_local_time_beside_a_real_gmt_falls_back_rather_than_rejecting():
+    """The whole row used to be rejected even though the UTC fallback exists
+    for exactly this case — every ride from a device that always sends a
+    zero-date local time was lost."""
+    row, reason = normalize_activity(
+        {
+            **RIDE,
+            "activityId": 4300,
+            "startTimeLocal": "0001-01-01T00:00:00",
+            "startTimeGMT": "2026-07-05 05:00:00",
+        }
+    )
+    assert reason is None
+    assert row["local_date"] == "2026-07-05"
+    assert row["start_time_utc"] == "2026-07-05T05:00:00"
+    assert row["start_time_local"] is None
+    from cycling_mcp.garmin_import import row_flags
+
+    assert "local_date_from_utc" in row_flags(row)
+    # The rest of the payload is untouched by the timestamp rejection.
+    assert row["avg_power"] == 190.0
+    assert row["normalized_power"] == 198.0
+
+
+def test_a_sentinel_gmt_beside_a_real_local_time_nulls_only_the_utc_side():
+    """A sentinel `start_time_utc` used to store unflagged, and that column is
+    the ordering tiebreak in list_activities/link_activity/get_week."""
+    from cycling_mcp.garmin_import import row_flags
+
+    row, reason = normalize_activity(
+        {
+            **RIDE,
+            "activityId": 4301,
+            "startTimeLocal": "2026-07-05 07:00:00",
+            "startTimeGMT": "0001-01-01T00:00:00",
+        }
+    )
+    assert reason is None
+    assert row["start_time_utc"] is None
+    assert row["local_date"] == "2026-07-05"
+    assert row["start_time_local"] == "2026-07-05T07:00:00"
+    assert "no_utc_time" in row_flags(row)
+
+
+def test_both_timestamps_sentinel_is_still_a_rejection():
+    row, reason = normalize_activity(
+        {
+            "activityId": 4302,
+            "startTimeLocal": "0001-01-01T00:00:00",
+            "startTimeGMT": "0001-01-01T00:00:00",
+            "duration": 3600.0,
+        }
+    )
+    assert row is None
+    assert "activity 4302" in reason
+
+
+def test_a_local_date_of_exactly_the_floor_is_stored_as_is():
+    row, reason = normalize_activity(
+        {**RIDE, "activityId": 4303, "startTimeLocal": "1990-01-01 07:00:00"}
+    )
+    assert reason is None
+    assert row["local_date"] == "1990-01-01"
+
+
+def test_one_day_before_the_floor_is_implausible():
+    row, reason = normalize_activity(
+        {"activityId": 4304, "startTimeLocal": "1989-12-31 07:00:00", "duration": 3600.0}
+    )
+    assert row is None
+    assert "before 1990-01-01" in reason

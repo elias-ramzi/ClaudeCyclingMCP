@@ -193,6 +193,45 @@ def test_nested_repeats_are_rejected():
     assert any("cannot be nested" in e for e in errors)
 
 
+# --------------------------------------------------------------------------
+# review round 6 — the expanded duration is bounded, not the inputs alone
+# --------------------------------------------------------------------------
+
+
+def test_a_spec_totalling_exactly_24_hours_validates():
+    workout, errors, _ = validate_spec(
+        base(blocks=[{"type": "steady", "duration": 24 * 3600, "power_w": 200}])
+    )
+    assert workout is not None
+    assert errors == []
+
+
+def test_24_hours_and_one_second_is_refused_with_the_bound_named():
+    _, errors, _ = validate_spec(
+        base(blocks=[{"type": "steady", "duration": 24 * 3600 + 1, "power_w": 200}])
+    )
+    assert any("86400s" in e and "24h" in e for e in errors)
+
+
+def test_a_repeat_count_that_would_hang_the_1hz_expansion_is_refused_instantly():
+    """2 billion x 600 s would allocate a float per second downstream in
+    `metrics.compute_metrics` — the whole point of bounding the *expanded*
+    total is that it catches count, duration and nesting with one check,
+    without ever materialising or iterating the product."""
+    _, errors, _ = validate_spec(
+        base(
+            blocks=[
+                {
+                    "type": "repeat",
+                    "count": 2_000_000_000,
+                    "blocks": [{"type": "steady", "duration": 600, "power_w": 200}],
+                }
+            ]
+        )
+    )
+    assert any("86400s" in e and "24h" in e for e in errors)
+
+
 def test_typo_in_a_key_is_warned_about():
     _, errors, warnings = validate_spec(
         base(blocks=[{"type": "steady", "duration": 600, "power_w": 200, "powr_w": 210}])

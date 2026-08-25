@@ -399,11 +399,63 @@ def _migrate_4_nutrition() -> list[str]:
     ]
 
 
+def _migrate_5_food_log_nullable_macros() -> list[str]:
+    """`food_log.protein_g` / `.fiber_g` become nullable: unknown is not zero.
+
+    A free-form estimate — canteen food, a restaurant plate — states what it
+    states. `kcal` is always given; `protein_g`/`fiber_g` are not always known,
+    and storing an unstated figure as `0.0` is a stated zero wearing an unknown
+    one's clothes: `day_summary`'s remainder then overstates what is left by
+    the whole meal, silently.
+
+    SQLite has no `ALTER COLUMN`, so this is the standard rebuild: a new table
+    with the two columns nullable, copy every row across by name (nothing else
+    changes), drop the old table, rename, and recreate the index that named the
+    old one. Every other column and constraint is byte-identical to migration 4.
+    """
+    return [
+        """
+        CREATE TABLE food_log_v5 (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            athlete_id            INTEGER NOT NULL DEFAULT 1,
+            log_date              TEXT NOT NULL,
+            slot                  TEXT NOT NULL,
+            ingredient_id         INTEGER REFERENCES ingredients(id) ON DELETE SET NULL,
+            label                 TEXT NOT NULL,
+            grams                 REAL,
+            kcal                  REAL NOT NULL,
+            protein_g             REAL,
+            fiber_g               REAL,
+            carbs_g               REAL,
+            fat_g                 REAL,
+            cost                  REAL,
+            counts_toward_protein INTEGER NOT NULL DEFAULT 1,
+            is_estimate           INTEGER NOT NULL DEFAULT 0,
+            meal_id               INTEGER REFERENCES meals(id) ON DELETE SET NULL,
+            meal_name             TEXT,
+            note                  TEXT,
+            logged_at             TEXT NOT NULL,
+            updated_at            TEXT NOT NULL
+        )
+        """,
+        "INSERT INTO food_log_v5 (id, athlete_id, log_date, slot, ingredient_id, label, grams, "
+        "kcal, protein_g, fiber_g, carbs_g, fat_g, cost, counts_toward_protein, is_estimate, "
+        "meal_id, meal_name, note, logged_at, updated_at) "
+        "SELECT id, athlete_id, log_date, slot, ingredient_id, label, grams, kcal, protein_g, "
+        "fiber_g, carbs_g, fat_g, cost, counts_toward_protein, is_estimate, meal_id, meal_name, "
+        "note, logged_at, updated_at FROM food_log",
+        "DROP TABLE food_log",
+        "ALTER TABLE food_log_v5 RENAME TO food_log",
+        "CREATE INDEX ix_food_log_date ON food_log(athlete_id, log_date, slot)",
+    ]
+
+
 MIGRATIONS: list[tuple[int, Callable[[], list[str]]]] = [
     (1, _migrate_1_training_log),
     (2, _migrate_2_plan_and_debrief),
     (3, _migrate_3_import_flags),
     (4, _migrate_4_nutrition),
+    (5, _migrate_5_food_log_nullable_macros),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

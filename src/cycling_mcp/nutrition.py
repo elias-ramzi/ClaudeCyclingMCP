@@ -35,7 +35,10 @@ from typing import Any
 from .metrics import compute_metrics
 from .spec import SpecError, load_spec
 from .store import DEFAULT_ATHLETE_ID, now_utc, open_db
-from .training import parse_date
+from .training import _positive, parse_date
+from .training import agree as _agree
+from .training import one_of as _training_one_of
+from .training import plural as _plural
 
 GENDERS = ("male", "female", "other")
 GOAL_TYPES = ("lose", "maintain", "gain")
@@ -146,13 +149,45 @@ _LOG_OUT_FIELDS = (
 #: where that exclusion is visible rather than hidden in a loop.
 _SUMMED_MACROS = ("kcal", "fiber_g", "carbs_g", "fat_g")
 
-#: Of those, the ones that may genuinely be unknown. Calories and fibre are
-#: NOT NULL on every entry, so their sum is a real 0.0 on an empty day — which
-#: is what a day with targets and nothing logged yet has to be able to report.
-#: Carbohydrate and fat are optional on an ingredient, so a total of 0 for a
-#: day of bread and rice would be a wrong number wearing the shape of a real
-#: one; those come back null instead.
+#: Of those, the ones whose *total* comes back null on a day that logged
+#: nothing of that macro. `kcal` is NOT NULL on every entry — an estimate still
+#: states a kcal figure — so its sum is always a real 0.0 on an empty day,
+#: which is what a day with targets and nothing logged yet has to be able to
+#: report. `fiber_g` used to be NOT NULL too, but a free-form estimate may not
+#: state it (migration 5); an unstated fibre figure is summed over the entries
+#: that *did* state one — still 0.0 on an empty or all-unknown day, never
+#: null, with `fiber_g_missing_entries` reporting the ones that did not say.
+#: Carbohydrate and fat stay genuinely optional per *ingredient*, so a total of
+#: 0 for a day of bread and rice would be a wrong number wearing the shape of a
+#: real one; those come back null instead when nothing logged carries one.
 _OPTIONAL_MACROS = ("carbs_g", "fat_g")
+
+#: A meal's own optional fields, clearable via `save_meal(clear=[...])`. See
+#: `CLEARABLE_INGREDIENT_FIELDS` for the criterion this and it both apply.
+CLEARABLE_MEAL_FIELDS = ("note", "default_for_slot")
+
+#: What `update_ingredient(clear=[...])` may erase. The criterion is the same
+#: one `coach.py`'s `CLEARABLE_*` tuples use (see coach.py:88-94): empty is a
+#: real state the record can be in, not "unknown until corrected". `name`,
+#: `kcal_100g`, `protein_100g`, `fiber_100g` and `state` are excluded because
+#: every target this server computes is built from them — an ingredient with
+#: no calories is not "unknown calories", it is a corrupt row — and
+#: `counts_toward_protein` is excluded because it is a boolean with no third
+#: "unset" state to return to. Everything else here is a fact the athlete may
+#: simply not have (no default portion, no note, no package price) and must be
+#: able to say so about again after correcting it to the wrong thing.
+CLEARABLE_INGREDIENT_FIELDS = (
+    "carbs_100g",
+    "fat_100g",
+    "sat_fat_100g",
+    "sugar_100g",
+    "salt_100g",
+    "default_portion_g",
+    "portion_label",
+    "package_price",
+    "package_weight_g",
+    "note",
+)
 
 
 class NutritionError(ValueError):
@@ -198,7 +233,12 @@ def fold(value: str) -> str:
 def _number(value: Any, what: str, limits: tuple[float, float] | None = None) -> float:
     try:
         number = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
+        # OverflowError: a JSON integer has no size limit, so a pasted 400-digit
+        # kcal_100g reaches float() directly — unlike a Python literal, there is
+        # no earlier point where a too-large int could have been refused. Caught
+        # here so it reads as an ordinary refusal naming the field, not a crash;
+        # `_coach`'s own OverflowError clause is the backstop, not the fix.
         raise NutritionError(f"{what} must be a number, got {value!r}") from exc
     if number != number or number in (float("inf"), float("-inf")):
         raise NutritionError(f"{what} must be a real number, got {value!r}")
@@ -219,16 +259,69 @@ def _optional_number(
 
 
 def _one_of(value: Any, allowed: tuple[str, ...], what: str) -> str | None:
+    """See `training.one_of`: case-insensitive, returns the stored spelling.
+
+    Re-raised as `NutritionError` rather than left as the shared helper's plain
+    `ValueError` (or `coach`'s `CoachError`) so every `except NutritionError`
+    around a per-item loop in this module — `add_ingredients`, `log_food`,
+    `confirm_targets` — keeps catching it. `coach.CoachError` and
+    `NutritionError` are unrelated `ValueError` subclasses, not a hierarchy;
+    swapping the type here would let one bad row abort the whole bulk call
+    instead of being rejected on its own.
+    """
+    try:
+        return _training_one_of(value, allowed, what)
+    except ValueError as exc:
+        raise NutritionError(str(exc)) from exc
+
+
+_BOOL_TRUE_SPELLINGS = ("true", "1", "yes")
+_BOOL_FALSE_SPELLINGS = ("false", "0", "no")
+
+
+def _bool(value: Any, what: str, default: bool = True) -> bool:
+    """A boolean from whatever shape a paste hands us, or a named refusal.
+
+    `bool(value)` — the previous body — takes any non-empty string as truthy,
+    so a spreadsheet-derived `counts_toward_protein: "false"` stored `True` and
+    silently inverted the incomplete-protein exclusion. `None` means "not
+    given" and takes `default`; an actual bool passes through; the usual string
+    and int spellings of true/false are recognised case-insensitively; anything
+    else is refused by name rather than guessed.
+    """
     if value is None:
-        return None
-    text = str(value).strip().lower()
-    if text not in allowed:
-        raise NutritionError(f"{what} must be one of {list(allowed)}, got {value!r}")
-    return text
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+        raise NutritionError(f"{what} must be true or false, got {value!r}")
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _BOOL_TRUE_SPELLINGS:
+            return True
+        if text in _BOOL_FALSE_SPELLINGS:
+            return False
+    raise NutritionError(f"{what} must be true or false, got {value!r}")
 
 
-def _bool(value: Any, default: bool = True) -> bool:
-    return default if value is None else bool(value)
+def _clear_fields(updates: dict[str, Any], clear: Any, clearable: tuple[str, ...]) -> list[str]:
+    """See `coach._stage_clear` — the only path to a NULL, ported rather than reinvented.
+
+    Deferred import for the same reason as `NON_STARTING_EVENT_STATUSES`: `coach.py`
+    imports `GENDERS` from this module at load time, so a module-level import in
+    this direction would be a real circular one. Re-raised as `NutritionError` so
+    a caller of `update_ingredient`/`save_meal` sees this module's own refusal
+    type, the same as every other refusal here — `coach.CoachError` and
+    `NutritionError` are unrelated `ValueError` subclasses, not a hierarchy.
+    """
+    from .coach import CoachError, _stage_clear
+
+    try:
+        return _stage_clear(updates, clear, clearable)
+    except CoachError as exc:
+        raise NutritionError(str(exc)) from exc
 
 
 def _round(value: float | None, places: int = 1) -> float | None:
@@ -265,7 +358,17 @@ def _range(start: str, end: str) -> tuple[date, date]:
 
 
 def _ensure_athlete(conn: sqlite3.Connection, athlete_id: int) -> dict:
-    """The athlete row, created empty if this is the first call. See coach._ensure_athlete."""
+    """The athlete row, created empty if this is the first call.
+
+    Byte-identical to `coach._ensure_athlete` today — both query the one
+    `athlete` table. Left duplicated rather than merged: it is a DB-touching
+    helper, and the one cycle-free shared module (`training.py`, home to
+    `one_of`/`_positive`) is documented as pure arithmetic with no store
+    access — moving a `conn.execute` there would blur that boundary for a
+    four-line function. `store.py` is the module that "touches state", but
+    every caller here already goes through `coach.py`/`nutrition.py`'s own
+    `open_db()` — revisit if a third module ever needs this exact upsert.
+    """
     row = conn.execute("SELECT * FROM athlete WHERE athlete_id = ?", (athlete_id,)).fetchone()
     if row is None:
         stamp = now_utc()
@@ -335,10 +438,17 @@ def _ingredient_out(row: dict) -> dict:
 
 
 def cost_per_100g(row: dict) -> float | None:
-    """Price per 100 g from the package price and weight, or None."""
+    """Price per 100 g from the package price and weight, or None.
+
+    A zero (or negative) price is unpriced, not free: `package_price: 0` is the
+    natural way to escape a required-looking field, and treating it as a real
+    €0.00 makes `cost_per_100g` 0.0 — counted as *priced* by every reader that
+    checks for `None` — which quietly deflates the week's food cost instead of
+    reporting it as unpriced the way an absent price already does.
+    """
     price = row.get("package_price")
     weight = row.get("package_weight_g")
-    if price is None or not weight:
+    if price is None or not weight or float(price) <= 0 or float(weight) <= 0:
         return None
     return round(float(price) * 100.0 / float(weight), 4)
 
@@ -402,7 +512,9 @@ def _ingredient_fields(item: dict, existing: dict | None = None) -> dict:
             item["package_weight_g"], "package_weight_g", (0.0, 100000.0)
         )
     if item.get("counts_toward_protein") is not None:
-        fields["counts_toward_protein"] = 1 if _bool(item["counts_toward_protein"]) else 0
+        fields["counts_toward_protein"] = (
+            1 if _bool(item["counts_toward_protein"], "counts_toward_protein") else 0
+        )
     elif not base:
         fields["counts_toward_protein"] = 1
     return fields
@@ -513,6 +625,7 @@ def update_ingredient(
     ingredient_id: int | None = None,
     name: str | None = None,
     new_name: str | None = None,
+    clear: list[str] | str | None = None,
     athlete_id: int = DEFAULT_ATHLETE_ID,
     **changes: Any,
 ) -> dict:
@@ -528,6 +641,13 @@ def update_ingredient(
     the same way logging does, exactly or not at all. `new_name` renames it;
     `name` is the lookup and never the new value, because one argument doing
     both would make every rename indistinguishable from a mistyped lookup.
+
+    `clear=[...]` erases an optional field back to unknown — `package_price`,
+    `package_weight_g`, `default_portion_g`, `portion_label`, `note`, or any of
+    the optional macros. There was previously no way back to "unknown" once a
+    wrong price or portion had been stored over the right one; a bare field
+    given as blank text is still ignored rather than stored, so `clear` is the
+    only path to a null here, the same as everywhere else in this server.
     """
     with open_db() as conn:
         _ensure_athlete(conn, athlete_id)
@@ -550,8 +670,9 @@ def update_ingredient(
                     f"another ingredient is already stored as {clash['name']!r} "
                     f"(id {clash['id']}). Nothing was changed."
                 )
+        cleared = _clear_fields(fields, clear, CLEARABLE_INGREDIENT_FIELDS)
         if not fields:
-            raise NutritionError("nothing to update — pass at least one field")
+            raise NutritionError("nothing to update — pass at least one field, or clear=[...]")
 
         assignments = ", ".join(f"{key} = ?" for key in fields)
         conn.execute(
@@ -570,15 +691,57 @@ def update_ingredient(
         "updated_fields": sorted(fields),
         "ingredient": _ingredient_out(stored),
     }
+    if cleared:
+        result["cleared_fields"] = cleared
     if logged:
         result["history_note"] = (
-            f"{logged} existing log entr{'y' if logged == 1 else 'ies'} kept the macros and cost "
+            f"{_plural(logged, 'existing log entry')} kept the macros and cost "
             f"they were logged with. This edit applies from the next entry onward."
         )
     warning = _state_warning({**stored, **fields})
     if warning:
         result["warnings"] = [warning]
     return result
+
+
+def delete_ingredient(
+    ingredient_id: int | None = None,
+    name: str | None = None,
+    athlete_id: int = DEFAULT_ATHLETE_ID,
+) -> dict:
+    """Remove a stored ingredient — refused while anything still points at it.
+
+    A logged entry or a saved meal referencing this row is load-bearing: a
+    food_log row's macros are frozen at log time (so deleting the ingredient
+    would not corrupt a past day), but `edit_log_entry` recomputes from the
+    ingredient row on a new weight, and a meal's macros are computed from it
+    on every read — deleting out from under either turns a correction into
+    silent data loss. Refused by name and count rather than cascading; correct
+    the row with `update_ingredient` instead, or delete the meals/entries that
+    use it first if it genuinely should not exist.
+    """
+    with open_db() as conn:
+        _ensure_athlete(conn, athlete_id)
+        row = _require_ingredient(conn, athlete_id, ingredient_id, name)
+        logged = conn.execute(
+            "SELECT COUNT(*) AS n FROM food_log WHERE ingredient_id = ?", (row["id"],)
+        ).fetchone()["n"]
+        in_meals = conn.execute(
+            "SELECT COUNT(*) AS n FROM meal_items WHERE ingredient_id = ?", (row["id"],)
+        ).fetchone()["n"]
+        if logged or in_meals:
+            parts = []
+            if logged:
+                parts.append(_plural(logged, "logged entry"))
+            if in_meals:
+                parts.append(_plural(in_meals, "meal item"))
+            raise NutritionError(
+                f"{row['name']!r} is still referenced by {' and '.join(parts)} and cannot be "
+                f"deleted. Nothing was changed — correct it with update_ingredient, or remove "
+                f"the entries/meals that use it first."
+            )
+        conn.execute("DELETE FROM ingredients WHERE id = ?", (row["id"],))
+    return {"deleted": {"id": row["id"], "name": row["name"]}}
 
 
 def _load_ingredients(conn: sqlite3.Connection, athlete_id: int) -> list[dict]:
@@ -768,6 +931,14 @@ def _quantity(entry: dict, ingredient: dict) -> float:
     A portion is only a quantity if the ingredient carries one. Silently
     treating `portions: 1` as 1 gram, or as 100, is the kind of error that
     makes a pot of skyr disappear from a day's total.
+
+    Zero or negative is refused here, for both `grams` and `portions`: a `0 g`
+    placeholder row logs a day as `logged: true` at ~0 kcal, which is not "ate
+    nothing", it is "someone forgot the weight" — and it deflates every
+    average that treats a logged day as a real one. `log_meal`'s own
+    `overrides=[{"grams": 0}]` is the one place a zero is meaningful ("leave
+    this out today"); that caller detects the explicit zero and never reaches
+    this function with it — see the override loop.
     """
     grams = entry.get("grams")
     portions = entry.get("portions")
@@ -777,10 +948,21 @@ def _quantity(entry: dict, ingredient: dict) -> float:
             f"definition when the portion is not exactly that many grams."
         )
     if grams is not None:
-        return _number(grams, "grams", GRAMS_LIMITS)
+        value = _number(grams, "grams", GRAMS_LIMITS)
+        if value <= 0:
+            raise NutritionError(
+                f"{ingredient['name']}: grams must be greater than zero — a zero-gram entry is "
+                f"a placeholder, not a food."
+            )
+        return value
     if portions is None:
         raise NutritionError(f"{ingredient['name']}: give grams or portions")
     count = _number(portions, "portions", (0.0, 100.0))
+    if count <= 0:
+        raise NutritionError(
+            f"{ingredient['name']}: portions must be greater than zero — a zero-portion entry "
+            f"is a placeholder, not a food."
+        )
     portion = ingredient.get("default_portion_g")
     if not portion:
         raise NutritionError(
@@ -817,7 +999,7 @@ def _entry_row(
         "updated_at": stamp,
     }
 
-    if _bool(entry.get("is_estimate"), default=False) or (
+    if _bool(entry.get("is_estimate"), "is_estimate", default=False) or (
         entry.get("ingredient") is None
         and entry.get("ingredient_id") is None
         and entry.get("name") is None
@@ -835,10 +1017,17 @@ def _entry_row(
                 "label": label,
                 "grams": _optional_number(entry.get("grams"), "grams", GRAMS_LIMITS),
                 "kcal": kcal,
-                "protein_g": _number(
-                    entry.get("protein_g") or 0, f"{label}: protein_g", (0.0, 500.0)
+                # Unlike kcal, protein and fibre are genuinely optional on an
+                # estimate: a restaurant plate states its calories and nothing
+                # else. `entry.get("protein_g") or 0` folded "not stated" and
+                # "stated as zero" into the same number — `_optional_number`
+                # keeps them apart; a real 0 (black coffee) still stores 0.0.
+                "protein_g": _optional_number(
+                    entry.get("protein_g"), f"{label}: protein_g", (0.0, 500.0)
                 ),
-                "fiber_g": _number(entry.get("fiber_g") or 0, f"{label}: fiber_g", (0.0, 200.0)),
+                "fiber_g": _optional_number(
+                    entry.get("fiber_g"), f"{label}: fiber_g", (0.0, 200.0)
+                ),
                 "carbs_g": _optional_number(entry.get("carbs_g"), "carbs_g", (0.0, 2000.0)),
                 "fat_g": _optional_number(entry.get("fat_g"), "fat_g", (0.0, 1000.0)),
                 # Never priced. See the docstring.
@@ -913,6 +1102,7 @@ def save_meal(
     items: Any,
     default_for_slot: str | None = None,
     note: str | None = None,
+    clear: list[str] | str | None = None,
     athlete_id: int = DEFAULT_ATHLETE_ID,
 ) -> dict:
     """Store a standard meal: a name and a list of (ingredient, grams).
@@ -924,6 +1114,12 @@ def save_meal(
     rows on every read, so correcting a yoghurt's protein figure fixes the
     breakfast too — the opposite rule to a log entry, and for the opposite
     reason: a meal is a recipe, and a log entry is a measurement.
+
+    There is no separate `update_meal`; this is the meal-mutation path, so
+    `clear=["note"]` / `clear=["default_for_slot"]` is how an existing meal's
+    own optional fields return to unknown — the same erase-is-a-verb rule
+    every other update tool in this server follows. Applies when saving over
+    an existing meal; a brand new one already has nothing to clear.
     """
     title = _text(name)
     if not title:
@@ -957,6 +1153,12 @@ def save_meal(
             "SELECT * FROM meals WHERE athlete_id = ? AND name_key = ?", (athlete_id, key)
         ).fetchone()
         if existing is None:
+            # A brand-new meal has nothing to clear, but a mistyped field name in
+            # `clear` is a caller trying to erase something and must not be told
+            # it worked just because the meal happened not to exist yet — the
+            # same rule the existing-meal branch enforces below. Validate before
+            # the INSERT so a bad name leaves nothing behind.
+            _clear_fields({}, clear, CLEARABLE_MEAL_FIELDS)
             cursor = conn.execute(
                 "INSERT INTO meals (athlete_id, name, name_key, default_for_slot, note, "
                 "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -964,6 +1166,7 @@ def save_meal(
             )
             meal_id = cursor.lastrowid
             replaced = False
+            cleared: list[str] = []
         else:
             meal_id = existing["id"]
             replaced = True
@@ -972,6 +1175,7 @@ def save_meal(
                 updates["default_for_slot"] = slot
             if _text(note) is not None:
                 updates["note"] = _text(note)
+            cleared = _clear_fields(updates, clear, CLEARABLE_MEAL_FIELDS)
             assignments = ", ".join(f"{column} = ?" for column in updates)
             conn.execute(
                 f"UPDATE meals SET {assignments} WHERE id = ?", (*updates.values(), meal_id)
@@ -986,7 +1190,38 @@ def save_meal(
             )
         stored = _meal_out(conn, athlete_id, meal_id)
 
-    return {"stored": stored, "replaced_items": replaced}
+    result: dict[str, Any] = {"stored": stored, "replaced_items": replaced}
+    if cleared:
+        result["cleared_fields"] = cleared
+    return result
+
+
+def delete_meal(meal: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dict:
+    """Remove a standard meal. Always allowed — a meal is a recipe, not a measurement.
+
+    Unlike `delete_ingredient`, nothing here is load-bearing for history: every
+    `food_log` row logged from this meal already froze its own macros and its
+    `meal_name` at log time (see `_entry_row`), so they read exactly as they
+    did before the meal existed. Only `meal_id` moves, to NULL
+    (`ON DELETE SET NULL`); `meal_items` for this meal go with it
+    (`ON DELETE CASCADE`).
+    """
+    with open_db() as conn:
+        _ensure_athlete(conn, athlete_id)
+        row = _resolve_meal(conn, athlete_id, meal)
+        logged = conn.execute(
+            "SELECT COUNT(*) AS n FROM food_log WHERE meal_id = ?", (row["id"],)
+        ).fetchone()["n"]
+        conn.execute("DELETE FROM meals WHERE id = ?", (row["id"],))
+
+    result: dict[str, Any] = {"deleted": {"id": row["id"], "name": row["name"]}}
+    if logged:
+        result["history_note"] = (
+            f"{_plural(logged, 'existing log entry')} logged from "
+            f"{row['name']!r} keep the macros and the meal name they were logged with; only "
+            f"the link back to this recipe is gone."
+        )
+    return result
 
 
 def _meal_out(conn: sqlite3.Connection, athlete_id: int, meal_id: int) -> dict:
@@ -1047,6 +1282,12 @@ def _resolve_meal(conn: sqlite3.Connection, athlete_id: int, reference: Any) -> 
         _dict(row) or {}
         for row in conn.execute("SELECT * FROM meals WHERE athlete_id = ?", (athlete_id,))
     ]
+    if isinstance(reference, bool):
+        # bool is an int subclass, so `isinstance(reference, int)` below would
+        # otherwise accept `meal=True` as `meal=1` — whichever meal happens to
+        # have id 1, expanded and logged, not a refusal. See
+        # `resolve_ingredient`, which already guards this the same way.
+        raise NutritionError(f"{reference!r} is not a meal reference")
     if isinstance(reference, int) or (isinstance(reference, str) and reference.strip().isdigit()):
         wanted = int(reference)
         for row in rows:
@@ -1206,7 +1447,28 @@ def log_meal(
             if reference is None:
                 reference = item.get("name")
             ingredient = resolve_ingredient(rows, reference)
-            overridden[ingredient["id"]] = _quantity(item, ingredient)
+            # An explicit zero is "leave it out today" — the one meaning a
+            # zero quantity has anywhere in this module — and has to be
+            # recognised *before* `_quantity`, which refuses zero as a
+            # placeholder. The comparison is on the coerced figure, not the
+            # raw value: every other quantity here reads the numeric strings
+            # a pasted payload carries, so "0" must mean what 0 means. Bools
+            # are refused first — float(False) is 0.0, the same trap
+            # resolve_ingredient and _resolve_meal guard. Caught on either
+            # field so `portions: 0` means the same thing `grams: 0` does.
+            omitted_today = False
+            for field, limits in (("grams", GRAMS_LIMITS), ("portions", (0.0, 100.0))):
+                raw = item.get(field)
+                if isinstance(raw, bool):
+                    raise NutritionError(
+                        f"{ingredient['name']}: {field} must be a number, got {raw!r}"
+                    )
+                if raw is not None and _number(raw, field, limits) == 0:
+                    omitted_today = True
+            if omitted_today:
+                overridden[ingredient["id"]] = 0.0
+            else:
+                overridden[ingredient["id"]] = _quantity(item, ingredient)
 
         items = [
             _dict(row) or {}
@@ -1526,12 +1788,23 @@ def close_goal(
 
 
 def _active_goal(conn: sqlite3.Connection, athlete_id: int, on_date: str) -> dict | None:
-    """The goal in force on a date: active, and effective at or before it."""
+    """The goal in force on a date: effective at or before it, and not yet closed as of it.
+
+    Not filtered by `status`. A goal closed in June was still the goal in
+    force in April, and a deficit run back then is only readable against it —
+    `get_goal` is the status-based read of "what is active right now"; this is
+    the date-scoped one a target computation needs. `closed_date > on_date`,
+    not `>=`, so the day a goal closes belongs to whatever replaced it — a
+    replacement goal effective that same date wins the handover day. Only a
+    goal with no replacement, closed and never re-set, reads as None on its
+    own closing date.
+    """
     return _dict(
         conn.execute(
-            "SELECT * FROM nutrition_goals WHERE athlete_id = ? AND status = 'active' "
-            "AND effective_date <= ? ORDER BY effective_date DESC, id DESC LIMIT 1",
-            (athlete_id, on_date),
+            "SELECT * FROM nutrition_goals WHERE athlete_id = ? AND effective_date <= ? "
+            "AND (closed_date IS NULL OR closed_date > ?) "
+            "ORDER BY effective_date DESC, id DESC LIMIT 1",
+            (athlete_id, on_date, on_date),
         ).fetchone()
     )
 
@@ -1587,7 +1860,10 @@ def _totals(entries: list[dict]) -> dict:
     — collagen, and the rest of the incomplete proteins — contributes its
     calories in full and none of its protein. Counting it would let the athlete
     hit a protein target with a powder that does not do the job protein is in
-    the target for.
+    the target for. A free-form estimate may not have stated a protein or a
+    fibre figure — `protein_g_missing_entries` / `fiber_g_missing_entries`
+    report how many did not, and `day_summary` turns a nonzero one into a note
+    that the remainder above overstates by that much.
 
     Optional macros sum over the rows that have them, and report how many did
     not: a carbohydrate total that silently treats "unknown" as zero is a
@@ -1603,10 +1879,22 @@ def _totals(entries: list[dict]) -> dict:
 
     counted = [entry for entry in entries if entry.get("counts_toward_protein", True)]
     excluded = [entry for entry in entries if not entry.get("counts_toward_protein", True)]
-    totals["protein_g"] = round(sum(entry.get("protein_g", 0.0) for entry in counted), 1)
+    # `entry.get("protein_g", 0.0)` looks like it folds a missing figure to
+    # zero, but every entry carries the key (see `_LOG_OUT_FIELDS`) — a `.get`
+    # default only fires for an *absent* key, so a `None` from a free-form
+    # estimate that never stated protein passed straight through and crashed
+    # `sum()` on the first mixed-type addition. Sum only the known ones, and
+    # count what was skipped rather than silently treating "unknown" as zero.
+    protein_missing = sum(1 for entry in entries if entry.get("protein_g") is None)
+    totals["protein_g"] = round(
+        sum(entry["protein_g"] for entry in counted if entry.get("protein_g") is not None), 1
+    )
+    if protein_missing:
+        totals["protein_g_missing_entries"] = protein_missing
     if excluded:
         totals["protein_g_excluded"] = round(
-            sum(entry.get("protein_g", 0.0) for entry in excluded), 1
+            sum(entry["protein_g"] for entry in excluded if entry.get("protein_g") is not None),
+            1,
         )
         totals["protein_excluded_from"] = sorted({entry.get("label", "?") for entry in excluded})
 
@@ -1618,11 +1906,40 @@ def _totals(entries: list[dict]) -> dict:
     return totals
 
 
-def _day_type_and_training(conn: sqlite3.Connection, athlete_id: int, day: str) -> dict:
-    """What the training tables say about one date: its day type and its cost.
+def _event_on(conn: sqlite3.Connection, athlete_id: int, day: str) -> dict | None:
+    """The event on one date that is still going to happen, or did.
 
-    This is the coupling that justifies one database. The day type is read off
-    what was actually ridden or is actually planned, not asked for:
+    Excludes `NON_STARTING_EVENT_STATUSES` (`abandoned`, `dns`) — a race
+    recorded as either is not one this day's fuelling should be built around.
+    The import is deferred: `coach.py` imports `GENDERS` from this module at
+    load time, so a module-level `from .coach import ...` here would be a real
+    circular import, not just an ordering nuisance.
+    """
+    from .coach import NON_STARTING_EVENT_STATUSES
+
+    placeholders = ", ".join("?" for _ in NON_STARTING_EVENT_STATUSES)
+    return _dict(
+        conn.execute(
+            f"SELECT * FROM events WHERE athlete_id = ? AND event_date = ? "
+            f"AND status NOT IN ({placeholders}) ORDER BY id LIMIT 1",
+            (athlete_id, day, *NON_STARTING_EVENT_STATUSES),
+        ).fetchone()
+    )
+
+
+def _day_type_and_training_from_rows(
+    day: str,
+    activities: list[dict],
+    planned: list[dict],
+    on_day: dict | None,
+    next_day: dict | None,
+) -> dict:
+    """The pure half of `_day_type_and_training`: the same rules, rows in hand.
+
+    Shared by the single-date path (`_day_type_and_training`, one query set
+    per call) and `_RangeHistory` (every table for a range read once) — the
+    two must never compute a day type differently, so there is exactly one
+    implementation of the rules to keep in sync.
 
     * an event on the date makes it `race`, and the date before it `race_eve`;
     * a long or hard ride — imported or planned — makes it `big_session`;
@@ -1634,48 +1951,26 @@ def _day_type_and_training(conn: sqlite3.Connection, athlete_id: int, day: str) 
     model is good. For a date still in the future there is no measurement, so
     the planned session's own mechanical work is converted at cycling's gross
     efficiency — the reason a ride's kJ and its kcal come out near enough
-    equal. Where a date has both, the import wins and the estimate is reported
-    beside it, so a plan that was not followed is visible rather than averaged
-    away.
+    equal. Where a date has both, the import wins and any planned session not
+    yet accounted for by an import — still `planned`/`pushed`, and not linked
+    to one of today's activities — adds its own estimate rather than
+    vanishing: a second session that has not happened yet is not the same
+    session as the one that has.
     """
-    activities = [
-        _dict(row) or {}
-        for row in conn.execute(
-            "SELECT id, name, sport, duration_s, calories, avg_power, normalized_power "
-            "FROM activities WHERE athlete_id = ? AND local_date = ? ORDER BY id",
-            (athlete_id, day),
-        )
-    ]
-    planned = [
-        _dict(row) or {}
-        for row in conn.execute(
-            "SELECT id, spec_json, status FROM planned_workouts WHERE athlete_id = ? "
-            "AND scheduled_date = ? ORDER BY id",
-            (athlete_id, day),
-        )
-    ]
-    on_day = _dict(
-        conn.execute(
-            "SELECT * FROM events WHERE athlete_id = ? AND event_date = ? "
-            "AND status != 'abandoned' ORDER BY id LIMIT 1",
-            (athlete_id, day),
-        ).fetchone()
-    )
-    tomorrow = (parse_date(day, "date") + timedelta(days=1)).isoformat()
-    next_day = _dict(
-        conn.execute(
-            "SELECT * FROM events WHERE athlete_id = ? AND event_date = ? "
-            "AND status != 'abandoned' ORDER BY id LIMIT 1",
-            (athlete_id, tomorrow),
-        ).fetchone()
-    )
+    activity_ids = {row["id"] for row in activities}
 
-    measured = [row for row in activities if row.get("calories")]
-    measured_kcal = round(sum(float(row["calories"]) for row in measured), 0) if measured else None
+    measured = [row for row in activities if _positive(row.get("calories")) is not None]
+    measured_kcal = (
+        round(sum(_positive(row["calories"]) for row in measured), 0) if measured else None
+    )
+    measured_ids = {row["id"] for row in measured}
+    unmeasured = [row for row in activities if row["id"] not in measured_ids]
+    activity_seconds = sum(_positive(row.get("duration_s")) or 0 for row in activities)
 
     planned_kcal = 0.0
     planned_seconds = 0.0
     planned_detail: list[dict] = []
+    candidates: list[dict] = []  # still planned/pushed: might be an extra session, or the ride
     for row in planned:
         if row.get("status") in ("missed", "skipped"):
             continue
@@ -1699,9 +1994,19 @@ def _day_type_and_training(conn: sqlite3.Connection, athlete_id: int, day: str) 
                 "estimated_kcal": round(kcal),
             }
         )
+        if row.get("status") in ("planned", "pushed"):
+            candidates.append({"row": row, "kcal": kcal, "name": workout.name})
 
-    activity_seconds = sum(float(row.get("duration_s") or 0) for row in activities)
-    unmeasured = [row for row in activities if not row.get("calories")]
+    # A session `completed`, or explicitly linked to one of today's
+    # activities, is that import wearing a different id — never added again.
+    # Every other still-planned/pushed session is additional exercise: a
+    # session that has not been marked as the ride behind an import is not
+    # assumed to be one just because an import happens to exist on the same
+    # day, however many activities were imported. See
+    # `test_an_unlinked_plan_next_to_a_measured_ride_sums_rather_than_vanishes`.
+    outstanding = [c for c in candidates if c["row"].get("linked_activity_id") not in activity_ids]
+    outstanding_kcal = sum(c["kcal"] for c in outstanding)
+    outstanding_names = [c["name"] for c in outstanding]
 
     if on_day is not None:
         day_type = "race"
@@ -1739,7 +2044,40 @@ def _day_type_and_training(conn: sqlite3.Connection, athlete_id: int, day: str) 
         "measured_exercise_kcal": measured_kcal,
         "planned_exercise_kcal": round(planned_kcal) if planned_detail else None,
         "unmeasured_activities": len(unmeasured),
+        "activity_seconds": activity_seconds,
+        "outstanding_planned_kcal": round(outstanding_kcal) if outstanding_names else 0,
+        "outstanding_planned_names": outstanding_names,
     }
+
+
+def _day_type_and_training(conn: sqlite3.Connection, athlete_id: int, day: str) -> dict:
+    """What the training tables say about one date: its day type and its cost.
+
+    This is the coupling that justifies one database. See
+    `_day_type_and_training_from_rows` for the rules — this is the single-date
+    path that reads the rows for `day` and hands them to it; `_RangeHistory`
+    reads a whole range at once and calls the same pure function per day.
+    """
+    activities = [
+        _dict(row) or {}
+        for row in conn.execute(
+            "SELECT id, name, sport, duration_s, calories, avg_power, normalized_power "
+            "FROM activities WHERE athlete_id = ? AND local_date = ? ORDER BY id",
+            (athlete_id, day),
+        )
+    ]
+    planned = [
+        _dict(row) or {}
+        for row in conn.execute(
+            "SELECT id, spec_json, status, linked_activity_id FROM planned_workouts "
+            "WHERE athlete_id = ? AND scheduled_date = ? ORDER BY id",
+            (athlete_id, day),
+        )
+    ]
+    on_day = _event_on(conn, athlete_id, day)
+    tomorrow = (parse_date(day, "date") + timedelta(days=1)).isoformat()
+    next_day = _event_on(conn, athlete_id, tomorrow)
+    return _day_type_and_training_from_rows(day, activities, planned, on_day, next_day)
 
 
 def _day_entries(conn: sqlite3.Connection, athlete_id: int, day: str) -> list[dict]:
@@ -1835,7 +2173,7 @@ def _day_summary(conn: sqlite3.Connection, athlete_id: int, day: str) -> dict:
             for entry in estimates
         ]
         summary["estimates_note"] = (
-            f"{len(estimates)} entr{'y is' if len(estimates) == 1 else 'ies are'} a free-form "
+            f"{_plural(len(estimates), 'entry')} {_agree(len(estimates), 'is')} a free-form "
             f"estimate: the macros were stated, not computed from a weighed ingredient, and "
             f"no cost is counted for them. Treat the totals as approximate by that much."
         )
@@ -1844,6 +2182,23 @@ def _day_summary(conn: sqlite3.Connection, athlete_id: int, day: str) -> dict:
             f"{totals['protein_g_excluded']:g} g of protein from "
             f"{', '.join(totals['protein_excluded_from'])} is excluded from the protein total — "
             f"it is an incomplete protein. Its calories are counted in full."
+        )
+    protein_missing = totals.get("protein_g_missing_entries")
+    fiber_missing = totals.get("fiber_g_missing_entries")
+    if protein_missing or fiber_missing:
+        parts = []
+        if protein_missing:
+            parts.append(f"protein from {_plural(protein_missing, 'entry')}")
+        if fiber_missing:
+            parts.append(f"fibre from {_plural(fiber_missing, 'entry')}")
+        # The verb agrees with the number of conjoined subjects, not with the
+        # entry counts: "protein from 2 entries IS unknown", but "protein ...
+        # and fibre ... ARE unknown".
+        summary["unknown_macros_note"] = (
+            f"{' and '.join(parts)} {_agree(len(parts), 'is')} unknown, not zero — "
+            f"an estimate that never stated it. "
+            f"The remaining figure above is counted against known entries only, so it overstates "
+            f"what is actually left by however much those entries turn out to hold."
         )
     return summary
 
@@ -1878,7 +2233,7 @@ def mifflin_st_jeor(weight_kg: float, height_cm: float, age_years: int, gender: 
     """Resting metabolic rate, Mifflin-St Jeor. The floor everything is built on.
 
     10 x kg + 6.25 x cm - 5 x age, then +5 for men and -161 for women. The
-    161 kcal gap between those two constants is why `gender` is asked for
+    166 kcal gap between those two constants is why `gender` is asked for
     rather than assumed: guessing it moves the whole day's target by more than
     a meal.
 
@@ -1899,11 +2254,44 @@ def mifflin_st_jeor(weight_kg: float, height_cm: float, age_years: int, gender: 
     return base - 78.0
 
 
-def _suggest_one(
+def _suggest_one_for(
     conn: sqlite3.Connection,
     athlete_id: int,
     day: str,
     athlete: dict,
+    protein_g_per_kg: float,
+    baseline_factor: float,
+    exercise_kcal_override: float | None,
+) -> dict:
+    """`_suggest_one`, resolving its three dated inputs with their own query set.
+
+    The single-date path: one call from `suggest_targets` for a lone date, and
+    every call from `confirm_targets`, which recomputes at most a handful of
+    dates per call. `suggest_targets` over a `start`/`end` range and
+    `week_summary` use `_RangeHistory` instead, so a season does not pay for
+    this query set once per day for the same handful of rows.
+    """
+    weight = _latest_weight(conn, athlete_id, day)
+    training = _day_type_and_training(conn, athlete_id, day)
+    goal = _active_goal(conn, athlete_id, day)
+    return _suggest_one(
+        day,
+        athlete,
+        weight,
+        training,
+        goal,
+        protein_g_per_kg,
+        baseline_factor,
+        exercise_kcal_override,
+    )
+
+
+def _suggest_one(
+    day: str,
+    athlete: dict,
+    weight: dict | None,
+    training: dict,
+    goal: dict | None,
     protein_g_per_kg: float,
     baseline_factor: float,
     exercise_kcal_override: float | None,
@@ -1913,11 +2301,12 @@ def _suggest_one(
     The output is the working, not the answer. A target the athlete cannot see
     the derivation of is one they can only accept or refuse — and the whole
     flow here is that the server proposes and the human confirms.
-    """
-    weight = _latest_weight(conn, athlete_id, day)
-    training = _day_type_and_training(conn, athlete_id, day)
-    goal = _active_goal(conn, athlete_id, day)
 
+    Takes its three dated inputs already resolved, rather than a connection
+    and a date, so a range of days can resolve them all from one batch of
+    queries (`_RangeHistory`) instead of one query set per day — see
+    `_suggest_one_for` for the single-date path that still queries directly.
+    """
     missing: list[str] = []
     if weight is None:
         missing.append("weight")
@@ -1948,12 +2337,21 @@ def _suggest_one(
     bmr = mifflin_st_jeor(weight["value_kg"], float(athlete["height_cm"]), age, athlete["gender"])
     baseline = bmr * baseline_factor
 
+    outstanding_kcal = training.get("outstanding_planned_kcal") or 0
     if exercise_kcal_override is not None:
         exercise = float(exercise_kcal_override)
         exercise_source = "override"
     elif training["measured_exercise_kcal"] is not None:
-        exercise = float(training["measured_exercise_kcal"])
-        exercise_source = "imported_activity"
+        if outstanding_kcal:
+            # A second session, still planned and not yet imported, is
+            # additional exercise on top of what was measured — not the same
+            # ride the import already counted. See
+            # `_day_type_and_training_from_rows` for what "outstanding" means.
+            exercise = float(training["measured_exercise_kcal"]) + float(outstanding_kcal)
+            exercise_source = "imported_activity+planned_workout"
+        else:
+            exercise = float(training["measured_exercise_kcal"])
+            exercise_source = "imported_activity"
     elif training["planned_exercise_kcal"] is not None:
         exercise = float(training["planned_exercise_kcal"])
         exercise_source = "planned_workout"
@@ -1972,7 +2370,11 @@ def _suggest_one(
     rate = float(goal["rate_kg_per_week"] or 0.0) if goal else 0.0
     full_adjustment = rate * KCAL_PER_KG / 7.0
     protected = training["day_type"] in ("big_session", "race", "race_eve")
-    adjustment = 0.0 if protected else full_adjustment
+    # Only a deficit is withheld. A surplus on a protected day is calories the
+    # session needs, not calories saved — withholding it would make a gain
+    # goal's target *smaller* on the day it most needs to be bigger.
+    withhold = protected and full_adjustment < 0
+    adjustment = 0.0 if withhold else full_adjustment
 
     target = maintenance + adjustment
     clamped = False
@@ -1994,10 +2396,15 @@ def _suggest_one(
         f"maintenance",
     ]
     if goal and rate:
-        if protected:
+        if withhold:
             steps.append(
                 f"goal is {rate:+g} kg/week ({round(full_adjustment):+d} kcal/day), NOT applied "
                 f"on a {training['day_type']} day"
+            )
+        elif protected:
+            steps.append(
+                f"{round(adjustment):+d} kcal/day for a {rate:+g} kg/week goal, applied in full "
+                f"on a {training['day_type']} day — a surplus is not withheld"
             )
         else:
             steps.append(f"{round(adjustment):+d} kcal/day for a {rate:+g} kg/week goal")
@@ -2035,7 +2442,7 @@ def _suggest_one(
             "exercise_source": exercise_source,
             "maintenance_kcal": round(maintenance),
             "goal_adjustment_kcal": round(adjustment),
-            "goal_adjustment_withheld_kcal": round(full_adjustment) if protected else 0,
+            "goal_adjustment_withheld_kcal": round(full_adjustment) if withhold else 0,
             "clamped_to_bmr": clamped,
         },
         "steps": steps,
@@ -2043,11 +2450,23 @@ def _suggest_one(
     }
 
     notes: list[str] = []
-    if protected and full_adjustment:
+    if withhold:
         notes.append(
             f"{day} is a {training['day_type']} day, so the {round(full_adjustment):+d} kcal/day "
             f"goal adjustment was not applied. Under-fuelling a hard session costs the session "
             f"and the recovery from it; take the extra mostly as carbohydrate."
+        )
+    elif protected and full_adjustment > 0:
+        notes.append(
+            f"{day} is a {training['day_type']} day, and the goal's "
+            f"{round(full_adjustment):+d} kcal/day surplus was applied in full: under-fuelling "
+            f"is the risk on a day like this, not over-fuelling."
+        )
+    if exercise_source == "imported_activity+planned_workout":
+        names = ", ".join(training.get("outstanding_planned_names") or [])
+        notes.append(
+            f"Exercise calories include an estimated {round(outstanding_kcal)} kcal from "
+            f"{names}, still planned and not yet imported today. Re-run this once it is."
         )
     if clamped:
         notes.append(
@@ -2090,6 +2509,116 @@ def _suggest_one(
     if notes:
         result["notes"] = notes
     return result
+
+
+class _RangeHistory:
+    """Every dated figure and training-table row a date range needs, read once.
+
+    Mirrors `coach.History`: resolving weight, the goal and the day type one
+    query at a time turned a 120-day `week_summary` or `suggest_targets` into
+    roughly six queries a day for the same handful of rows. Built once for an
+    inclusive `[first, last]` range of ISO date strings; every lookup after
+    that is in memory. Single-date callers keep querying directly — see
+    `_suggest_one_for`.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, athlete_id: int, first: str, last: str) -> None:
+        self._weight_rows = [
+            _dict(row) or {}
+            for row in conn.execute(
+                "SELECT * FROM weight_history WHERE athlete_id = ? AND effective_date <= ? "
+                "ORDER BY effective_date, id",
+                (athlete_id, last),
+            )
+        ]
+        self._goal_rows = [
+            _dict(row) or {}
+            for row in conn.execute(
+                "SELECT * FROM nutrition_goals WHERE athlete_id = ? ORDER BY effective_date, id",
+                (athlete_id,),
+            )
+        ]
+        self._activities: dict[str, list[dict]] = {}
+        for row in conn.execute(
+            "SELECT id, local_date, name, sport, duration_s, calories, avg_power, "
+            "normalized_power FROM activities WHERE athlete_id = ? "
+            "AND local_date BETWEEN ? AND ? ORDER BY id",
+            (athlete_id, first, last),
+        ):
+            record = _dict(row) or {}
+            self._activities.setdefault(record["local_date"], []).append(record)
+        self._planned: dict[str, list[dict]] = {}
+        for row in conn.execute(
+            "SELECT id, spec_json, status, linked_activity_id, scheduled_date "
+            "FROM planned_workouts WHERE athlete_id = ? "
+            "AND scheduled_date BETWEEN ? AND ? ORDER BY id",
+            (athlete_id, first, last),
+        ):
+            record = _dict(row) or {}
+            self._planned.setdefault(record["scheduled_date"], []).append(record)
+
+        from .coach import NON_STARTING_EVENT_STATUSES  # deferred: see _event_on
+
+        lookahead = (parse_date(last, "end") + timedelta(days=1)).isoformat()
+        placeholders = ", ".join("?" for _ in NON_STARTING_EVENT_STATUSES)
+        self._events: dict[str, dict] = {}
+        for row in conn.execute(
+            f"SELECT * FROM events WHERE athlete_id = ? AND event_date BETWEEN ? AND ? "
+            f"AND status NOT IN ({placeholders}) ORDER BY id",
+            (athlete_id, first, lookahead, *NON_STARTING_EVENT_STATUSES),
+        ):
+            record = _dict(row) or {}
+            # First (lowest id) per date wins — matches `_event_on`'s own
+            # `ORDER BY id LIMIT 1`. An event date is not unique in the schema.
+            self._events.setdefault(record["event_date"], record)
+
+        self._food_log: dict[str, list[dict]] = {}
+        for row in conn.execute(
+            "SELECT * FROM food_log WHERE athlete_id = ? AND log_date BETWEEN ? AND ? ORDER BY id",
+            (athlete_id, first, last),
+        ):
+            record = _log_out(_dict(row) or {})
+            self._food_log.setdefault(record["log_date"], []).append(record)
+        self._targets: dict[str, dict] = {}
+        for row in conn.execute(
+            "SELECT * FROM daily_targets WHERE athlete_id = ? AND target_date BETWEEN ? AND ?",
+            (athlete_id, first, last),
+        ):
+            record = _dict(row) or {}
+            record.pop("rationale_json", None)
+            self._targets[record["target_date"]] = record
+
+    def weight(self, on_date: str) -> dict | None:
+        """See `_latest_weight`: the latest weigh-in at or before the date, never extrapolated."""
+        candidates = [row for row in self._weight_rows if row["effective_date"] <= on_date]
+        return candidates[-1] if candidates else None
+
+    def goal(self, on_date: str) -> dict | None:
+        """See `_active_goal`: effective at or before the date, and not yet closed as of it."""
+        candidates = [
+            row
+            for row in self._goal_rows
+            if row["effective_date"] <= on_date
+            and (row.get("closed_date") is None or row["closed_date"] > on_date)
+        ]
+        return candidates[-1] if candidates else None
+
+    def training(self, day: str) -> dict:
+        """See `_day_type_and_training`: the same rules, over the rows read once."""
+        tomorrow = (parse_date(day, "date") + timedelta(days=1)).isoformat()
+        return _day_type_and_training_from_rows(
+            day,
+            self._activities.get(day, []),
+            self._planned.get(day, []),
+            self._events.get(day),
+            self._events.get(tomorrow),
+        )
+
+    def food_log(self, day: str) -> list[dict]:
+        return self._food_log.get(day, [])
+
+    def targets(self, day: str) -> dict | None:
+        return self._targets.get(day)
 
 
 def suggest_targets(
@@ -2159,9 +2688,27 @@ def suggest_targets(
 
     with open_db() as conn:
         athlete = _ensure_athlete(conn, athlete_id)
-        suggestions = [
-            _suggest_one(conn, athlete_id, day, athlete, per_kg, factor, override) for day in days
-        ]
+        if start and end:
+            # One batch of queries for the whole range, not one query set per
+            # day — see `_RangeHistory`.
+            history = _RangeHistory(conn, athlete_id, days[0], days[-1])
+            suggestions = [
+                _suggest_one(
+                    day,
+                    athlete,
+                    history.weight(day),
+                    history.training(day),
+                    history.goal(day),
+                    per_kg,
+                    factor,
+                    override,
+                )
+                for day in days
+            ]
+        else:
+            suggestions = [
+                _suggest_one_for(conn, athlete_id, days[0], athlete, per_kg, factor, override)
+            ]
 
     usable = [item for item in suggestions if "suggested" in item]
     result: dict[str, Any] = {
@@ -2197,22 +2744,38 @@ def confirm_targets(
     day_type: str | None = None,
     note: str | None = None,
     days: Any = None,
+    protein_g_per_kg: float | None = None,
+    baseline_factor: float | None = None,
+    exercise_kcal_override: float | None = None,
     athlete_id: int = DEFAULT_ATHLETE_ID,
 ) -> dict:
     """Store the day's targets: the suggestion as it stands, or with overrides.
 
     Call with just a date to accept what `suggest_targets` proposed for it —
     the suggestion is recomputed here rather than passed back in, so nothing
-    can be confirmed that the server would not have proposed. Pass any of
-    `kcal` / `protein_g` / `fiber_g` to override, and `source` is recorded as
-    `overridden` rather than `confirmed` so a later reading knows which numbers
-    were the athlete's.
+    can be confirmed that the server would not have proposed. `protein_g_per_kg`,
+    `baseline_factor` and `exercise_kcal_override` are the same three knobs
+    `suggest_targets` takes, and the recomputation needs them too — without
+    them a suggestion shown with `exercise_kcal_override=800` and accepted as
+    it stood would be re-derived with none, and a different number would be
+    filed than the one the athlete saw. They are inputs to the derivation, not
+    overrides of the outcome: passing them alone does not flip `source` to
+    `overridden` the way `kcal`/`protein_g`/`fiber_g` do.
+
+    Pass any of `kcal` / `protein_g` / `fiber_g` to override the *result*, and
+    `source` is recorded as `overridden` rather than `confirmed` so a later
+    reading knows which numbers were the athlete's.
 
     Confirming again for the same date replaces that date's targets; one date
     has one set, or every remainder depends on which was read.
 
-    `days` confirms several dates in one call, each an object in the same shape
-    — `[{"date": "2026-08-24", "kcal": 2600}, ...]`.
+    `days` confirms several dates in one call, each an object in the same
+    shape — `[{"date": "2026-08-24", "kcal": 2600}, ...]`. Any of the three
+    knobs can be set per object too, and a per-object value wins over the
+    top-level one for that date. `exercise_kcal_override` only ever applies to
+    one day, so a top-level one is refused across a multi-day `days` call —
+    exactly as `suggest_targets` refuses it over a range; a per-object one is
+    fine on any number of dates, because each is that date's own figure.
 
     A kcal override below computed BMR is refused. That is not a target this
     server will file, whoever asked for it; the goal's rate is what should
@@ -2234,7 +2797,29 @@ def confirm_targets(
                 "fiber_g": fiber_g,
                 "day_type": day_type,
                 "note": note,
+                "protein_g_per_kg": protein_g_per_kg,
+                "baseline_factor": baseline_factor,
+                "exercise_kcal_override": exercise_kcal_override,
             }
+        )
+
+    default_protein_g_per_kg = (
+        _number(protein_g_per_kg, "protein_g_per_kg", (0.5, 4.0))
+        if protein_g_per_kg is not None
+        else DEFAULT_PROTEIN_G_PER_KG
+    )
+    default_baseline_factor = (
+        _number(baseline_factor, "baseline_factor", (1.0, 2.5))
+        if baseline_factor is not None
+        else SEDENTARY_FACTOR
+    )
+    default_exercise_override = _optional_number(
+        exercise_kcal_override, "exercise_kcal_override", (0.0, 15000.0)
+    )
+    if default_exercise_override is not None and len(requests) > 1:
+        raise NutritionError(
+            "exercise_kcal_override applies to one day; it would be wrong on every other day "
+            "of a multi-day confirm. Pass it per day inside `days`, or confirm that day alone."
         )
 
     stored: list[dict] = []
@@ -2251,14 +2836,31 @@ def confirm_targets(
                 continue
             try:
                 day = _today(item.get("date") or item.get("date_str")).isoformat()
-                suggestion = _suggest_one(
+                item_protein = (
+                    _number(item["protein_g_per_kg"], "protein_g_per_kg", (0.5, 4.0))
+                    if item.get("protein_g_per_kg") is not None
+                    else default_protein_g_per_kg
+                )
+                item_baseline = (
+                    _number(item["baseline_factor"], "baseline_factor", (1.0, 2.5))
+                    if item.get("baseline_factor") is not None
+                    else default_baseline_factor
+                )
+                item_override = (
+                    _number(
+                        item["exercise_kcal_override"], "exercise_kcal_override", (0.0, 15000.0)
+                    )
+                    if item.get("exercise_kcal_override") is not None
+                    else default_exercise_override
+                )
+                suggestion = _suggest_one_for(
                     conn,
                     athlete_id,
                     day,
                     athlete,
-                    DEFAULT_PROTEIN_G_PER_KG,
-                    SEDENTARY_FACTOR,
-                    None,
+                    item_protein,
+                    item_baseline,
+                    item_override,
                 )
                 overrides = {
                     key: item.get(key)
@@ -2317,7 +2919,17 @@ def confirm_targets(
                         values["fiber_g"],
                         kind,
                         source,
-                        json.dumps(suggestion.get("steps") or [], ensure_ascii=False),
+                        json.dumps(
+                            {
+                                "steps": suggestion.get("steps") or [],
+                                "knobs": {
+                                    "protein_g_per_kg": item_protein,
+                                    "baseline_factor": item_baseline,
+                                    "exercise_kcal_override": item_override,
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
                         _text(item.get("note")),
                         stamp,
                         stamp,
@@ -2412,13 +3024,32 @@ def _weight_trend(
     means = _moving_average(rows, WEIGHT_TREND_WINDOW_DAYS)
     reported = [point for point in means if point["date"] >= first.isoformat()] or means[-1:]
     trend["moving_average"] = reported
-    start_point, end_point = means[0], means[-1]
+    # The endpoints are the first and last *in-window* means, not the first
+    # and last mean the reach happened to produce. A weigh-in up to six days
+    # before the window anchored the trend to a single raw reading before —
+    # the reach exists to smooth the window's own points, not to relocate them.
+    start_point, end_point = reported[0], reported[-1]
     span_days = (
         parse_date(end_point["date"], "date") - parse_date(start_point["date"], "date")
     ).days
     if span_days <= 0:
         trend["trend"] = None
-        trend["note"] = "All weigh-ins fall on one date; no span to read a rate over."
+        if len(reported) < 2:
+            # Only one weigh-in date falls inside the window itself — the
+            # pre-window rows the reach pulled in fed the moving average
+            # (that is what the reach is for) but there is no second
+            # in-window date to pair it with, so there is no span to anchor.
+            # This is not the same failure as several in-window weigh-ins
+            # sharing one calendar date; saying "one date" here would be
+            # false when the window and the earlier readings plainly span
+            # more than one date.
+            trend["note"] = (
+                "Only one weigh-in falls inside the window. Earlier weigh-ins before the "
+                "window fed the moving average, but there is no second in-window date to "
+                "read a span between."
+            )
+        else:
+            trend["note"] = "All weigh-ins fall on one date; no span to read a rate over."
         return trend
 
     change = end_point["mean_kg"] - start_point["mean_kg"]
@@ -2475,12 +3106,15 @@ def week_summary(
     days = [day.isoformat() for day in _days(first, last)]
 
     with open_db() as conn:
-        goal = _active_goal(conn, athlete_id, last.isoformat())
+        # One batch of queries for the whole range, not six per day — see
+        # `_RangeHistory`.
+        history = _RangeHistory(conn, athlete_id, first.isoformat(), last.isoformat())
+        goal = history.goal(last.isoformat())
         rows: list[dict] = []
         for day in days:
-            entries = _day_entries(conn, athlete_id, day)
-            targets = _stored_targets(conn, athlete_id, day)
-            training = _day_type_and_training(conn, athlete_id, day)
+            entries = history.food_log(day)
+            targets = history.targets(day)
+            training = history.training(day)
             totals = _totals(entries)
             row: dict[str, Any] = {
                 "date": day,
@@ -2524,6 +3158,18 @@ def week_summary(
     cost = round(sum((row["totals"] or {}).get("cost", 0.0) for row in logged), 2)
     unpriced = sum((row["totals"] or {}).get("cost_unpriced_entries", 0) for row in logged)
     estimates = sum(row["estimates"] for row in rows)
+    # Mirrors `_totals`' per-day counters: a free-form estimate that never stated
+    # protein or fibre is missing, not zero, and `protein_g_per_day` /
+    # `fiber_g_per_day` below sum only the days' known figures — surfacing the
+    # counters keeps that average from reading as complete when it is not.
+    protein_missing = sum(
+        (row["totals"] or {}).get("protein_g_missing_entries", 0) for row in logged
+    )
+    fiber_missing = sum((row["totals"] or {}).get("fiber_g_missing_entries", 0) for row in logged)
+    if protein_missing:
+        averages["protein_g_missing_entries"] = protein_missing
+    if fiber_missing:
+        averages["fiber_g_missing_entries"] = fiber_missing
 
     result: dict[str, Any] = {
         "start": first.isoformat(),
@@ -2552,13 +3198,28 @@ def week_summary(
     if unlogged:
         result["unlogged_days"] = unlogged
         result["unlogged_note"] = (
-            f"{len(unlogged)} day{'' if len(unlogged) == 1 else 's'} had nothing logged and "
-            f"{'is' if len(unlogged) == 1 else 'are'} excluded from the averages rather than "
+            f"{_plural(len(unlogged), 'day')} had nothing logged and "
+            f"{_agree(len(unlogged), 'is')} excluded from the averages rather than "
             f"counted as zero calories."
         )
     if estimates:
         result["estimate_note"] = (
-            f"{estimates} entr{'y is' if estimates == 1 else 'ies are'} free-form estimates. "
-            f"They count in the calorie and protein averages and never in the cost."
+            f"{_plural(estimates, 'entry')} {_agree(estimates, 'is')} free-form estimates. "
+            f"They count in the calorie average always, in the protein and fibre averages only "
+            f"when they stated a figure, and never in the cost."
+        )
+    if protein_missing or fiber_missing:
+        parts = []
+        if protein_missing:
+            parts.append(f"protein from {_plural(protein_missing, 'entry')}")
+        if fiber_missing:
+            parts.append(f"fibre from {_plural(fiber_missing, 'entry')}")
+        # Verb agreement follows the conjoined subjects, as in _day_summary.
+        result["unknown_macros_note"] = (
+            f"{' and '.join(parts)} across the week {_agree(len(parts), 'is')} unknown, "
+            f"not zero — a free-form estimate "
+            f"that never stated it. protein_g_per_day / fiber_g_per_day above are averaged over "
+            f"known entries only, so they undercount by however much those entries turn out to "
+            f"hold."
         )
     return result

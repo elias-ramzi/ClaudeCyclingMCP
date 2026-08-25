@@ -192,6 +192,26 @@ def test_every_tool_answers_over_stdio(client, spec):
     assert client.call("get_skill", name="mywhoosh-upload")
 
 
+def test_an_unbounded_repeat_is_refused_at_the_mcp_boundary(client, spec):
+    """count=2_000_000_000 over a 600s block would allocate a 1 Hz series
+    downstream; the refusal has to happen at validate_spec, before a client
+    ever calls describe_spec/render_zwo/render_garmin with the same spec."""
+    huge = {
+        "name": "Runaway",
+        "ftp": 250,
+        "blocks": [
+            {
+                "type": "repeat",
+                "count": 2_000_000_000,
+                "blocks": [{"type": "steady", "duration": 600, "power_w": 200}],
+            }
+        ],
+    }
+    result = client.call("validate_spec", spec=huge)
+    assert result["valid"] is False
+    assert any("24h" in e for e in result["errors"])
+
+
 def test_a_missing_snapshot_blocks_over_stdio(client, spec):
     """Two checks that both pass on a no-op are not evidence of success."""
     result = client.call(
@@ -349,6 +369,32 @@ def test_every_coach_tool_answers_over_stdio(coach_client):
     assert coach_client.call("list_events")["ok"] is True
     assert coach_client.call("export_data")["ok"] is True
     assert coach_client.call("get_skill", name="coaching")["ok"] is True
+
+
+def test_get_form_near_year_one_answers_rather_than_raising_over_stdio(coach_client):
+    """`first - timedelta(days=MAX_FORM_RUNUP_DAYS)` used to overflow for any
+    window starting inside about the first ten years of the representable
+    range, before OverflowError was even in `_coach`'s catch tuple — a crash
+    across the tool boundary rather than the ordinary refusal every other
+    input here gets."""
+    result = coach_client.call("get_form", start="0001-06-01", end="0001-08-01")
+    assert "_error" not in result
+    assert result["ok"] is True
+    assert result["start"] == "0001-06-01"
+
+
+def test_an_overflow_error_from_any_tool_renders_as_a_refusal_not_a_crash():
+    """Defense in depth for the next date arithmetic that gets the
+    clamp-before-subtract order wrong, in this tool or another one: OverflowError
+    is an ArithmeticError, not a ValueError, so it needs its own name in
+    `_coach`'s catch tuple rather than riding along with it."""
+    from cycling_mcp.server import _coach
+
+    def _overflowing(**_kwargs):
+        raise OverflowError("date value out of range")
+
+    result = json.loads(_coach(_overflowing))
+    assert result == {"ok": False, "error": "date value out of range"}
 
 
 @pytest.mark.parametrize(
@@ -669,3 +715,170 @@ def test_editing_and_deleting_a_log_entry_survive_the_schema(nutrition_client):
     deleted = nutrition_client.call("delete_log_entry", entry_id=entry_id)
     assert deleted["ok"] is True
     assert deleted["day"]["entry_count"] == 0
+
+
+# --------------------------------------------------------------------------
+# review round 7 — confirm_targets takes the same knobs suggest_targets does
+#
+# Over the wire, not just the Python function: an int the schema coerces
+# where the tool expects a float is exactly the coercion bug this file exists
+# to catch, and a direct call to nutrition.confirm_targets cannot reproduce it.
+# --------------------------------------------------------------------------
+
+
+def test_confirm_targets_reproduces_a_suggestion_with_an_exercise_override(nutrition_client):
+    suggested = nutrition_client.call(
+        "suggest_targets", date="2026-08-27", exercise_kcal_override=800
+    )
+    kcal = suggested["days"][0]["suggested"]["kcal"]
+
+    confirmed = nutrition_client.call(
+        "confirm_targets", date="2026-08-27", exercise_kcal_override=800
+    )
+    assert confirmed["ok"] is True
+    assert confirmed["targets"][0]["kcal"] == kcal
+    assert confirmed["targets"][0]["source"] == "confirmed"
+
+
+def test_confirm_targets_reproduces_a_suggestion_with_a_baseline_factor(nutrition_client):
+    suggested = nutrition_client.call("suggest_targets", date="2026-08-28", baseline_factor=1.6)
+    kcal = suggested["days"][0]["suggested"]["kcal"]
+
+    confirmed = nutrition_client.call("confirm_targets", date="2026-08-28", baseline_factor=1.6)
+    assert confirmed["targets"][0]["kcal"] == kcal
+
+
+def test_confirm_targets_reproduces_a_suggestion_with_a_protein_target(nutrition_client):
+    suggested = nutrition_client.call("suggest_targets", date="2026-08-29", protein_g_per_kg=2.2)
+    protein = suggested["days"][0]["suggested"]["protein_g"]
+
+    confirmed = nutrition_client.call("confirm_targets", date="2026-08-29", protein_g_per_kg=2.2)
+    assert confirmed["targets"][0]["protein_g"] == protein
+
+
+def test_an_exercise_override_just_outside_the_limit_is_refused_over_the_wire(nutrition_client):
+    result = nutrition_client.call(
+        "confirm_targets", date="2026-08-30", exercise_kcal_override=15000.01
+    )
+    assert "_error" not in result
+    assert result["ok"] is False
+    assert "exercise_kcal_override" in result["error"]
+
+
+# --------------------------------------------------------------------------
+# review round 7 (fix-review-round batch nutrition-null-and-coercion), over stdio
+# --------------------------------------------------------------------------
+
+
+def test_log_weight_with_a_400_digit_value_does_not_crash_the_server(coach_client):
+    """`value_kg: float` is coerced by pydantic before `coach.log_weight` runs at
+    all, so this is an MCP-level tool error rather than an `ok: False` answer —
+    still no crash, and the message still names the offending field."""
+    result = coach_client.call("log_weight", value_kg=10**400)
+    assert "value_kg" in result.get("error", result.get("_error", ""))
+    # The server is still alive and answers the next call normally.
+    assert coach_client.call("get_zones")["ok"] is True
+
+
+def test_add_ingredients_with_a_400_digit_kcal_rejects_only_that_item(nutrition_client):
+    result = nutrition_client.call(
+        "add_ingredients",
+        ingredients=[
+            {"name": "Huge", "kcal_100g": 10**400, "protein_100g": 1, "fiber_100g": 1},
+            {"name": "Oeuf brouille", "kcal_100g": 155, "protein_100g": 13, "fiber_100g": 0},
+        ],
+    )
+    assert "_error" not in result
+    assert result["ok"] is True
+    assert result["inserted"] == 1
+    assert result["rejected"] == 1
+    assert "kcal_100g" in result["rejections"][0]["reason"]
+
+
+def test_delete_ingredient_and_delete_meal_are_registered_tools(nutrition_client):
+    added = nutrition_client.call(
+        "add_ingredients",
+        ingredients=[
+            {
+                "name": "Throwaway ingredient",
+                "kcal_100g": 100,
+                "protein_100g": 1,
+                "fiber_100g": 1,
+            }
+        ],
+    )
+    ingredient_id = added["ingredients"][0]["id"]
+    deleted = nutrition_client.call("delete_ingredient", ingredient_id=ingredient_id)
+    assert "_error" not in deleted
+    assert deleted["ok"] is True
+    assert deleted["deleted"]["name"] == "Throwaway ingredient"
+
+    saved = nutrition_client.call(
+        "save_meal", name="Throwaway meal", items=[{"ingredient": "skyr", "grams": 100}]
+    )
+    assert saved["ok"] is True
+    removed = nutrition_client.call("delete_meal", meal="Throwaway meal")
+    assert "_error" not in removed
+    assert removed["ok"] is True
+    assert removed["deleted"]["name"] == "Throwaway meal"
+
+
+def test_update_ingredient_clear_survives_the_schema(nutrition_client):
+    added = nutrition_client.call(
+        "add_ingredients",
+        ingredients=[
+            {
+                "name": "Clearable ingredient",
+                "kcal_100g": 100,
+                "protein_100g": 1,
+                "fiber_100g": 1,
+                "package_price": 1.5,
+                "package_weight_g": 100,
+            }
+        ],
+    )
+    ingredient_id = added["ingredients"][0]["id"]
+    result = nutrition_client.call(
+        "update_ingredient", ingredient_id=ingredient_id, clear=["package_price"]
+    )
+    assert "_error" not in result
+    assert result["ok"] is True
+    assert result["cleared_fields"] == ["package_price"]
+    assert result["ingredient"]["cost_per_100g"] is None
+
+
+def test_a_coach_and_a_nutrition_enum_both_tolerate_case_after_unification(
+    coach_client, nutrition_client
+):
+    """`_one_of` used to fold case in nutrition.py and not in coach.py — the same
+    word was a valid datum in one layer and a refusal in the other."""
+    saved = coach_client.call(
+        "save_planned_workouts",
+        workouts=[
+            {
+                "spec": {
+                    "name": "Endurance",
+                    "ftp": 250,
+                    "blocks": [{"type": "steady", "duration": 1800, "power_pct": 60}],
+                },
+                "scheduled_date": "2026-08-06",
+            }
+        ],
+    )
+    planned_workout_id = saved["planned_workouts"][0]["id"]
+    coach_result = coach_client.call(
+        "update_planned_workout", planned_workout_id=planned_workout_id, status="PLANNED"
+    )
+    assert "_error" not in coach_result
+    assert coach_result["ok"] is True
+    assert coach_result["planned_workout"]["status"] == "planned"
+
+    nutrition_result = nutrition_client.call(
+        "log_food",
+        entries=[{"ingredient": "skyr", "grams": 50}],
+        log_date="2026-08-19",
+        slot="Breakfast",
+    )
+    assert "_error" not in nutrition_result
+    assert nutrition_result["ok"] is True
+    assert nutrition_result["entries"][0]["slot"] == "breakfast"

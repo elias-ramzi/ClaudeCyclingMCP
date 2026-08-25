@@ -7,12 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-24
+
 ### Added
 
 - **A nutrition layer**, in the same database and for the same athlete. An ingredient base (per-100 g
   macros, aliases, habitual portions, raw-versus-cooked state, package price, and a note for the
   athlete's own preparation know-how), standard meals, a per-ingredient food log, dated targets, and
-  weekly summaries with food cost. Sixteen new tools — see
+  weekly summaries with food cost. Eighteen new tools — see
   [docs/nutrition.md](docs/nutrition.md).
 - **Calorie targets computed from the day's training.** `suggest_targets` chains Mifflin-St Jeor BMR
   (from the weight in effect on that date, plus height, age and gender) x a sedentary baseline, plus
@@ -100,6 +102,13 @@ Found by an adversarial review of the new code before it shipped; each is pinned
   flags `no_sport_type`.
 - **`import_data` refuses a malformed row** instead of raising `AttributeError` across the tool
   boundary after its delete sweep.
+- **A null in a payload no longer folds to a number in the duration check.** `total_step_seconds`
+  treated a missing repeat count as 1 and a missing step duration as 0, so a payload corrupted by
+  a dropped `conditionTypeId 7` summed to a plausible smaller total — and when the fetched side
+  carried the same null, `verify_garmin_upload` reported a corrupted workout as matching. The
+  total is now reported as unknown (`null`), `check_garmin_payload` and `verify_garmin_upload`
+  say explicitly what could not be checked, and `ui_checklist` prints `unknown` where it used to
+  print a confident `0:00`. A real zero still sums and still prints as a clock.
 
 #### Found in code review of the pull request
 
@@ -448,14 +457,213 @@ criterion actually is — clearable where empty is a state the record can be in,
 `_unscored_warning`'s subject and verb agree for all three callers, as do the lap sentences ("the 1
 timed lap sums to"); and the healed-injury rationale lives in `_stage_clear` alone.
 
+#### Found in the sixth review round
 
-- **A null in a payload no longer folds to a number in the duration check.** `total_step_seconds`
-  treated a missing repeat count as 1 and a missing step duration as 0, so a payload corrupted by
-  a dropped `conditionTypeId 7` summed to a plausible smaller total — and when the fetched side
-  carried the same null, `verify_garmin_upload` reported a corrupted workout as matching. The
-  total is now reported as unknown (`null`), `check_garmin_payload` and `verify_garmin_upload`
-  say explicitly what could not be checked, and `ui_checklist` prints `unknown` where it used to
-  print a confident `0:00`. A real zero still sums and still prints as a clock.
+- **A spec's repeat count and block duration multiply without a bound.** `count=2_000_000_000` over
+  a 600 s block validated and stored — `describe_spec`, `render_zwo` and `render_garmin` all reach
+  the same expansion, and `metrics.compute_metrics` allocates one float per second of it. Validation
+  now refuses any spec whose total expanded duration (every repeat multiplied out, nesting included)
+  exceeds 24 hours (`MAX_WORKOUT_SECONDS`), with the bound named in the refusal. One check on the
+  product covers count, duration and nesting at once, computed by multiplication rather than by
+  iterating the count. The test suite now runs under `pytest-timeout` (120 s/test), so a future hang
+  of this shape fails the run instead of stalling it.
+- **`get_form` could overflow instead of refuse.** `first - timedelta(days=MAX_FORM_RUNUP_DAYS)` was
+  evaluated before `max()` ever clamped it, so any window starting inside about the first ten years
+  of the representable range raised `OverflowError` — an `ArithmeticError`, outside the tool layer's
+  catch tuple, and a crash across the MCP boundary instead of the ordinary refusal every other bad
+  input here gets. The clamp now happens before the subtraction (date-minus-date never overflows),
+  and `OverflowError` is in `_coach`'s catch tuple regardless, as a backstop for the next place this
+  ordering mistake gets made.
+- **A sentinel timestamp rejected the whole row even when its sibling was fine.** Plausibility was
+  judged only on the derived `local_date`, so a sentinel `startTimeLocal` beside a genuine
+  `startTimeGMT` lost the ride entirely though the UTC fallback exists for exactly this case — and a
+  sentinel `startTimeGMT` beside a genuine local time stored a year-1 `start_time_utc` unflagged,
+  silently corrupting the ordering tiebreak `list_activities`/`link_activity`/`get_week` all use.
+  Each timestamp is now judged on its own date; a row is rejected only when neither survives, and a
+  missing `start_time_utc` is flagged `no_utc_time`.
+- **A lap's placeholder zero read as a measurement.** `avg_power: 0` (no power meter) against a
+  250 W interval read as `under`, or as compliant `easier_than_target` on a recovery block; a
+  `duration_s` of 0 read as `short`. Both now route through the same `_positive` gate
+  `compute_activity_load` has always used for duration — moved to `training.py` so `compare_block`
+  can share it — reading as `no_power` / `duration_verdict: unknown` instead. `compliance_report`'s
+  own duration comparison had the same hole: a stored `0` reported "rode 00:00" and a fabricated
+  "shorter than planned" sentence.
+- **Unlinking an auto-completed session left it `completed` with no ride.** `link_activity` sets
+  `completed`; `update_planned_workout(clear=["linked_activity_id"])` alone used to leave that
+  status standing over nothing, invisible to `planned_not_ridden` (no status left that means
+  "expected") and to `ridden_not_planned` (there is no ride). Clearing an *actual* link — the column
+  was not already null — with no explicit `status` in the same call now reverts `status` to
+  `planned`, the same way it was set, and says so; a session marked `completed` by hand with no link
+  keeps that status, since `"linked_activity_id" in cleared` is true even when nothing was ever
+  linked. `record_race_result` had the identical hole one field over: retracting all three result
+  fields — its own documented recipe — left a `completed` event with no time, no ride and no
+  debrief; a call that actually cleared something and left no result at all now reverts to
+  `upcoming`. Gated on the clear having happened, not merely on "no result survives" — a bare
+  `record_race_result(event_id)` probing an event a past-dated `add_event` already completed with no
+  result, or a blank `debrief=""` on one deliberately marked `completed`, must not rewrite a status
+  nobody asked to change. An explicit `status` in the same call always wins over either revert.
+- **A zero or negative finish time stored and auto-completed a race.** `finish_time=-272` rendered
+  as `"-1:55:28"`; `finish_time=0` completed the event while the display hid it entirely.
+  `record_race_result` now refuses a non-positive `finish_time` at its own call site — the shared
+  `parse_duration` is untouched, since spec blocks do their own `<= 0` check independently.
+- **`get_form` scored rides its own window had already discarded.** A ride beyond the run-up cap or
+  before the plausible-date floor was stripped from the walk by a post-loop filter, but was still
+  scored and counted into `methods` and `unscored` first — so `mixed_methods_warning` and
+  `unscored_warning` fired about rides that could never have contributed to the figures they were
+  warning about. Both branches now skip scoring entirely.
+- **`rpe` could not be cleared.** An unrated ride is a real state — logged before the athlete had a
+  number for it, or attached to the wrong ride — and the only write path forced 1-10.
+  `clear=["rpe"]` now returns it to unrated. `distance_km`/`elevation_m` on an event stay
+  replace-only, deliberately: they come from the event's own definition, not a subjective read of a
+  ride, so there is no "unknown" state more honest than "not yet entered".
+
+Cleanup alongside: `_agree(1, "carry")` read `"carrys"`, and the run-up note's "was left out" clause
+did not agree with a plural subject either — both fixed, and `test_the_implausible_note_agrees_*`
+pins the full sentence for one ride and for several rather than a substring. `list_activities(limit=0)`
+reported `count: 0` and `truncated: true` as if that were a real answer; `limit < 1` is now refused.
+docs/coaching.md described the import date band as `1990-01-01..today`; the code has always enforced
+`today + FUTURE_DATE_SLOP_DAYS` (2 days) per timestamp, and the doc now says so. A new lock-step test
+ties `get_form`'s "five years" / "ten years" / "1990" prose in server.py and docs/coaching.md to
+`MAX_FORM_SPAN_DAYS`, `MAX_FORM_RUNUP_DAYS` and `PLAUSIBLE_DATE_FLOOR`, in the style of
+`test_version_lockstep.py`.
+
+#### Found in the seventh review round
+
+- **`confirm_targets` could file numbers the athlete never saw.** It recomputed the suggestion with
+  hardcoded defaults — `DEFAULT_PROTEIN_G_PER_KG`, `SEDENTARY_FACTOR`, no exercise override —
+  discarding the three knobs `suggest_targets` takes. A suggestion shown with
+  `exercise_kcal_override=800` and accepted as it stood filed the *knob-less* number instead.
+  `confirm_targets` now takes the same `protein_g_per_kg` / `baseline_factor` /
+  `exercise_kcal_override`, top-level and per date inside `days` (a per-date value wins), validated
+  with the same limits `suggest_targets` uses, and recorded in `rationale_json`. The knobs alone do
+  not flip `source` to `overridden` — they are inputs to the derivation, not overrides of its result.
+  A top-level `exercise_kcal_override` is refused across a multi-date `days` call, exactly as
+  `suggest_targets` refuses it over a range; a per-date one is fine on any number of dates.
+- **A goal resolved by "latest active", not by the date being asked about.** `_active_goal` filtered
+  `status = 'active'`, so a goal closed in June was invisible to a target computed for a March date it
+  was in force for the whole time — `suggest_targets`/`week_summary` for that date fell back to
+  maintenance mid-deficit. It now resolves for the date: effective at or before it, and not yet closed
+  as of it (`closed_date IS NULL OR closed_date > date`) — a closed goal was still the goal before its
+  close. `get_goal`'s status-based "what is active right now" read is untouched; the two answer
+  different questions on purpose.
+- **A protected day withheld a gain goal's surplus along with a loss goal's deficit.**
+  `adjustment = 0.0 if protected else full_adjustment` was sign-blind: a `+385` kcal/day gain goal on
+  race day filed a *smaller* target than an ordinary day, while the note said "take the extra mostly
+  as carbohydrate" about an adjustment the arithmetic had just zeroed. Only a deficit (`full_adjustment
+  < 0`) is withheld on a `big_session`/`race`/`race_eve` day now; a surplus is applied in full, with a
+  note that says so rather than claiming it was "not applied".
+- **A second planned session vanished once the first ride imported.** The exercise `elif` chain let a
+  measured activity win outright, so a morning ride imported at 600 kcal hid an unrelated evening
+  session still planned at ~672 kcal — `exercise_kcal` read 600 with no mention of the second one, and
+  a small commute imported next to a still-planned four-hour ride could erase the ride's ~2500 kcal
+  entirely while the same response still labelled the day a `big_session`. `_day_type_and_training` now
+  reports every still-`planned`/`pushed` session that is **not explicitly linked** to one of today's
+  activities (`linked_activity_id`, set via `link_activity` or `update_planned_workout`) as additional
+  exercise — summed with the measured figure and named in a note
+  (`exercise_source: "imported_activity+planned_workout"`). Only a session that is `completed`, or
+  explicitly linked, is treated as the same session as an import and left out; there is no
+  unclaimed-activity-count heuristic standing in for an explicit link, because that heuristic silently
+  absorbed a planned session whenever there was any unlinked import on the day, whatever its size.
+  `docs/nutrition.md` updated to describe the summing rule.
+- **A race recorded `dns` still triggered race-day fuelling.** Both event lookups excluded only
+  `abandoned`, so a `dns` race still made its date `race` and the day before `race_eve` — deficit
+  withheld, fibre halved, for a race the file says was never started. `dns` is now excluded alongside
+  `abandoned`, via `coach.NON_STARTING_EVENT_STATUSES` (defined once, imported into nutrition.py
+  rather than the two strings being inlined a second time).
+- **A negative calories or duration on an activity was read as a measurement.** Truthiness let
+  `calories: -500` count as measured exercise, and a negative `duration_s` *subtracted* from the
+  day's activity time, suppressing `big_session`. Both now route through the shared `_positive` gate
+  (moved to `training.py` in the round-six fix and reused here); a non-positive value reads as no
+  measurement, the same way a placeholder zero already did.
+- **The weight trend anchored outside its own window.** `start_point`/`end_point` were the first and
+  last moving-average points the six-day reach happened to produce, so a weigh-in up to six days
+  before the window anchored the "week's" trend — sometimes to a single raw reading, the exact noise
+  the average exists to smooth. The endpoints are now the first and last *in-window* means; the reach
+  still feeds the moving average itself, only the two endpoints moved. That change made a second,
+  narrower no-span case reachable: exactly one weigh-in inside the window, with one or more before it.
+  That is now told apart from several in-window weigh-ins genuinely sharing one date — the former says
+  so ("only one weigh-in falls inside the window"), the latter keeps the original "all weigh-ins fall
+  on one date" wording; before this the single-in-window case reused the "one date" text even though
+  two different dates were plainly on file, three keys away from `weigh_ins_in_window` in the same
+  response.
+- **`_active_goal`'s own docstring asserted the opposite of what it does at the handover boundary.**
+  It read "`closed_date > on_date` (not `>=`) so the day a goal closes is still inside its own window",
+  which is only true when nothing replaces the goal that day — with a replacement effective the same
+  date, the code (correctly) hands the handover day to the replacement, and the sentence was an
+  invitation for a future edit to "fix" `>` to `>=` and silently misfile every handover day. Reworded to
+  describe both cases, and both are now pinned by a test.
+- **~720 queries for a 120-day range.** `suggest_targets` over a range and `week_summary` resolved
+  weight, the goal and the day type per day. `_RangeHistory` mirrors `coach.History`: one query each
+  for weight history, goals, activities, planned sessions, events and the food log/targets across the
+  whole range, resolved per day in memory with identical semantics. Single-date calls are unaffected.
+- Cleanup: the BMR docstring said the male/female gap is 161 kcal; it is 166, and every other surface
+  already said so.
+- **A free-form estimate's unstated protein or fibre stored as a measured zero.** `entry.get("protein_g")
+  or 0` folded "not stated" and "stated as zero" into the same number, so a 900 kcal restaurant estimate
+  landed with `protein_g: 0.0` — overstating `day_summary`'s remainder by the whole meal and quietly
+  deflating `week_summary`'s protein average. `food_log.protein_g`/`.fiber_g` are now nullable
+  (**schema v5** — a SQLite table rebuild, append-only alongside v1-v4; existing rows migrate in
+  place); the estimate path uses the same optional-number coercion `carbs_g`/`fat_g` already had, and
+  an *explicit* `protein_g: 0`/`fiber_g: 0` still stores a real `0.0` — a stated zero is a
+  measurement, not a gap. `_totals` reports `protein_g_missing_entries` / `fiber_g_missing_entries`
+  when any entry did not say, still summing what is known (0.0 on an empty or all-unknown day, never
+  null — `day_summary`'s remainder arithmetic keeps working), and `day_summary` adds a note that the
+  remainder above overstates by however much those entries turn out to hold. The same
+  `entry.get(key, 0.0)` shape hid a second bug one line below: the default only fires on an *absent*
+  key, and every entry carries `protein_g`, so a `None` from an estimate reached `sum()` directly —
+  fixed by the same change.
+- **A 400-digit number crashed instead of refusing.** `float()` on a JSON integer with no size limit
+  raises `OverflowError`, reachable directly through any loosely-typed list/dict argument —
+  `add_ingredients`, `log_food` — and through `coach.log_weight`'s own unguarded `float(value_kg)`.
+  `nutrition._number` now catches `OverflowError` alongside `TypeError`/`ValueError`, and
+  `log_weight` wraps its coercion the same way; both refuse naming the field, per item, rather than
+  losing the rest of a bulk call to `_coach`'s `OverflowError` backstop (added in the round-six fix)
+  catching it three layers up. A merely huge-but-finite figure (`10**300`) still passes coercion and
+  is refused by the plausibility range, not by an exception.
+- **`counts_toward_protein: "false"` stored `True`.** `_bool` was `bool(value)`, so any non-empty
+  string — including the word "false" — was truthy, silently inverting the incomplete-protein
+  exclusion for a spreadsheet-derived paste. `_bool(value, what, default)` now parses the case-
+  insensitive usual spellings (`"true"`/`"false"`/`"1"`/`"0"`/`"yes"`/`"no"`, and `int` 0/1) and
+  refuses anything else, naming the field; used for `counts_toward_protein` and `is_estimate` alike.
+  `_resolve_meal` gained the `bool`-before-`int` guard `resolve_ingredient` already had —
+  `log_meal(meal=True)` used to expand whichever meal has id 1, since `bool` is an `int` subclass.
+- **`log_food` accepted `grams: 0`.** A zero-gram placeholder row logged a day as `logged: true` at
+  ~0 kcal, deflating `week_summary`'s average. `_quantity` now refuses `grams <= 0` and
+  `portions <= 0` as a placeholder rather than a food. `log_meal`'s override semantics — `grams: 0`
+  meaning "leave this ingredient out today" — are preserved by detecting the explicit zero in the
+  override loop *before* calling `_quantity`, which now refuses it. The omit check compares the
+  *coerced* figure, not the raw value — every other quantity in the module reads the numeric
+  strings a pasted payload carries, so `"0"` omits the same way `0` does — and refuses a bool
+  first, since `float(False)` is `0.0` and would otherwise omit an ingredient silently.
+- **No path back to unknown on an ingredient or a meal, and a `€0` package was priced.**
+  `update_ingredient`'s optional fields only ever replaced; a wrong price, portion or macro could
+  never return to "not known". `update_ingredient(clear=[...])` and `save_meal(clear=[...])` (there
+  is no separate `update_meal`) port `coach._stage_clear`'s erase-is-a-verb rule — a field outside
+  the clearable set is refused rather than silently ignored, and the response carries
+  `cleared_fields`. Separately, `package_price: 0` produced `cost_per_100g: 0.0`, counted as *priced*
+  by every reader checking for `None` — `cost_per_100g` now treats a zero or negative price (or
+  weight) as unpriced, the same as an absent one, so a logged entry's cost comes back `None` and
+  `week_summary`'s cost note reports it rather than silently understating the week's food spend. Two
+  new tools, `delete_ingredient` (refused while any log entry or meal still references the row —
+  frozen history and a meal's live macros are both load-bearing) and `delete_meal` (always allowed;
+  existing log entries already froze their own macros and `meal_name`, so only the link back to the
+  recipe is cleared).
+- **Cleanup: `coach._one_of` and `nutrition._one_of` disagreed on case.** Nutrition folded input to
+  lowercase before matching; coach did not, so `status="PLANNED"` was a valid datum in one layer and
+  a refusal in the other for the same word. Unified into `training.one_of` — case-insensitive,
+  returning the *canonical* spelling from the vocabulary (so `EVENT_PRIORITIES = ("A", "B", "C")`
+  still round-trips to `"A"`, not `"a"`) — with `coach._one_of` and `nutrition._one_of` as thin
+  wrappers that re-raise their own refusal type, so every existing `except NutritionError` around a
+  per-item loop keeps catching what it always caught. Living in `training.py` because `coach.py`
+  imports `GENDERS` from `nutrition.py` at module load, so a module-level import in either other
+  direction is a real circular one. `coach._plural`/`coach._agree` made the same move for the same
+  reason: nutrition had grown seven hand-rolled pluralizations of its own, one of which conjugated
+  a conjoined subject wrong ("protein from 1 entry and fibre from 1 entry **is** unknown") — both
+  layers now call `training.plural`/`training.agree`, extended with the `entry`→`entries` noun
+  rule and the `is`/`are` pair those messages need.
+
+The tool-surface pin (`manifest.json`) grows by two — `delete_ingredient`, `delete_meal` — updated
+deliberately alongside the tools; `update_ingredient` and `save_meal` gained a `clear` parameter.
 
 ### Notes
 
@@ -737,6 +945,7 @@ First release — cut in the repository but never tagged or published to PyPI, s
 - Whether the MyWhoosh builder's FTP field reflects the athlete's game profile, or is a local preview
   value defaulting to 200 W, is not verified.
 
-[Unreleased]: https://github.com/elias-ramzi/ClaudeCyclingMCP/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/elias-ramzi/ClaudeCyclingMCP/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/elias-ramzi/ClaudeCyclingMCP/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/elias-ramzi/ClaudeCyclingMCP/releases/tag/v0.2.0
 [0.1.0]: https://github.com/elias-ramzi/ClaudeCyclingMCP/tree/6610803
