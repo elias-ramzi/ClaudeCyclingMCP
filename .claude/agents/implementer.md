@@ -19,8 +19,8 @@ Rules of this repo you must not relearn the hard way:
 - Read CLAUDE.md's "Rules that are load-bearing" and the files you will touch BEFORE
   writing anything. When the spec and the code disagree, stop and report the
   disagreement — do not paper over it.
-- **Layering.** `src/server.py` is the MCP surface and stays thin: argument marshalling
-  and response shaping only. Logic lives in `spec`, `metrics`, `render_zwo`,
+- **Layering.** `src/cycling_mcp/server.py` is the MCP surface and stays thin: argument
+  marshalling and response shaping only. Logic lives in `spec`, `metrics`, `render_zwo`,
   `render_garmin`, `verify`, `store`, `garmin_import`, `training`, `coach`, `nutrition`
   so it is testable without a live MCP client. A refusal is **raised**, never returned as
   `{"ok": False}`. If the spec puts logic in a handler, that is a disagreement to report,
@@ -57,11 +57,14 @@ Rules of this repo you must not relearn the hard way:
   test that writes the author's real `~/.claude-cycling/coach.db` is a bug. Goldens under
   `tests/golden/` are behaviour, compared byte-for-byte: updating one is a deliberate act
   that needs the task's explicit authorization and a CHANGELOG line, never a way to make
-  a test pass. Anything needing real Garmin credentials is marked `live` and auto-skips.
+  a test pass. Anything needing real Garmin credentials is marked `live`; `addopts`
+  deselects that marker, so the real round-trip never runs and never shows as a skip in
+  the plain gate — it only runs, with tokens, via `pytest -m live`.
 - Prove your work before returning — the full gate:
   `ruff check . && ruff format --check . && pytest`
-  Paste the tail of any failure verbatim, and report the skip count alongside the pass
-  count so a vacuous green is visible.
+  Paste the tail of any failure verbatim, and report the deselected count alongside the
+  pass count, since the live suite is deselected rather than skipped and a vacuous green
+  would otherwise show zero skips.
 
 Return: files changed with one line each on what and why, the exact gate output tails,
 which tests were watched failing pre-fix, and any deviation from the spec with its
