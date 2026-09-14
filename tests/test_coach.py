@@ -8,10 +8,18 @@ a week, a plan stored that cannot be rendered on the morning it is due.
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 import pytest
 
 from cycling_mcp import coach, store
 from cycling_mcp.garmin_import import GarminPayloadError
+
+#: An event date that is always ahead of today. These tests are about what a
+#: result does to an *upcoming* event, and `add_event` completes anything
+#: already past — so a fixed date stops testing that on the day it passes
+#: rather than failing honestly. A hardcoded "2026-09-04" went red on the 5th.
+FUTURE_EVENT_DATE = (date.today() + timedelta(days=30)).isoformat()
 
 RIDE = {
     "activityId": 5001,
@@ -1571,7 +1579,7 @@ def test_a_max_hr_alone_still_says_the_zones_are_an_estimate():
 def test_a_bare_race_result_does_not_complete_an_upcoming_event():
     """The auto-complete ran before the empty-updates guard, so an existence
     probe or a partial retry closed the race with no time, no ride, no debrief."""
-    event = coach.add_event("Club 100", "2026-09-04", priority="A")["stored"]
+    event = coach.add_event("Club 100", FUTURE_EVENT_DATE, priority="A")["stored"]
     result = coach.record_race_result(event["id"])
 
     assert result["updated_fields"] == []
@@ -1582,7 +1590,7 @@ def test_a_bare_race_result_does_not_complete_an_upcoming_event():
 
 
 def test_a_result_that_carries_something_still_completes_an_upcoming_event():
-    event = coach.add_event("Club 100", "2026-09-04", priority="A")["stored"]
+    event = coach.add_event("Club 100", FUTURE_EVENT_DATE, priority="A")["stored"]
     result = coach.record_race_result(event["id"], debrief="rode it steady, no cramps")
     assert result["stored"]["status"] == "completed"
     assert result["updated_fields"] == ["debrief", "status"]
@@ -1590,7 +1598,7 @@ def test_a_result_that_carries_something_still_completes_an_upcoming_event():
 
 def test_a_blank_debrief_does_not_complete_an_upcoming_event_either():
     """Blank text writes nothing, so it is not a result to complete the race on."""
-    event = coach.add_event("Club 100", "2026-09-04", priority="A")["stored"]
+    event = coach.add_event("Club 100", FUTURE_EVENT_DATE, priority="A")["stored"]
     result = coach.record_race_result(event["id"], debrief="   ")
     assert result["updated_fields"] == []
     assert result["stored"]["status"] == "upcoming"
@@ -1972,7 +1980,7 @@ def test_a_debrief_can_be_cleared_off_the_wrong_race():
 def test_clearing_a_debrief_does_not_complete_an_upcoming_race():
     """Erasing is a change, and still not a result. Reading "did anything
     change" instead of "was a result given" would undo round 3's fix."""
-    event = coach.add_event("Club 100", "2026-09-04", priority="A")["stored"]
+    event = coach.add_event("Club 100", FUTURE_EVENT_DATE, priority="A")["stored"]
     coach.update_event(event["id"], note="ignore me")
     result = coach.record_race_result(event["id"], clear=["debrief"])
     assert result["stored"]["status"] == "upcoming"
@@ -2184,7 +2192,7 @@ def test_a_whole_race_result_can_be_retracted():
 
 
 def test_clearing_a_finish_time_does_not_complete_an_upcoming_race():
-    event = coach.add_event("Club 100", "2026-09-04", priority="A")["stored"]
+    event = coach.add_event("Club 100", FUTURE_EVENT_DATE, priority="A")["stored"]
     result = coach.record_race_result(event["id"], clear=["finish_time_s"])
     assert result["stored"]["status"] == "upcoming"
     assert result["cleared_fields"] == ["finish_time_s"]
@@ -2411,21 +2419,21 @@ def test_zero_finish_time_is_refused():
     # `completed` at creation (add_event completes anything already past) —
     # otherwise the assertion below could not tell a real refusal from a
     # status that was `completed` before the call ever ran.
-    event = coach.add_event("Club 100", "2026-09-04", priority="B")["stored"]
+    event = coach.add_event("Club 100", FUTURE_EVENT_DATE, priority="B")["stored"]
     with pytest.raises(coach.CoachError, match="finish_time"):
         coach.record_race_result(event["id"], finish_time=0)
     assert _upcoming_status(event["id"]) == "upcoming"
 
 
 def test_a_negative_finish_time_is_refused():
-    event = coach.add_event("Club 100", "2026-09-04", priority="B")["stored"]
+    event = coach.add_event("Club 100", FUTURE_EVENT_DATE, priority="B")["stored"]
     with pytest.raises(coach.CoachError, match="finish_time"):
         coach.record_race_result(event["id"], finish_time=-272)
     assert _upcoming_status(event["id"]) == "upcoming"
 
 
 def test_a_finish_time_of_one_second_is_accepted():
-    event = coach.add_event("Club 100", "2026-09-04", priority="B")["stored"]
+    event = coach.add_event("Club 100", FUTURE_EVENT_DATE, priority="B")["stored"]
     result = coach.record_race_result(event["id"], finish_time=1)
     assert result["stored"]["finish_time_s"] == 1
     assert result["stored"]["status"] == "completed"
