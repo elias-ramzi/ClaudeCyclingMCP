@@ -806,7 +806,7 @@ def server_info() -> str:
 
 @app.tool()
 def get_skill(name: str | None = None) -> str:
-    """Fetch a bundled procedure by name: the upload flows, coaching, or nutrition.
+    """Fetch a bundled procedure by name: the upload flows, the import, coaching, nutrition.
 
     Read `garmin-upload` or `mywhoosh-upload` before uploading, scheduling or
     exporting a rendered cycling workout — a .zwo to MyWhoosh, or a Garmin
@@ -823,6 +823,13 @@ def get_skill(name: str | None = None) -> str:
     fuelling around a race. It covers seeding the food base, the daily logging
     loop, and why a big session is not a deficit day.
 
+    Read `mywhoosh-activity-import` for the other direction — the ride that
+    happened rather than the session that was planned. When an indoor ride was
+    recorded by both MyWhoosh and a head unit and the two disagree, on power
+    that looks wrong, dropouts, or a structured session flattened to one lap,
+    it finds the MyWhoosh file, diagnoses which recording is the real one, and
+    replaces the Garmin activity only if the evidence supports it.
+
     Call this whenever you are asked to follow, use, or run one of this
     server's skills by name — for example "use the mywhoosh-upload skill" — or
     when you are asked to put a workout onto MyWhoosh or Garmin Connect and want
@@ -837,11 +844,11 @@ def get_skill(name: str | None = None) -> str:
     Neither route lets a model retrieve a procedure it has just been asked for,
     which is what this tool is for.
 
-    The upload skills stop and ask before doing anything irreversible — a
-    MyWhoosh export spends a finite slot credit — `coaching` proposes a week
-    rather than pushing it, and `nutrition` proposes targets rather than
-    filing them. Follow them as written rather than summarising
-    them.
+    Every skill stops and asks before doing anything irreversible — a MyWhoosh
+    export spends a finite slot credit, and a deleted Garmin activity has no
+    trash to come back from — while `coaching` proposes a week rather than
+    pushing it, and `nutrition` proposes targets rather than filing them.
+    Follow them as written rather than summarising them.
     """
     skills = load_skills()
     if not skills:

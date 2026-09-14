@@ -69,7 +69,7 @@
     },
     {
       "name": "get_skill",
-      "description": "Fetch a bundled procedure by name — the two upload flows, or coaching"
+      "description": "Fetch a bundled procedure by name — the upload flows, the activity import, coaching, or nutrition"
     },
     {
       "name": "spec_schema",
@@ -264,6 +264,12 @@
       "description": "Coach an athlete: onboarding, the weekly plan, adaptation, the race debrief",
       "arguments": ["session"],
       "text": "Follow the \"coaching\" procedure, using this server's tools. The full instructions are served by the server at run time; what the athlete asked is ${arguments.session}."
+    },
+    {
+      "name": "mywhoosh-activity-import",
+      "description": "Diagnose a double-recorded indoor ride and replace the bad Garmin activity with the MyWhoosh one",
+      "arguments": ["session"],
+      "text": "Follow the \"mywhoosh-activity-import\" procedure, using this server's tools. The full instructions are served by the server at run time; the ride to work from is ${arguments.session}."
     }
   ],
   "compatibility": {

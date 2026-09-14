@@ -45,7 +45,7 @@ rather than trusting a success response.
 - 🏋️ **A coach, not just a renderer** — a local file of profile, dated FTP/weight/HR, objectives, imported rides and planned sessions, with TSS, CTL/ATL/TSB and plan-vs-actual computed from it ([the coach layer](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/coaching.md)).
 - 🥗 **Nutrition on the same file** — an ingredient base, standard meals and a per-ingredient food log, with calorie targets computed from BMR **and that day's actual training** — a big session is not a deficit day ([the nutrition layer](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/nutrition.md)).
 - 🔐 **No credentials, ever** — the server never uploads and holds no tokens. Its only side effects are its own database and the file you ask for with `out_path`.
-- 🧩 **Bundled skills** — Garmin upload-and-verify, a browser-driven MyWhoosh import that reads MyWhoosh's own FTP before rendering, and generic cycling-coach and nutrition procedures.
+- 🧩 **Bundled skills** — Garmin upload-and-verify, a browser-driven MyWhoosh import that reads MyWhoosh's own FTP before rendering, a MyWhoosh-to-Garmin activity replacement that diagnoses which of two recordings is the real one before anything is deleted, and generic cycling-coach and nutrition procedures.
 
 ## Install
 
@@ -97,12 +97,13 @@ two platforms consume FTP at different times, and getting it wrong on the MyWhoo
 
 ## Skills
 
-Four bundled procedures in [`.claude/skills/`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills), triggering on how someone
+Five bundled procedures in [`.claude/skills/`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills), triggering on how someone
 actually describes what they want — "create", "add", "send", "put it on", "what am I doing this
-week" — not only on "upload":
+week", "the power on that ride is wrong" — not only on "upload":
 
 - **[`garmin-upload`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/garmin-upload/SKILL.md)** — renders, uploads via the Garmin MCP, then fetches the workout back and compares it against what was sent. Offers to schedule it.
 - **[`mywhoosh-upload`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/mywhoosh-upload/SKILL.md)** — drives the MyWhoosh builder through Claude in Chrome, since there is no API. It reads MyWhoosh's FTP out of the builder *before* rendering, so the fractions are right by construction, and stops for explicit confirmation before the export — which spends a finite slot credit.
+- **[`mywhoosh-activity-import`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/mywhoosh-activity-import/SKILL.md)** — the ride that happened rather than the session that was planned. When an indoor ride is recorded twice, it finds the MyWhoosh `.fit` and works out *from the time-in-zone distribution* whether the Garmin copy is genuinely corrupt or the two power meters simply disagree — only the first justifies a replacement. Deletion is permanent, so it prefers annotating and asks before removing anything.
 - **[`coaching`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/coaching/SKILL.md)** — how to coach with the tools below: the onboarding interview driven by whatever the profile is still missing, the weekly loop (read reality, compare to plan, then write it), and the adaptation rules that make it a plan rather than a template. Generic — it carries no athlete's facts.
 - **[`nutrition`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/nutrition/SKILL.md)** — seeding a food base from whatever the athlete already tracks, the daily logging loop where "can I eat X?" is answered by subtraction rather than by a yes or no, and why a big session is not a deficit day. Equally generic: the athlete's own foods, portions and preparation quirks live in their database, not in the skill.
 

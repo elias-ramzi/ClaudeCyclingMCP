@@ -14,7 +14,13 @@ UPLOAD_SKILLS = ("garmin-upload", "mywhoosh-upload")
 
 def test_every_bundled_skill_loads():
     names = [s.name for s in load_skills(SKILLS_DIR)]
-    assert names == ["coaching", "garmin-upload", "mywhoosh-upload", "nutrition"]
+    assert names == [
+        "coaching",
+        "garmin-upload",
+        "mywhoosh-activity-import",
+        "mywhoosh-upload",
+        "nutrition",
+    ]
 
 
 def test_frontmatter_name_matches_the_directory():
@@ -44,6 +50,18 @@ def test_upload_descriptions_trigger_beyond_the_word_upload():
         assert "create" in lowered
         assert "add" in lowered
         assert "send" in lowered
+
+
+def test_the_import_description_triggers_on_a_ride_that_already_happened():
+    """Nobody asks to "create" a ride they have already ridden.
+
+    This one is reached by complaining about the data — the power looks wrong,
+    the pedals dropped out — so the complaint has to be in the description.
+    """
+    skill = next(s for s in load_skills(SKILLS_DIR) if s.name == "mywhoosh-activity-import")
+    lowered = skill.description.lower()
+    for phrasing in ("import", "replace", "recorded twice", "power", "dropped out", "one lap"):
+        assert phrasing in lowered, phrasing
 
 
 def test_the_coaching_description_triggers_on_talking_about_training():
@@ -145,6 +163,21 @@ def test_message_asks_when_no_session_given(skill):
     assert "confirm the FTP" in message
 
 
+def test_a_ride_that_already_happened_is_not_a_session_to_build():
+    """The import procedure overrides the framing for the same reason coaching does.
+
+    Opened with "ask what session to build ... confirm the FTP before
+    rendering", it would be an instruction to design a workout in front of a
+    procedure about a ride that is already on disk.
+    """
+    imports = {skill.name: skill for skill in load_skills(SKILLS_DIR)}["mywhoosh-activity-import"]
+    assert "Ask which ride this is about" in build_skill_message(imports)
+    assert "what session to build" not in build_skill_message(imports)
+    assert "The ride to work from is: yesterday's MyWhoosh ride" in build_skill_message(
+        imports, "yesterday's MyWhoosh ride"
+    )
+
+
 def test_packaged_skills_are_found_without_the_repo(tmp_path, monkeypatch):
     """The wheel ships skills at cycling_mcp/_skills; the loader must find them."""
     import cycling_mcp.skills as module
@@ -188,6 +221,7 @@ def test_get_skill_lists_when_no_name_given():
     assert sorted(s["name"] for s in result["skills"]) == [
         "coaching",
         "garmin-upload",
+        "mywhoosh-activity-import",
         "mywhoosh-upload",
         "nutrition",
     ]
@@ -205,6 +239,17 @@ def test_get_skill_returns_the_full_procedure():
     assert "EXPORT TO MYWHOOSH" in result["instructions"]
     assert "slot credit" in result["instructions"]
     assert len(result["instructions"]) > 5000
+
+
+def test_get_skill_carries_the_deletion_gate():
+    """The irreversible step is deletion, and the reason it needs asking about."""
+    import json as _json
+
+    from cycling_mcp.server import get_skill
+
+    instructions = _json.loads(get_skill("mywhoosh-activity-import"))["instructions"]
+    assert "There is no trash for Garmin activities." in instructions
+    assert "The user has said yes, in this conversation" in instructions
 
 
 def test_get_skill_is_case_insensitive_and_forgiving_of_spacing():

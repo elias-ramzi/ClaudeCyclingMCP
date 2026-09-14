@@ -7,6 +7,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`mywhoosh-activity-import`** — a fifth bundled skill, and the first that goes the other way:
+  the ride that happened, not the session that was planned. When an indoor ride is recorded by
+  MyWhoosh *and* by a head unit, the two files are not interchangeable — on 2026-09-01 the same
+  session read 187 W from MyWhoosh and 155 W from an Edge 1050, with heart rates matching to a
+  beat, because the pedals had been dropping out and the Edge recorded the gaps as zeros. The
+  procedure locates the MyWhoosh `.fit`, proves it is the same ride, and only then replaces the
+  Garmin activity.
+
+  Three parts of it were expensive to establish and are written down so nobody re-derives them:
+
+  - **Where MyWhoosh puts the file.** macOS
+    `~/Library/Containers/com.whoosh.whooshgame/Data/Library/Application Support/Epic/MyWhoosh/Content/Data/`,
+    Windows `%LOCALAPPDATA%\Packages\MyWhooshTechnologyService.MyWhoosh_<hash>\LocalCache\Local\MyWhoosh\Content\Data\`,
+    both holding a `MyNewActivity-<version>.fit` that the *next ride overwrites*. On iPad there is
+    no accessible path at all. The portal at `event.mywhoosh.com/user/activities` is the route that
+    works everywhere and keeps history; its download was verified byte-identical (same md5) to the
+    local file. Identification is by `file_id.time_created`, which is **UTC** while Garmin's
+    listing is local — a two-hour gap that reads as a mismatch and is a timezone.
+  - **How to tell a calibration gap from a dropout**, because only the second justifies deleting
+    anything. Both look like "the power is wrong" in the summary; they look nothing alike in the
+    time-in-zone distribution. A calibration difference shifts the whole distribution coherently
+    and a factor or offset recovers it. A dropout adds time at the bottom that is missing from
+    nowhere else — 999 s more in zone 1 on a file only 98 s longer, which no multiplication
+    explains. The skill computes both sides on *identical* bounds by taking Garmin's own zone
+    floors from `get_activity_power_in_timezones` and applying them to the `.fit`; that
+    reproduces Garmin's table to within one second, so a difference between the columns is a
+    difference between the files.
+  - **That the safe option comes first.** Annotating the bad activity with `set_activity_name` /
+    `set_activity_description` loses nothing and stops a future analysis being misled. Replacement
+    is only justified when Garmin's aggregates — training load, power curve, training status — have
+    to be right, because a description does not make Garmin recompute them. Deletion is permanent,
+    must be confirmed in the conversation naming the activity, and must happen *before* the upload:
+    Garmin rejects a file whose timestamp overlaps an existing activity.
+
+  The Garmin MCP in use carries neither `delete_activity` nor `upload_activity` today, so the skill
+  checks for them in step 0 and says up front which of the two shapes the session will take —
+  fully automated, or diagnosis plus two manual moves — rather than discovering it after the user
+  has agreed to a fix.
+
+  It declares `prompt_input` / `prompt_fallback` in its frontmatter, the override 0.3.0 added for
+  `coaching`, and for the same reason: invoked as a prompt with no argument it would otherwise open
+  with "ask what session to build … confirm the FTP before rendering" — an instruction to design a
+  workout, in front of a procedure about a ride already sitting on disk.
+
 ## [0.3.0] - 2026-08-24
 
 ### Added
