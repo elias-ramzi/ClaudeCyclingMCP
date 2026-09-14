@@ -11,7 +11,11 @@ description: >-
   187", "the power on that ride is rubbish", "replace it with the MyWhoosh
   file", "where does MyWhoosh save its files", not only on the word "import".
   Covers diagnosing which recording is the real one before anything is deleted.
-prompt_input: activity
+prompt_input: The ride to work from is
+prompt_fallback: >-
+  Ask which ride this is about if that is not already clear from the
+  conversation, and identify both recordings — the MyWhoosh file and the Garmin
+  activity — before changing anything.
 ---
 
 # Replacing a Garmin activity with the MyWhoosh recording

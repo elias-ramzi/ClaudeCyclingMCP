@@ -9,9 +9,18 @@ from cycling_mcp.skills import build_skill_message, load_skills, parse_frontmatt
 SKILLS_DIR = Path(__file__).resolve().parents[1] / ".claude" / "skills"
 
 
-def test_every_skill_loads():
+UPLOAD_SKILLS = ("garmin-upload", "mywhoosh-upload")
+
+
+def test_every_bundled_skill_loads():
     names = [s.name for s in load_skills(SKILLS_DIR)]
-    assert names == ["garmin-upload", "mywhoosh-activity-import", "mywhoosh-upload"]
+    assert names == [
+        "coaching",
+        "garmin-upload",
+        "mywhoosh-activity-import",
+        "mywhoosh-upload",
+        "nutrition",
+    ]
 
 
 def test_frontmatter_name_matches_the_directory():
@@ -32,23 +41,39 @@ def test_descriptions_survive_the_folded_block_scalar():
         assert "\n" not in skill.description
 
 
-# How someone actually describes wanting each of these, in their own words. A
-# description that only fires on the tool's own vocabulary — "upload", "import" —
-# is a skill nobody reaches, so each one is pinned to its own phrasing rather
-# than to a shared list: nobody asks to "create" a ride that already happened.
-TRIGGER_WORDS = {
-    "garmin-upload": ("create", "add", "send"),
-    "mywhoosh-upload": ("create", "add", "send"),
-    "mywhoosh-activity-import": ("import", "replace", "recorded", "power"),
-}
-
-
-def test_descriptions_trigger_beyond_the_tool_vocabulary():
-    """They must fire on how someone actually describes what they want."""
+def test_upload_descriptions_trigger_beyond_the_word_upload():
+    """They must fire on how someone actually describes wanting a session."""
     for skill in load_skills(SKILLS_DIR):
+        if skill.name not in UPLOAD_SKILLS:
+            continue
         lowered = skill.description.lower()
-        for word in TRIGGER_WORDS[skill.name]:
-            assert word in lowered, f"{skill.name} would not trigger on {word!r}"
+        assert "create" in lowered
+        assert "add" in lowered
+        assert "send" in lowered
+
+
+def test_the_import_description_triggers_on_a_ride_that_already_happened():
+    """Nobody asks to "create" a ride they have already ridden.
+
+    This one is reached by complaining about the data — the power looks wrong,
+    the pedals dropped out — so the complaint has to be in the description.
+    """
+    skill = next(s for s in load_skills(SKILLS_DIR) if s.name == "mywhoosh-activity-import")
+    lowered = skill.description.lower()
+    for phrasing in ("import", "replace", "recorded twice", "power", "dropped out", "one lap"):
+        assert phrasing in lowered, phrasing
+
+
+def test_the_coaching_description_triggers_on_talking_about_training():
+    """Nobody asks their coach to "invoke the coaching skill".
+
+    The phrasings below are how the request actually arrives, and each one has
+    to be recognisable in the description or the skill never fires.
+    """
+    skill = next(s for s in load_skills(SKILLS_DIR) if s.name == "coaching")
+    lowered = skill.description.lower()
+    for phrasing in ("this week", "missed", "form", "fatigue", "ftp", "race"):
+        assert phrasing in lowered, phrasing
 
 
 def test_bodies_are_the_instructions_not_the_frontmatter():
@@ -117,7 +142,8 @@ def test_directory_without_a_skill_md_is_skipped(tmp_path):
 
 @pytest.fixture
 def skill():
-    return load_skills(SKILLS_DIR)[0]
+    """An upload skill specifically — the prompt framing differs per skill."""
+    return next(s for s in load_skills(SKILLS_DIR) if s.name == "garmin-upload")
 
 
 def test_message_frames_the_body_as_an_instruction(skill):
@@ -138,28 +164,18 @@ def test_message_asks_when_no_session_given(skill):
 
 
 def test_a_ride_that_already_happened_is_not_a_session_to_build():
-    """`prompt_input: activity` swaps the preamble.
+    """The import procedure overrides the framing for the same reason coaching does.
 
-    Invoked as a prompt with no argument, the import procedure was being
-    introduced with "ask what session to build ... confirm the FTP before
-    rendering" — an instruction to build a workout, in front of a procedure
-    about a ride that is already on disk.
+    Opened with "ask what session to build ... confirm the FTP before
+    rendering", it would be an instruction to design a workout in front of a
+    procedure about a ride that is already on disk.
     """
-    imports = next(s for s in load_skills(SKILLS_DIR) if s.name == "mywhoosh-activity-import")
-    assert imports.prompt_input == "activity"
-
-    empty = build_skill_message(imports)
-    assert "Ask which ride this is about" in empty
-    assert "session to build" not in empty
+    imports = {skill.name: skill for skill in load_skills(SKILLS_DIR)}["mywhoosh-activity-import"]
+    assert "Ask which ride this is about" in build_skill_message(imports)
+    assert "what session to build" not in build_skill_message(imports)
     assert "The ride to work from is: yesterday's MyWhoosh ride" in build_skill_message(
         imports, "yesterday's MyWhoosh ride"
     )
-
-
-def test_an_unknown_prompt_input_falls_back_rather_than_dropping_the_skill():
-    skill = parse_skill("---\nname: x\ndescription: y\nprompt_input: nonsense\n---\n\n# B\n\ntext")
-    assert skill is not None
-    assert skill.prompt_input == "session"
 
 
 def test_packaged_skills_are_found_without_the_repo(tmp_path, monkeypatch):
@@ -203,9 +219,11 @@ def test_get_skill_lists_when_no_name_given():
     result = _json.loads(get_skill())
     assert result["ok"] is True
     assert sorted(s["name"] for s in result["skills"]) == [
+        "coaching",
         "garmin-upload",
         "mywhoosh-activity-import",
         "mywhoosh-upload",
+        "nutrition",
     ]
 
 
@@ -250,3 +268,63 @@ def test_unknown_skill_says_what_is_available():
     result = _json.loads(get_skill("nope"))
     assert result["ok"] is False
     assert "mywhoosh-upload" in result["available"]
+
+
+def test_the_coaching_skill_keeps_the_rules_that_are_the_point():
+    """The distilled coaching rules are why this skill exists.
+
+    A rewrite that loses them leaves a skill that reads well and coaches
+    nothing, and nothing else in the repo would notice.
+    """
+    body = next(s for s in load_skills(SKILLS_DIR) if s.name == "coaching").body
+    for rule in (
+        "A missed session is lost",
+        "Quality goes at the end of a long ride",
+        "Check the FTP before you emit a single target",
+        "Always propose. Never push without explicit agreement",
+        "Stop producing weekly plans",
+    ):
+        assert rule in body, rule
+
+
+def test_a_skill_can_say_what_its_prompt_argument_means():
+    """The defaults are written for the upload skills.
+
+    A coaching prompt framed as "ask what session to build" opens in the wrong
+    place — the first move there is to read the athlete's file, not to design a
+    workout.
+    """
+    skills = {skill.name: skill for skill in load_skills(SKILLS_DIR)}
+    coaching = skills["coaching"]
+    assert "get_profile" in build_skill_message(coaching)
+    assert "what session to build" not in build_skill_message(coaching)
+    assert "What the athlete asked: I could not ride Tuesday" in build_skill_message(
+        coaching, "I could not ride Tuesday"
+    )
+
+
+def test_a_skill_without_the_override_keeps_the_upload_framing():
+    skills = {skill.name: skill for skill in load_skills(SKILLS_DIR)}
+    message = build_skill_message(skills["garmin-upload"])
+    assert "Ask what session to build" in message
+    assert "confirm the FTP" in message
+
+
+def test_the_nutrition_description_triggers_on_talking_about_food():
+    """Nobody asks their coach to "invoke the nutrition skill" either.
+
+    These are how the request actually arrives — mid-day, in fragments, about
+    one meal — and each has to be recognisable in the description or the skill
+    never fires.
+    """
+    skill = next(s for s in load_skills(SKILLS_DIR) if s.name == "nutrition")
+    lowered = skill.description.lower()
+    for phrasing in ("ate", "eat", "restaurant", "weight", "race", "day"):
+        assert phrasing in lowered, phrasing
+
+
+def test_the_bundled_skills_carry_no_personal_facts():
+    """A bundled skill ships to everyone; the athlete's own foods and figures
+    belong in their database, where they can be corrected."""
+    for skill in load_skills(SKILLS_DIR):
+        assert "elias" not in skill.body.lower(), skill.name

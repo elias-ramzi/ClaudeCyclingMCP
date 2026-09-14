@@ -172,6 +172,29 @@ def test_verify_fails_a_payload_that_garmin_stored_faithfully_but_was_mistyped(r
     assert any("not the payload render_garmin produced" in d for d in result["differences"])
 
 
+def test_check_garmin_payload_reports_an_unknown_total_not_a_smaller_one(rendered):
+    """A step that lost its duration must not quietly shrink step_seconds."""
+    mangled = json.loads(json.dumps(rendered["payload"]))
+    mangled["workoutSegments"][0]["workoutSteps"][1]["endConditionValue"] = None
+    result = json.loads(check_garmin_payload(mangled, rendered["payload_digest"]))
+    assert result["step_seconds"] is None
+    assert any("unknown" in c for c in result["could_not_check"])
+
+
+def test_verify_garmin_upload_flags_a_null_it_cannot_sum_past():
+    """When both sides carry the same null, the diff is clean — the corruption
+    hides in the total, so the total has to say it could not be computed."""
+    recorded = json.loads((GOLDEN / "recorded_roundtrip.json").read_text(encoding="utf-8"))
+    sent = json.loads(json.dumps(recorded["sent"]))
+    fetched = json.loads(json.dumps(recorded["fetched"]))
+    sent["workoutSegments"][0]["workoutSteps"][1]["numberOfIterations"] = None
+    fetched["segments"][0]["steps"][1]["repeat_count"] = None
+    result = json.loads(verify_garmin_upload(sent, fetched))
+    assert result["differences"] == []
+    assert result["sent_step_seconds"] is None
+    assert any("conditionTypeId 7" in c for c in result["could_not_check"])
+
+
 def test_render_garmin_warns_that_a_flat_ramp_is_lossy(rendered):
     """The athlete sees "hold 130-180 W", not "climb". Nothing else says so."""
     assert any("ramp renders on Garmin" in w for w in rendered["warnings"])
@@ -438,14 +461,51 @@ def test_server_info_makes_the_build_sayable():
     info = json.loads(server_info())
     assert info["version"] == __version__
     assert info["skills"] == [
+        "coaching",
         "garmin-upload",
         "mywhoosh-activity-import",
         "mywhoosh-upload",
+        "nutrition",
     ]
     assert Path(info["package_path"]).is_dir()
     # Distinguishes a local editable checkout from a uvx cache in one glance.
     assert info["package_path"].endswith("cycling_mcp")
     assert info["uploads"] is False
+
+
+def test_server_info_reports_the_database_without_creating_it(tmp_path, monkeypatch):
+    """The server is no longer stateless, so where the state lives is part of
+    identifying the build. Reporting it must not be what brings it into
+    existence, or "exists" would only ever mean "somebody asked"."""
+    from cycling_mcp.server import server_info
+    from cycling_mcp.store import CURRENT_SCHEMA_VERSION, ENV_DB_PATH
+
+    target = tmp_path / "coach.db"
+    monkeypatch.setenv(ENV_DB_PATH, str(target))
+
+    database = json.loads(server_info())["database"]
+    assert database["path"] == str(target)
+    assert database["exists"] is False
+    assert database["schema_version"] is None
+    assert not target.exists()
+
+    from cycling_mcp.store import open_db
+
+    with open_db():
+        pass
+    database = json.loads(server_info())["database"]
+    assert database["exists"] is True
+    assert database["schema_version"] == CURRENT_SCHEMA_VERSION
+
+
+def test_the_purity_note_still_says_what_is_true():
+    """It used to say "pure". It now writes a database, and a note that has
+    drifted from the behaviour is worse than no note."""
+    from cycling_mcp.server import server_info
+
+    note = json.loads(server_info())["note"].lower()
+    assert "no network" in note and "no credentials" in note
+    assert "out_path" in note and "own database" in note
 
 
 def test_written_files_are_utf8_regardless_of_platform_default(spec, tmp_path):
