@@ -108,10 +108,11 @@ taken as exact logs the wrong food, and the day's total looks entirely reasonabl
 **Raw and cooked are different ingredients.** ~350 kcal/100 g against ~130 for the same rice. The
 `state` column records which, and storing a `raw` one warns.
 
-**A big session, a race and a race eve are not deficit days.** `suggest_targets` withholds the
-goal's adjustment on them and reports how much it withheld. Under-fuelling a hard session costs the
-session and the recovery from it. And no target this server produces or files is below computed
-BMR — `suggest_targets` clamps, `confirm_targets` refuses.
+**A big session, a race and a race eve are not deficit days.** A deficit is withheld on them, and
+the response reports how much. A gain goal's surplus is applied in full on those days instead —
+withholding it would shrink the target on the day that costs the athlete most — and the response
+says which direction, withheld or applied in full, happened. And no target this server produces or
+files is below computed BMR — `suggest_targets` clamps, `confirm_targets` refuses.
 
 **Personal facts live in data, never in a bundled skill.** Specific foods, habitual portions,
 preparation quirks are ingredient and meal rows and their notes. A skill ships to everyone.

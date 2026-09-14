@@ -1851,6 +1851,9 @@ def update_ingredient(
     cleared — an ingredient with no calories is a corrupt row, not one with an
     unknown figure — and a name outside that set is refused rather than quietly
     ignored.
+
+    A blank `note` or `portion_label` is ignored rather than stored — the
+    response names it in `ignored_blank_fields` — and `clear` empties it.
     """
     return _nutrition(
         nutrition.update_ingredient,
@@ -2058,6 +2061,7 @@ def edit_log_entry(
     slot: str | None = None,
     log_date: str | None = None,
     note: str | None = None,
+    clear: list[str] | str | None = None,
 ) -> str:
     """Correct one logged entry — usually a weight guessed and then measured.
 
@@ -2071,6 +2075,8 @@ def edit_log_entry(
 
     `log_date` moves an entry to another day, which is the fix for a late
     dinner filed after midnight. Both days come back in the response.
+
+    A blank `note` is ignored rather than stored; `clear=["note"]` empties it.
     """
     return _nutrition(
         nutrition.edit_log_entry,
@@ -2080,6 +2086,7 @@ def edit_log_entry(
         slot=slot,
         log_date=log_date,
         note=note,
+        clear=clear,
     )
 
 
@@ -2220,6 +2227,7 @@ def confirm_targets(
     protein_g_per_kg: float | None = None,
     baseline_factor: float | None = None,
     exercise_kcal_override: float | None = None,
+    accept_summed_exercise: bool = False,
 ) -> str:
     """Store the day's targets — the suggestion as it stands, or with overrides.
 
@@ -2251,6 +2259,15 @@ def confirm_targets(
     one day, so a top-level one is refused across a multi-date `days` call —
     pass it per date instead.
 
+    A day whose exercise sums an import with a still-planned session
+    (`exercise_source: "imported_activity+planned_workout"` in
+    `suggest_targets`) is refused here unless `accept_summed_exercise` is set
+    — top-level, or per date inside `days`, a per-date value winning. The
+    server never guesses that the planned session and the import are the same
+    ride: link them with `link_activity` if they are, or pass
+    `accept_summed_exercise=true` if there genuinely were two. An explicit
+    `exercise_kcal_override` bypasses this — there is no sum to accept.
+
     Until a date has targets, `day_summary` has no remainder and "can I eat X?"
     has no arithmetic behind it.
     """
@@ -2266,6 +2283,7 @@ def confirm_targets(
         protein_g_per_kg=protein_g_per_kg,
         baseline_factor=baseline_factor,
         exercise_kcal_override=exercise_kcal_override,
+        accept_summed_exercise=accept_summed_exercise,
     )
 
 

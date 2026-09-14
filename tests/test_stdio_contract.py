@@ -717,6 +717,25 @@ def test_editing_and_deleting_a_log_entry_survive_the_schema(nutrition_client):
     assert deleted["day"]["entry_count"] == 0
 
 
+def test_clearing_a_log_entry_note_survives_the_schema(nutrition_client):
+    """The module function gained `clear` when blank notes stopped nulling the
+    column, but the tool signature is the only surface the model can reach: a
+    `clear` that exists in nutrition.py and not in server.py leaves a mistaken
+    note with no path to NULL at all — worse than the blank-erase bug it fixed."""
+    logged = nutrition_client.call(
+        "log_food",
+        entries=[{"ingredient": "skyr", "grams": 200, "note": "logged on the wrong row"}],
+        log_date="2026-08-21",
+    )
+    entry_id = logged["entries"][0]["id"]
+
+    result = nutrition_client.call("edit_log_entry", entry_id=entry_id, clear=["note"])
+    assert "_error" not in result, result
+    assert result["ok"] is True
+    assert result["cleared_fields"] == ["note"]
+    assert result["entry"]["note"] is None
+
+
 # --------------------------------------------------------------------------
 # review round 7 — confirm_targets takes the same knobs suggest_targets does
 #

@@ -76,6 +76,14 @@ _LAP_ALIASES: dict[str, tuple[str, ...]] = {
 
 _INT_FIELDS = {"avg_hr", "max_hr"}
 
+# SQLite's INTEGER column is signed 64-bit. A finite float that survives
+# `_number`'s inf/NaN guard can still `round()` to a Python int outside this
+# range — the sqlite3 binding raises its own OverflowError at INSERT time,
+# one call past where `_NotFiniteNumber` looks, so the two `_INT_FIELDS`
+# conversions below bound it themselves rather than relying on that guard.
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
+
 # A fractional-seconds field, with whatever follows it (an offset, or nothing).
 _FRACTION = re.compile(r"^(.*?)\.(\d+)(.*)$")
 
@@ -245,8 +253,46 @@ def _pick(item: dict, keys: tuple[str, ...]) -> Any:
     return None
 
 
+class _NotFiniteNumber(Exception):
+    """Raised by `_number` for a value that parses but is not usable: inf,
+    -inf, or NaN.
+
+    Distinct from the ordinary `None` result, which means "absent or
+    unparseable" and is tolerated silently everywhere `_number` is called. A
+    JSON float literal too large to represent (`1e999`) parses to `inf` with
+    no exception; a JSON integer too large for `float()` (a 400-digit literal)
+    raises `OverflowError` inside this function. Both are folded to this one
+    signal so a call site that rejects bad rows — `normalize_activity`'s field
+    loop — can tell "absent" from "present but unusable" apart and name both
+    the field and the offending value, while a call site that never rejects
+    rows — `normalize_lap` — can catch this and fold it to None like any other
+    unusable value.
+
+    This covers every field `_number` reads, but it is not the whole story for
+    the two `_INT_FIELDS` (`avg_hr`, `max_hr`): a value can be perfectly finite
+    here and still overflow SQLite's signed-64-bit INTEGER column once
+    `round()`s to a Python int outside that range. That bound is *not* raised
+    from this exception — it is checked separately, right after the
+    `_INT_FIELDS` conversion, by both call sites (`_SQLITE_INT_MIN`/`_MAX`).
+    """
+
+    def __init__(self, value: Any):
+        self.value = value
+        super().__init__(f"not a finite number: {value!r}")
+
+
 def _number(value: Any) -> float | None:
     """A float, or None. Booleans are not numbers here, whatever Python thinks.
+
+    Raises `_NotFiniteNumber` for a value that parses to inf/-inf/NaN — see
+    that exception's docstring. An unparseable *string* still folds to None,
+    unchanged from before this: that behaviour predates the finite-number
+    guard and is not what it is for. Only inf/NaN/overflow become the raised
+    signal, regardless of whether the value arrived as a number or a string.
+    A finite value this function happily returns can still be unstorable for
+    `avg_hr`/`max_hr` once rounded to an out-of-range integer — this function
+    does not know which fields are integer columns, so that bound is the call
+    sites' job, not this one's (see `_NotFiniteNumber`'s docstring).
 
     Deliberately not shared with `verify.py`'s two coercers, which look similar
     and are not interchangeable:
@@ -264,13 +310,27 @@ def _number(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            # JSON integers are arbitrary-precision in Python: a 400-digit
+            # literal survives `json.loads` and only overflows here, one field
+            # into a batch of otherwise-valid rides. Without this, `float()`
+            # raised straight past the per-row reject path and killed the
+            # whole import call.
+            raise _NotFiniteNumber(value) from None
+        if not math.isfinite(number):
+            raise _NotFiniteNumber(value)
+        return number
     if isinstance(value, str):
         text = value.strip().replace(",", ".")
         try:
-            return float(text)
+            number = float(text)
         except ValueError:
             return None
+        if not math.isfinite(number):
+            raise _NotFiniteNumber(value)
+        return number
     return None
 
 
@@ -639,9 +699,30 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
         "normalized_power",
         "calories",
     ):
-        number = _number(values[field])
+        try:
+            number = _number(values[field])
+        except _NotFiniteNumber as exc:
+            # Reject the row, naming the field — not the batch. A silent fold
+            # to None here would store nothing wrong, but letting the
+            # exception through (as it used to for the overflow case) killed
+            # every valid ride in the same call.
+            return None, f"activity {activity_id}: {field} is not a finite number ({exc.value!r})"
         if number is not None and field in _INT_FIELDS:
-            row[field] = round(number)
+            value = round(number)
+            if not (_SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX):
+                # `number` is finite — it passed the guard above — but still
+                # too big for SQLite's signed-64-bit INTEGER column. Unguarded,
+                # the sqlite3 binding itself raised OverflowError at INSERT
+                # time, one call deeper than the guard above and outside the
+                # per-row reject path, killing the whole batch the same way
+                # the unbounded `float()` used to. Kept as a distinct message
+                # from the finite-number one so a reader can tell "inf" from
+                # "too big to store".
+                return None, (
+                    f"activity {activity_id}: {field} is outside the range this database "
+                    f"stores ({number!r})"
+                )
+            row[field] = value
         else:
             row[field] = number
 
@@ -696,9 +777,20 @@ def normalize_lap(item: dict, index: int) -> dict:
     """
     row: dict[str, Any] = {"lap_index": index}
     for field, keys in _LAP_ALIASES.items():
-        number = _number(_pick(item, keys))
+        try:
+            number = _number(_pick(item, keys))
+        except _NotFiniteNumber:
+            # Laps are never rejected (see this function's own docstring) — an
+            # inf/NaN lap value is unusable the same way a missing one is, so
+            # it is thinned to None rather than raised past this call site.
+            # Same treatment for a finite value too large for SQLite's
+            # INTEGER column (round() below would otherwise hand back a
+            # Python int that overflows the column at INSERT time) — that
+            # case is caught after rounding, just below.
+            number = None
         if number is not None and field in _INT_FIELDS:
-            row[field] = round(number)
+            value = round(number)
+            row[field] = value if _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX else None
         else:
             row[field] = number
     return row

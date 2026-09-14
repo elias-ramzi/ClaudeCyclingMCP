@@ -450,12 +450,46 @@ def _migrate_5_food_log_nullable_macros() -> list[str]:
     ]
 
 
+def _migrate_6_food_log_sequence() -> list[str]:
+    """Best-effort floor for a database that reached v5 before `migrate()`
+    grew its own `sqlite_sequence` snapshot/restore guard.
+
+    Migration 5's rebuild (see its own docstring — it is append-only and
+    stays exactly as it ran) does not carry `food_log`'s AUTOINCREMENT
+    high-water mark forward: `DROP TABLE food_log` deletes that mark, and the
+    rename hands the rebuilt table only `MAX(id)` of whatever survived the
+    copy. For a database that ran migration 5 *before this version existed*,
+    the mark lost at that moment cannot be recovered here — an id deleted at
+    the pre-migration tail may already have been handed out again to
+    something newer by the time this runs. This migration only re-establishes
+    the floor going forward, so nothing has an id *lower* than what is
+    already on disk; it is `migrate()`'s snapshot/restore guard that actually
+    protects a database migrating from v4 or earlier, where the pre-DROP mark
+    is still visible to catch.
+
+    Pure SQL and idempotent, since a migration only ever runs once per
+    database anyway: insert the row if `food_log` has never had one (a table
+    that autoincrement-numbered rows once but the row was itself lost some
+    other way), else raise it to the table's own current `MAX(id)` if that
+    reads higher than what is stored.
+    """
+    return [
+        "INSERT INTO sqlite_sequence (name, seq) "
+        "SELECT 'food_log', IFNULL((SELECT MAX(id) FROM food_log), 0) "
+        "WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'food_log')",
+        "UPDATE sqlite_sequence SET seq = (SELECT IFNULL(MAX(id), 0) FROM food_log) "
+        "WHERE name = 'food_log' "
+        "AND seq < (SELECT IFNULL(MAX(id), 0) FROM food_log)",
+    ]
+
+
 MIGRATIONS: list[tuple[int, Callable[[], list[str]]]] = [
     (1, _migrate_1_training_log),
     (2, _migrate_2_plan_and_debrief),
     (3, _migrate_3_import_flags),
     (4, _migrate_4_nutrition),
     (5, _migrate_5_food_log_nullable_macros),
+    (6, _migrate_6_food_log_sequence),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -473,6 +507,45 @@ def schema_version(conn: sqlite3.Connection) -> int:
     return int(row["v"] or 0)
 
 
+def _snapshot_sqlite_sequence(conn: sqlite3.Connection) -> dict[str, int]:
+    """`{table_name: seq}` for every AUTOINCREMENT table, or `{}` on a brand
+    new database that has no tables — and so no `sqlite_sequence` — yet."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'"
+    ).fetchone()
+    if not exists:
+        return {}
+    return {
+        row["name"]: row["seq"] for row in conn.execute("SELECT name, seq FROM sqlite_sequence")
+    }
+
+
+def _restore_sqlite_sequence_floor(conn: sqlite3.Connection, before: dict[str, int]) -> None:
+    """Raise `sqlite_sequence` back to its pre-migration mark wherever a
+    migration just applied left it lower — never lowers or invents a mark.
+
+    A rebuild migration (SQLite has no `ALTER COLUMN`, so relaxing a
+    constraint is CREATE new table + `INSERT ... SELECT` + DROP old + RENAME)
+    only carries forward the AUTOINCREMENT high-water mark of the rows that
+    survived the copy: `DROP TABLE` deletes that table's own
+    `sqlite_sequence` row, and the rename hands the rebuilt table just
+    `MAX(id)` of what got copied. A row deleted before the rebuild — its id
+    already past `MAX(id)` of what remains — gets handed out again to
+    whatever is inserted next, silently.
+    """
+    for name, seq in before.items():
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        if not table_exists:
+            continue
+        row = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (name, seq))
+        elif row["seq"] < seq:
+            conn.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = ?", (seq, name))
+
+
 def migrate(conn: sqlite3.Connection) -> list[int]:
     """Bring `conn` up to CURRENT_SCHEMA_VERSION. Returns what was applied.
 
@@ -480,12 +553,27 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
     list. Statements are executed one at a time rather than through
     `executescript`, which issues an implicit COMMIT — that would drop the
     caller's transaction and leave a failed migration half-applied on disk.
+
+    Brackets the whole walk with an AUTOINCREMENT high-water-mark guard: the
+    `sqlite_sequence` table is snapshotted before any pending migration runs,
+    and restored afterward wherever a migration left a table's mark lower
+    than it stood before (see `_restore_sqlite_sequence_floor`). This lives
+    here, in the framework, rather than in any one migration, because a
+    rebuild migration cannot see its own pre-DROP `sqlite_sequence` state
+    from a *later* migration — by the time anything downstream could read it,
+    the DROP already deleted it. Only code that brackets the entire walk has
+    both the before and the after in hand. It also means every future rebuild
+    migration is covered by construction, not by remembering to add this
+    again.
     """
     current = schema_version(conn)
+    pending = [(version, statements) for version, statements in MIGRATIONS if version > current]
+    if not pending:
+        return []
+
+    before_sequence = _snapshot_sqlite_sequence(conn)
     applied: list[int] = []
-    for version, statements in MIGRATIONS:
-        if version <= current:
-            continue
+    for version, statements in pending:
         for statement in statements():
             conn.execute(statement)
         conn.execute(
@@ -493,6 +581,7 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
             (version, now_utc()),
         )
         applied.append(version)
+    _restore_sqlite_sequence_floor(conn, before_sequence)
     return applied
 
 

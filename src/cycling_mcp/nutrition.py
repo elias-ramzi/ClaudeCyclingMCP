@@ -35,7 +35,7 @@ from typing import Any
 from .metrics import compute_metrics
 from .spec import SpecError, load_spec
 from .store import DEFAULT_ATHLETE_ID, now_utc, open_db
-from .training import _positive, parse_date
+from .training import NON_STARTING_EVENT_STATUSES, _dict, _positive, _text, parse_date
 from .training import agree as _agree
 from .training import one_of as _training_one_of
 from .training import plural as _plural
@@ -72,6 +72,15 @@ KJ_PER_KCAL = 4.184
 #: a cutting phase for a cyclist.
 DEFAULT_PROTEIN_G_PER_KG = 2.0
 DEFAULT_FIBER_G = 30.0
+
+#: The three knobs `suggest_targets` and `confirm_targets` both take, named
+#: once rather than written out at every `_number` call in either function.
+#: Round 7 finding 1 was one divergence between two copies of a range; these
+#: three ranges used to be six separate literals across the two functions —
+#: the exact class of drift a lockstep parity test now pins against.
+PROTEIN_G_PER_KG_LIMITS = (0.5, 4.0)
+BASELINE_FACTOR_LIMITS = (1.0, 2.5)
+EXERCISE_KCAL_OVERRIDE_LIMITS = (0.0, 15000.0)
 #: Race day and the evening before. Fibre is reduced, not because it stopped
 #: being good for the athlete, but because it is still in the gut at kilometre
 #: 40.
@@ -166,6 +175,12 @@ _OPTIONAL_MACROS = ("carbs_g", "fat_g")
 #: `CLEARABLE_INGREDIENT_FIELDS` for the criterion this and it both apply.
 CLEARABLE_MEAL_FIELDS = ("note", "default_for_slot")
 
+#: What `edit_log_entry(clear=[...])` may erase. A log entry is a frozen
+#: measurement (grams/macros are the measurement itself, slot and date are not
+#: optional), so `note` — the one free-text field on the row — is the only
+#: thing here with an "unknown" state to return to.
+CLEARABLE_LOG_ENTRY_FIELDS = ("note",)
+
 #: What `update_ingredient(clear=[...])` may erase. The criterion is the same
 #: one `coach.py`'s `CLEARABLE_*` tuples use (see coach.py:88-94): empty is a
 #: real state the record can be in, not "unknown until corrected". `name`,
@@ -197,17 +212,6 @@ class NutritionError(ValueError):
 # --------------------------------------------------------------------------
 # small helpers
 # --------------------------------------------------------------------------
-
-
-def _dict(row: sqlite3.Row | None) -> dict | None:
-    return None if row is None else dict(zip(row.keys(), tuple(row), strict=True))
-
-
-def _text(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
 
 
 _PUNCTUATION = re.compile(r"[^a-z0-9]+")
@@ -306,22 +310,35 @@ def _bool(value: Any, what: str, default: bool = True) -> bool:
     raise NutritionError(f"{what} must be true or false, got {value!r}")
 
 
-def _clear_fields(updates: dict[str, Any], clear: Any, clearable: tuple[str, ...]) -> list[str]:
+def _clear_fields(
+    updates: dict[str, Any],
+    clear: Any,
+    clearable: tuple[str, ...],
+    blanked: list[str] | None = None,
+) -> list[str]:
     """See `coach._stage_clear` — the only path to a NULL, ported rather than reinvented.
 
-    Deferred import for the same reason as `NON_STARTING_EVENT_STATUSES`: `coach.py`
-    imports `GENDERS` from this module at load time, so a module-level import in
-    this direction would be a real circular one. Re-raised as `NutritionError` so
-    a caller of `update_ingredient`/`save_meal` sees this module's own refusal
-    type, the same as every other refusal here — `coach.CoachError` and
-    `NutritionError` are unrelated `ValueError` subclasses, not a hierarchy.
+    Deferred import: `coach.py` imports `GENDERS` from this module at load
+    time, so a module-level `from .coach import ...` here would be a real
+    circular import, not just an ordering nuisance. Re-raised as
+    `NutritionError` so a caller of `update_ingredient`/`save_meal` sees this
+    module's own refusal type, the same as every other refusal here —
+    `coach.CoachError` and `NutritionError` are unrelated `ValueError`
+    subclasses, not a hierarchy.
     """
     from .coach import CoachError, _stage_clear
 
     try:
-        return _stage_clear(updates, clear, clearable)
+        return _stage_clear(updates, clear, clearable, blanked)
     except CoachError as exc:
         raise NutritionError(str(exc)) from exc
+
+
+def _blank_text_note(blanked: list[str], clearable: tuple[str, ...]) -> dict:
+    """See `coach._blank_text_note` — what a blank field did (nothing), said out loud."""
+    from .coach import _blank_text_note as _coach_blank_text_note
+
+    return _coach_blank_text_note(blanked, clearable)
 
 
 def _round(value: float | None, places: int = 1) -> float | None:
@@ -453,12 +470,21 @@ def cost_per_100g(row: dict) -> float | None:
     return round(float(price) * 100.0 / float(weight), 4)
 
 
-def _ingredient_fields(item: dict, existing: dict | None = None) -> dict:
+def _ingredient_fields(item: dict, existing: dict | None = None) -> tuple[dict, list[str]]:
     """Validate and coerce one ingredient's fields. Shared by add and update.
 
     `existing` is the stored row on an update, so a partial update inherits
     what it did not mention — and so the required macros can stay required on
     an insert without forcing them to be repeated on every edit.
+
+    Returns the fields to write, and — for `portion_label`/`note` — the names
+    given as blank text on an update. `_text("")` folds to None, and `item.get
+    (column) is not None` admits `""`, so writing that None straight into
+    `fields` would UPDATE the column to NULL: a blank form field erasing a
+    "weigh it cooked" note with no `cleared_fields` to say so. On an update a
+    blank is skipped and named instead, the same as `coach._stage_text`; on an
+    insert (no `existing`) there is nothing stored yet to protect, so a blank
+    is simply absent from the row, silently.
     """
     base = existing or {}
     fields: dict[str, Any] = {}
@@ -502,9 +528,15 @@ def _ingredient_fields(item: dict, existing: dict | None = None) -> dict:
         fields["default_portion_g"] = _number(
             item["default_portion_g"], "default_portion_g", GRAMS_LIMITS
         )
+    blanked: list[str] = []
     for column in ("portion_label", "note"):
         if item.get(column) is not None:
-            fields[column] = _text(item[column])
+            text = _text(item[column])
+            if text is None:
+                if base:
+                    blanked.append(column)
+                continue
+            fields[column] = text
     if item.get("package_price") is not None:
         fields["package_price"] = _number(item["package_price"], "package_price", (0.0, 10000.0))
     if item.get("package_weight_g") is not None:
@@ -517,7 +549,7 @@ def _ingredient_fields(item: dict, existing: dict | None = None) -> dict:
         )
     elif not base:
         fields["counts_toward_protein"] = 1
-    return fields
+    return fields, blanked
 
 
 def _state_warning(fields: dict) -> str | None:
@@ -570,7 +602,10 @@ def add_ingredients(items: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dict:
                 )
                 continue
             try:
-                fields = _ingredient_fields(item)
+                # No `existing` row, so a blank text field is silently absent
+                # from the insert rather than reported — there is nothing
+                # stored yet for it to overwrite.
+                fields, _blanked = _ingredient_fields(item)
             except NutritionError as exc:
                 rejected.append({"index": index, "name": item.get("name"), "reason": str(exc)})
                 continue
@@ -645,14 +680,15 @@ def update_ingredient(
     `clear=[...]` erases an optional field back to unknown — `package_price`,
     `package_weight_g`, `default_portion_g`, `portion_label`, `note`, or any of
     the optional macros. There was previously no way back to "unknown" once a
-    wrong price or portion had been stored over the right one; a bare field
-    given as blank text is still ignored rather than stored, so `clear` is the
-    only path to a null here, the same as everywhere else in this server.
+    wrong price or portion had been stored over the right one; a bare
+    `portion_label`/`note` given as blank text is ignored rather than
+    stored — the response names it in `ignored_blank_fields` — so `clear` is
+    the only path to a null here, the same as everywhere else in this server.
     """
     with open_db() as conn:
         _ensure_athlete(conn, athlete_id)
         row = _require_ingredient(conn, athlete_id, ingredient_id, name)
-        fields = _ingredient_fields({**changes, "name": new_name}, existing=row)
+        fields, blanked = _ingredient_fields({**changes, "name": new_name}, existing=row)
         if new_name is None:
             # `_ingredient_fields` always emits a name and its key, because it
             # needs one to validate against — but nothing was asked about the
@@ -670,19 +706,27 @@ def update_ingredient(
                     f"another ingredient is already stored as {clash['name']!r} "
                     f"(id {clash['id']}). Nothing was changed."
                 )
-        cleared = _clear_fields(fields, clear, CLEARABLE_INGREDIENT_FIELDS)
+        # `_clear_fields` stages a cleared name's NULL straight into `fields`,
+        # so `not fields` below still means "no assignment at all" once a
+        # clear is folded in.
+        cleared = _clear_fields(fields, clear, CLEARABLE_INGREDIENT_FIELDS, blanked)
         if not fields:
-            raise NutritionError("nothing to update — pass at least one field, or clear=[...]")
-
-        assignments = ", ".join(f"{key} = ?" for key in fields)
-        conn.execute(
-            f"UPDATE ingredients SET {assignments}, updated_at = ? WHERE id = ?",
-            (*fields.values(), now_utc(), row["id"]),
-        )
-        stored = _dict(
-            conn.execute("SELECT * FROM ingredients WHERE id = ?", (row["id"],)).fetchone()
-        )
-        assert stored is not None
+            if not blanked:
+                raise NutritionError("nothing to update — pass at least one field, or clear=[...]")
+            # Something was given — it just came out blank. That is a no-op,
+            # not a missing argument, and building `UPDATE ... SET , ...`
+            # from an empty assignment list would be invalid SQL anyway.
+            stored = row
+        else:
+            assignments = ", ".join(f"{key} = ?" for key in fields)
+            conn.execute(
+                f"UPDATE ingredients SET {assignments}, updated_at = ? WHERE id = ?",
+                (*fields.values(), now_utc(), row["id"]),
+            )
+            stored = _dict(
+                conn.execute("SELECT * FROM ingredients WHERE id = ?", (row["id"],)).fetchone()
+            )
+            assert stored is not None
         logged = conn.execute(
             "SELECT COUNT(*) AS n FROM food_log WHERE ingredient_id = ?", (row["id"],)
         ).fetchone()["n"]
@@ -693,6 +737,7 @@ def update_ingredient(
     }
     if cleared:
         result["cleared_fields"] = cleared
+    result.update(_blank_text_note(blanked, CLEARABLE_INGREDIENT_FIELDS))
     if logged:
         result["history_note"] = (
             f"{_plural(logged, 'existing log entry')} kept the macros and cost "
@@ -925,7 +970,7 @@ def macros_for(row: dict, grams: float) -> dict:
     return out
 
 
-def _quantity(entry: dict, ingredient: dict) -> float:
+def _quantity(entry: dict, ingredient: dict, allow_zero: bool = False) -> float:
     """Grams from either `grams` or `portions`, or a refusal that says which.
 
     A portion is only a quantity if the ingredient carries one. Silently
@@ -935,10 +980,19 @@ def _quantity(entry: dict, ingredient: dict) -> float:
     Zero or negative is refused here, for both `grams` and `portions`: a `0 g`
     placeholder row logs a day as `logged: true` at ~0 kcal, which is not "ate
     nothing", it is "someone forgot the weight" — and it deflates every
-    average that treats a logged day as a real one. `log_meal`'s own
-    `overrides=[{"grams": 0}]` is the one place a zero is meaningful ("leave
-    this out today"); that caller detects the explicit zero and never reaches
-    this function with it — see the override loop.
+    average that treats a logged day as a real one.
+
+    `allow_zero` is `log_meal`'s override loop, and only it: there a `0` is
+    the one meaningful zero this module has — "leave this ingredient out
+    today" — and it has to be recognised without ever reaching a bare `<= 0`
+    refusal. The both-given contradiction is checked first regardless, so
+    `{"grams": 200, "portions": 0}` is still refused rather than read as an
+    override of zero; only a single coerced-to-zero field returns `0.0`, and
+    on the portions path it returns before the no-default-portion refusal —
+    omitting an ingredient must not require it to carry a stored portion
+    size. Every caller that is not that loop leaves `allow_zero` at its
+    default, so a stray `grams: 0` elsewhere still reads as "someone forgot
+    the weight", not as an instruction.
     """
     grams = entry.get("grams")
     portions = entry.get("portions")
@@ -948,7 +1002,14 @@ def _quantity(entry: dict, ingredient: dict) -> float:
             f"definition when the portion is not exactly that many grams."
         )
     if grams is not None:
+        if isinstance(grams, bool):
+            # float(True) == 1.0 — an unguarded bool would coerce silently
+            # instead of being refused as the wrong shape, and under
+            # `allow_zero` a stray `False` would be read as "leave it out".
+            raise NutritionError(f"{ingredient['name']}: grams must be a number, got {grams!r}")
         value = _number(grams, "grams", GRAMS_LIMITS)
+        if allow_zero and value == 0:
+            return 0.0
         if value <= 0:
             raise NutritionError(
                 f"{ingredient['name']}: grams must be greater than zero — a zero-gram entry is "
@@ -957,7 +1018,11 @@ def _quantity(entry: dict, ingredient: dict) -> float:
         return value
     if portions is None:
         raise NutritionError(f"{ingredient['name']}: give grams or portions")
+    if isinstance(portions, bool):
+        raise NutritionError(f"{ingredient['name']}: portions must be a number, got {portions!r}")
     count = _number(portions, "portions", (0.0, 100.0))
+    if allow_zero and count == 0:
+        return 0.0
     if count <= 0:
         raise NutritionError(
             f"{ingredient['name']}: portions must be greater than zero — a zero-portion entry "
@@ -1153,19 +1218,39 @@ def save_meal(
             "SELECT * FROM meals WHERE athlete_id = ? AND name_key = ?", (athlete_id, key)
         ).fetchone()
         if existing is None:
-            # A brand-new meal has nothing to clear, but a mistyped field name in
-            # `clear` is a caller trying to erase something and must not be told
-            # it worked just because the meal happened not to exist yet — the
-            # same rule the existing-meal branch enforces below. Validate before
-            # the INSERT so a bad name leaves nothing behind.
-            _clear_fields({}, clear, CLEARABLE_MEAL_FIELDS)
+            # A brand-new meal has nothing to clear, but a mistyped field name
+            # in `clear`, or a field given both a value and a request to
+            # clear it, is a caller trying to erase something and must not be
+            # told it worked (or read as a no-op) just because the meal
+            # happened not to exist yet — the same rule the existing-meal
+            # branch enforces below. Staged against the same values that
+            # branch stages, so the contradiction raises the identical
+            # refusal either way, and validated before the INSERT so a bad
+            # call leaves nothing behind.
+            staged: dict[str, Any] = {}
+            if slot is not None:
+                staged["default_for_slot"] = slot
+            if _text(note) is not None:
+                staged["note"] = _text(note)
+            _clear_fields(staged, clear, CLEARABLE_MEAL_FIELDS)
             cursor = conn.execute(
                 "INSERT INTO meals (athlete_id, name, name_key, default_for_slot, note, "
                 "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (athlete_id, title, key, slot, _text(note), stamp, stamp),
+                (
+                    athlete_id,
+                    title,
+                    key,
+                    staged.get("default_for_slot"),
+                    staged.get("note"),
+                    stamp,
+                    stamp,
+                ),
             )
             meal_id = cursor.lastrowid
             replaced = False
+            # `staged` picked up a cleared name's None, but nothing here was
+            # ever set to begin with — a brand-new row already has nothing to
+            # clear, so nothing is reported as cleared.
             cleared: list[str] = []
         else:
             meal_id = existing["id"]
@@ -1218,8 +1303,8 @@ def delete_meal(meal: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dict:
     if logged:
         result["history_note"] = (
             f"{_plural(logged, 'existing log entry')} logged from "
-            f"{row['name']!r} keep the macros and the meal name they were logged with; only "
-            f"the link back to this recipe is gone."
+            f"{row['name']!r} {_agree(logged, 'keep')} the macros and the meal name they were "
+            f"logged with; only the link back to this recipe is gone."
         )
     return result
 
@@ -1448,27 +1533,11 @@ def log_meal(
                 reference = item.get("name")
             ingredient = resolve_ingredient(rows, reference)
             # An explicit zero is "leave it out today" — the one meaning a
-            # zero quantity has anywhere in this module — and has to be
-            # recognised *before* `_quantity`, which refuses zero as a
-            # placeholder. The comparison is on the coerced figure, not the
-            # raw value: every other quantity here reads the numeric strings
-            # a pasted payload carries, so "0" must mean what 0 means. Bools
-            # are refused first — float(False) is 0.0, the same trap
-            # resolve_ingredient and _resolve_meal guard. Caught on either
-            # field so `portions: 0` means the same thing `grams: 0` does.
-            omitted_today = False
-            for field, limits in (("grams", GRAMS_LIMITS), ("portions", (0.0, 100.0))):
-                raw = item.get(field)
-                if isinstance(raw, bool):
-                    raise NutritionError(
-                        f"{ingredient['name']}: {field} must be a number, got {raw!r}"
-                    )
-                if raw is not None and _number(raw, field, limits) == 0:
-                    omitted_today = True
-            if omitted_today:
-                overridden[ingredient["id"]] = 0.0
-            else:
-                overridden[ingredient["id"]] = _quantity(item, ingredient)
+            # zero quantity has anywhere in this module. `_quantity`'s
+            # `allow_zero` recognises it on whichever of grams/portions was
+            # given, but still refuses the both-given contradiction first and
+            # a bool before ever coercing it — see `_quantity`'s docstring.
+            overridden[ingredient["id"]] = _quantity(item, ingredient, allow_zero=True)
 
         items = [
             _dict(row) or {}
@@ -1554,6 +1623,7 @@ def edit_log_entry(
     slot: str | None = None,
     log_date: str | None = None,
     note: str | None = None,
+    clear: list[str] | str | None = None,
     athlete_id: int = DEFAULT_ATHLETE_ID,
 ) -> dict:
     """Correct one logged entry — usually a weight that was guessed then measured.
@@ -1565,6 +1635,12 @@ def edit_log_entry(
 
     An estimate has no ingredient behind it, so its quantity cannot be
     recomputed; change its numbers by deleting it and logging it again.
+
+    `note` follows the same rule as every other free-text field in this
+    server: a blank (`""` or whitespace) is not an instruction to erase what
+    is stored, so it is skipped and named in `ignored_blank_fields` instead —
+    see `coach._stage_text`. A frozen log row still has one path to a real
+    NULL: `clear=["note"]`.
     """
     with open_db() as conn:
         row = _dict(
@@ -1576,12 +1652,17 @@ def edit_log_entry(
             raise NutritionError(f"no log entry with id {entry_id}")
 
         updates: dict[str, Any] = {}
+        blanked: list[str] = []
         if slot is not None:
             updates["slot"] = _one_of(slot, SLOTS, "slot")
         if log_date is not None:
             updates["log_date"] = parse_date(log_date, "log_date").isoformat()
         if note is not None:
-            updates["note"] = _text(note)
+            text = _text(note)
+            if text is None:
+                blanked.append("note")
+            else:
+                updates["note"] = text
 
         if grams is not None or portions is not None:
             if row["ingredient_id"] is None:
@@ -1614,24 +1695,40 @@ def edit_log_entry(
                 }
             )
 
-        if not updates:
-            raise NutritionError("nothing to change — pass grams, portions, slot, date or note")
+        cleared = _clear_fields(updates, clear, CLEARABLE_LOG_ENTRY_FIELDS, blanked)
 
-        assignments = ", ".join(f"{key} = ?" for key in updates)
-        conn.execute(
-            f"UPDATE food_log SET {assignments}, updated_at = ? WHERE id = ?",
-            (*updates.values(), now_utc(), entry_id),
-        )
-        stored = _dict(conn.execute("SELECT * FROM food_log WHERE id = ?", (entry_id,)).fetchone())
-        assert stored is not None
+        if not updates:
+            if not blanked:
+                raise NutritionError(
+                    "nothing to change — pass grams, portions, slot, date, note or clear=[...]"
+                )
+            # Something was given — it just came out blank. That is a no-op,
+            # not a missing argument, the same as `update_ingredient`: build
+            # `UPDATE ... SET , ...` from an empty assignment list would be
+            # invalid SQL anyway, and there is nothing to write.
+            stored = row
+        else:
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            conn.execute(
+                f"UPDATE food_log SET {assignments}, updated_at = ? WHERE id = ?",
+                (*updates.values(), now_utc(), entry_id),
+            )
+            stored = _dict(
+                conn.execute("SELECT * FROM food_log WHERE id = ?", (entry_id,)).fetchone()
+            )
+            assert stored is not None
         days = sorted({row["log_date"], stored["log_date"]})
         summaries = {day: _day_summary(conn, athlete_id, day) for day in days}
 
-    return {
+    result: dict[str, Any] = {
         "updated_fields": sorted(updates),
         "entry": _log_out(stored),
         "days": summaries,
     }
+    if cleared:
+        result["cleared_fields"] = cleared
+    result.update(_blank_text_note(blanked, CLEARABLE_LOG_ENTRY_FIELDS))
+    return result
 
 
 def delete_log_entry(entry_id: int, athlete_id: int = DEFAULT_ATHLETE_ID) -> dict:
@@ -1906,22 +2003,39 @@ def _totals(entries: list[dict]) -> dict:
     return totals
 
 
+def _unknown_macro_parts(protein_missing: int, fiber_missing: int) -> list[str]:
+    """ "protein from N entries" / "fibre from N entries", conjoined by the caller.
+
+    Shared by `_day_summary` and `week_summary`, which each built this parts
+    list by hand before. The verb agreement is the caller's own — it depends
+    on the number of conjoined subjects (`len(parts)`), not on either entry
+    count: "protein from 2 entries IS unknown", but "protein ... and fibre
+    ... ARE unknown".
+    """
+    parts = []
+    if protein_missing:
+        parts.append(f"protein from {_plural(protein_missing, 'entry')}")
+    if fiber_missing:
+        parts.append(f"fibre from {_plural(fiber_missing, 'entry')}")
+    return parts
+
+
+#: `status NOT IN (?, ?)` for `NON_STARTING_EVENT_STATUSES`, built once rather
+#: than in every caller that excludes a non-starting event — `_event_on` and
+#: `_RangeHistory.__init__` both do.
+_NOT_STARTING_CLAUSE = "status NOT IN (" + ", ".join("?" for _ in NON_STARTING_EVENT_STATUSES) + ")"
+
+
 def _event_on(conn: sqlite3.Connection, athlete_id: int, day: str) -> dict | None:
     """The event on one date that is still going to happen, or did.
 
     Excludes `NON_STARTING_EVENT_STATUSES` (`abandoned`, `dns`) — a race
     recorded as either is not one this day's fuelling should be built around.
-    The import is deferred: `coach.py` imports `GENDERS` from this module at
-    load time, so a module-level `from .coach import ...` here would be a real
-    circular import, not just an ordering nuisance.
     """
-    from .coach import NON_STARTING_EVENT_STATUSES
-
-    placeholders = ", ".join("?" for _ in NON_STARTING_EVENT_STATUSES)
     return _dict(
         conn.execute(
             f"SELECT * FROM events WHERE athlete_id = ? AND event_date = ? "
-            f"AND status NOT IN ({placeholders}) ORDER BY id LIMIT 1",
+            f"AND {_NOT_STARTING_CLAUSE} ORDER BY id LIMIT 1",
             (athlete_id, day, *NON_STARTING_EVENT_STATUSES),
         ).fetchone()
     )
@@ -2004,6 +2118,17 @@ def _day_type_and_training_from_rows(
     # assumed to be one just because an import happens to exist on the same
     # day, however many activities were imported. See
     # `test_an_unlinked_plan_next_to_a_measured_ride_sums_rather_than_vanishes`.
+    #
+    # This sum is advisory, not filed blind: `suggest_targets` keeps showing
+    # it (a suggestion is the working, not a decision), but `confirm_targets`
+    # refuses to store a target computed from it unless the caller either
+    # links the session (proving the import IS this plan) or explicitly
+    # accepts the sum (`accept_summed_exercise=true`, meaning there genuinely
+    # were two sessions). Nothing here — or in `confirm_targets` — guesses
+    # that a planned session and an imported ride are the same ride; guessing
+    # wrong doubles a day's exercise calories and looks entirely plausible
+    # afterwards, which is worse than refusing to file it. See
+    # `confirm_targets` and finding 8 of review round 8.
     outstanding = [c for c in candidates if c["row"].get("linked_activity_id") not in activity_ids]
     outstanding_kcal = sum(c["kcal"] for c in outstanding)
     outstanding_names = [c["name"] for c in outstanding]
@@ -2186,14 +2311,7 @@ def _day_summary(conn: sqlite3.Connection, athlete_id: int, day: str) -> dict:
     protein_missing = totals.get("protein_g_missing_entries")
     fiber_missing = totals.get("fiber_g_missing_entries")
     if protein_missing or fiber_missing:
-        parts = []
-        if protein_missing:
-            parts.append(f"protein from {_plural(protein_missing, 'entry')}")
-        if fiber_missing:
-            parts.append(f"fibre from {_plural(fiber_missing, 'entry')}")
-        # The verb agrees with the number of conjoined subjects, not with the
-        # entry counts: "protein from 2 entries IS unknown", but "protein ...
-        # and fibre ... ARE unknown".
+        parts = _unknown_macro_parts(protein_missing, fiber_missing)
         summary["unknown_macros_note"] = (
             f"{' and '.join(parts)} {_agree(len(parts), 'is')} unknown, not zero — "
             f"an estimate that never stated it. "
@@ -2466,7 +2584,10 @@ def _suggest_one(
         names = ", ".join(training.get("outstanding_planned_names") or [])
         notes.append(
             f"Exercise calories include an estimated {round(outstanding_kcal)} kcal from "
-            f"{names}, still planned and not yet imported today. Re-run this once it is."
+            f"{names}, still planned and not yet imported today. This figure will not confirm "
+            f"as shown: call link_activity first if the import IS {names}, or pass "
+            f"accept_summed_exercise=true to confirm_targets if there genuinely were two "
+            f"sessions."
         )
     if clamped:
         notes.append(
@@ -2495,9 +2616,8 @@ def _suggest_one(
         )
     if training["unmeasured_activities"]:
         notes.append(
-            f"{training['unmeasured_activities']} imported "
-            f"activit{'y' if training['unmeasured_activities'] == 1 else 'ies'} on this date "
-            f"carr{'ies' if training['unmeasured_activities'] == 1 else 'y'} no calorie figure "
+            f"{_plural(training['unmeasured_activities'], 'imported activity')} on this date "
+            f"{_agree(training['unmeasured_activities'], 'carry')} no calorie figure "
             f"from Garmin and contributed nothing."
         )
     if athlete["gender"] == "other":
@@ -2557,14 +2677,11 @@ class _RangeHistory:
             record = _dict(row) or {}
             self._planned.setdefault(record["scheduled_date"], []).append(record)
 
-        from .coach import NON_STARTING_EVENT_STATUSES  # deferred: see _event_on
-
         lookahead = (parse_date(last, "end") + timedelta(days=1)).isoformat()
-        placeholders = ", ".join("?" for _ in NON_STARTING_EVENT_STATUSES)
         self._events: dict[str, dict] = {}
         for row in conn.execute(
             f"SELECT * FROM events WHERE athlete_id = ? AND event_date BETWEEN ? AND ? "
-            f"AND status NOT IN ({placeholders}) ORDER BY id",
+            f"AND {_NOT_STARTING_CLAUSE} ORDER BY id",
             (athlete_id, first, lookahead, *NON_STARTING_EVENT_STATUSES),
         ):
             record = _dict(row) or {}
@@ -2677,9 +2794,11 @@ def suggest_targets(
     else:
         days = [_today(date_str).isoformat()]
 
-    factor = _number(baseline_factor, "baseline_factor", (1.0, 2.5))
-    per_kg = _number(protein_g_per_kg, "protein_g_per_kg", (0.5, 4.0))
-    override = _optional_number(exercise_kcal_override, "exercise_kcal_override", (0.0, 15000.0))
+    factor = _number(baseline_factor, "baseline_factor", BASELINE_FACTOR_LIMITS)
+    per_kg = _number(protein_g_per_kg, "protein_g_per_kg", PROTEIN_G_PER_KG_LIMITS)
+    override = _optional_number(
+        exercise_kcal_override, "exercise_kcal_override", EXERCISE_KCAL_OVERRIDE_LIMITS
+    )
     if override is not None and len(days) > 1:
         raise NutritionError(
             "exercise_kcal_override applies to one day; it would be wrong on every other day "
@@ -2747,6 +2866,7 @@ def confirm_targets(
     protein_g_per_kg: float | None = None,
     baseline_factor: float | None = None,
     exercise_kcal_override: float | None = None,
+    accept_summed_exercise: Any = False,
     athlete_id: int = DEFAULT_ATHLETE_ID,
 ) -> dict:
     """Store the day's targets: the suggestion as it stands, or with overrides.
@@ -2780,6 +2900,20 @@ def confirm_targets(
     A kcal override below computed BMR is refused. That is not a target this
     server will file, whoever asked for it; the goal's rate is what should
     change.
+
+    **A day whose exercise is `imported_activity+planned_workout` — an import
+    summed with a still-planned session `suggest_targets` could not rule out
+    as the same ride — is refused here too**, unless `accept_summed_exercise`
+    is set (top-level, or per date inside `days`; a per-date value wins).
+    This is a confirm-time gate, not a heuristic: the server never guesses
+    that a planned session and an imported ride are the same one, so rather
+    than silently filing a total that might be double the real figure, it
+    refuses and names the three ways out — `link_activity` if the import IS
+    that planned session, `accept_summed_exercise=true` if there genuinely
+    were two, or `exercise_kcal_override` with the intended figure.
+    `exercise_kcal_override` replaces the computed exercise outright
+    (`exercise_source == "override"`), so it always bypasses this gate — there
+    is no sum left to accept or refuse.
     """
     requests: list[dict] = []
     if days is not None:
@@ -2804,23 +2938,24 @@ def confirm_targets(
         )
 
     default_protein_g_per_kg = (
-        _number(protein_g_per_kg, "protein_g_per_kg", (0.5, 4.0))
+        _number(protein_g_per_kg, "protein_g_per_kg", PROTEIN_G_PER_KG_LIMITS)
         if protein_g_per_kg is not None
         else DEFAULT_PROTEIN_G_PER_KG
     )
     default_baseline_factor = (
-        _number(baseline_factor, "baseline_factor", (1.0, 2.5))
+        _number(baseline_factor, "baseline_factor", BASELINE_FACTOR_LIMITS)
         if baseline_factor is not None
         else SEDENTARY_FACTOR
     )
     default_exercise_override = _optional_number(
-        exercise_kcal_override, "exercise_kcal_override", (0.0, 15000.0)
+        exercise_kcal_override, "exercise_kcal_override", EXERCISE_KCAL_OVERRIDE_LIMITS
     )
     if default_exercise_override is not None and len(requests) > 1:
         raise NutritionError(
             "exercise_kcal_override applies to one day; it would be wrong on every other day "
             "of a multi-day confirm. Pass it per day inside `days`, or confirm that day alone."
         )
+    default_accept_summed_exercise = _bool(accept_summed_exercise, "accept_summed_exercise", False)
 
     stored: list[dict] = []
     rejected: list[dict] = []
@@ -2837,18 +2972,20 @@ def confirm_targets(
             try:
                 day = _today(item.get("date") or item.get("date_str")).isoformat()
                 item_protein = (
-                    _number(item["protein_g_per_kg"], "protein_g_per_kg", (0.5, 4.0))
+                    _number(item["protein_g_per_kg"], "protein_g_per_kg", PROTEIN_G_PER_KG_LIMITS)
                     if item.get("protein_g_per_kg") is not None
                     else default_protein_g_per_kg
                 )
                 item_baseline = (
-                    _number(item["baseline_factor"], "baseline_factor", (1.0, 2.5))
+                    _number(item["baseline_factor"], "baseline_factor", BASELINE_FACTOR_LIMITS)
                     if item.get("baseline_factor") is not None
                     else default_baseline_factor
                 )
                 item_override = (
                     _number(
-                        item["exercise_kcal_override"], "exercise_kcal_override", (0.0, 15000.0)
+                        item["exercise_kcal_override"],
+                        "exercise_kcal_override",
+                        EXERCISE_KCAL_OVERRIDE_LIMITS,
                     )
                     if item.get("exercise_kcal_override") is not None
                     else default_exercise_override
@@ -2874,6 +3011,36 @@ def confirm_targets(
                         f"{day}: {suggestion['missing_note']} Or pass kcal, protein_g and "
                         f"fiber_g explicitly to file a target anyway."
                     )
+                # See the comment above `outstanding` in
+                # `_day_type_and_training_from_rows`: this sum is advisory in
+                # `suggest_targets`, but never filed blind — an import summed
+                # with a still-planned session might be the same ride wearing
+                # two names, and confirming that without a human resolving it
+                # would file a doubled figure that looks entirely reasonable
+                # afterwards. `exercise_kcal_override` (source "override")
+                # replaces the sum outright, so it never reaches here.
+                exercise_source = (suggestion.get("working") or {}).get("exercise_source")
+                accepted_summed_exercise = False
+                if exercise_source == "imported_activity+planned_workout":
+                    item_accept = _bool(
+                        item.get("accept_summed_exercise"),
+                        "accept_summed_exercise",
+                        default_accept_summed_exercise,
+                    )
+                    if not item_accept:
+                        names = ", ".join(
+                            (suggestion.get("training") or {}).get("outstanding_planned_names")
+                            or []
+                        )
+                        raise NutritionError(
+                            f"{day}: exercise calories sum an imported ride with an estimate "
+                            f"for {names}, still planned and not marked as ridden — filing that "
+                            f"as shown would double-count if it is the same ride. Three ways "
+                            f"out: call link_activity if the import IS {names}; pass "
+                            f"accept_summed_exercise=true if there genuinely were two sessions; "
+                            f"or pass exercise_kcal_override with the intended figure."
+                        )
+                    accepted_summed_exercise = True
                 base = suggestion.get(
                     "suggested",
                     {"kcal": 0, "protein_g": 0, "fiber_g": 0, "day_type": suggestion["day_type"]},
@@ -2940,6 +3107,15 @@ def confirm_targets(
                 entry = dict(row)
                 if overrides:
                     entry["overrode"] = {key: base[key] for key in overrides if key in base}
+                if accepted_summed_exercise:
+                    names = ", ".join(
+                        (suggestion.get("training") or {}).get("outstanding_planned_names") or []
+                    )
+                    entry["accepted_summed_exercise_note"] = (
+                        f"Filed with exercise calories summing an imported ride and an "
+                        f"estimate for {names}, accepted explicitly via "
+                        f"accept_summed_exercise=true rather than linked."
+                    )
                 stored.append(entry)
             except (NutritionError, ValueError) as exc:
                 rejected.append({"index": index, "date": item.get("date"), "reason": str(exc)})
@@ -3183,7 +3359,7 @@ def week_summary(
             "per_day": round(cost / len(logged), 2) if logged else None,
             "unpriced_entries": unpriced,
             "note": (
-                f"{unpriced} logged entr{'y' if unpriced == 1 else 'ies'} had no price and "
+                f"{_plural(unpriced, 'logged entry')} had no price and "
                 f"contributed nothing to this total, so the real figure is higher."
                 if unpriced
                 else "Every logged entry carried a price."
@@ -3209,11 +3385,7 @@ def week_summary(
             f"when they stated a figure, and never in the cost."
         )
     if protein_missing or fiber_missing:
-        parts = []
-        if protein_missing:
-            parts.append(f"protein from {_plural(protein_missing, 'entry')}")
-        if fiber_missing:
-            parts.append(f"fibre from {_plural(fiber_missing, 'entry')}")
+        parts = _unknown_macro_parts(protein_missing, fiber_missing)
         # Verb agreement follows the conjoined subjects, as in _day_summary.
         result["unknown_macros_note"] = (
             f"{' and '.join(parts)} across the week {_agree(len(parts), 'is')} unknown, "

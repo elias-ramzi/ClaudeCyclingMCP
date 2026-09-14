@@ -14,6 +14,7 @@ knowing how it was made.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
@@ -59,6 +60,13 @@ TWENTY_MINUTE_FACTOR = 0.95
 
 CTL_TIME_CONSTANT_DAYS = 42
 ATL_TIME_CONSTANT_DAYS = 7
+
+#: Statuses that mean the event will not be, or was not, started. Race-day
+#: fuelling — the protected day, the halved fibre — only makes sense for an
+#: event that actually happens; both `coach.py` (which also re-exports it, for
+#: compatibility) and `nutrition.py` import this rather than inlining the two
+#: strings, so the definition of "not happening" stays in one place.
+NON_STARTING_EVENT_STATUSES = ("abandoned", "dns")
 
 # How far a lap's average power may sit from its target before compliance calls
 # it a miss. 5% of target, not of FTP: the same window on a 300 W interval and
@@ -274,6 +282,29 @@ def hr_tss(duration_s: float, avg_hr: float, threshold_hr: int) -> float:
     to make fine judgements about it.
     """
     return training_stress_score(duration_s, avg_hr / threshold_hr)
+
+
+def _dict(row: sqlite3.Row | None) -> dict | None:
+    """A `sqlite3.Row` as a plain dict, or None. Shared by `coach.py` and
+    `nutrition.py` — both read from the same store and both need the same
+    one-line conversion on every fetched row.
+    """
+    return None if row is None else dict(zip(row.keys(), tuple(row), strict=True))
+
+
+def _text(value: Any) -> str | None:
+    """A value coerced to trimmed text, or None for anything blank.
+
+    `str(value).strip()` folding an empty result to None is the whole
+    contract every `_stage_text`-style caller relies on: "given but blank"
+    and "not given at all" have to read the same, because a bare `is not
+    None` check on the raw value would admit `""` and let a blank form field
+    overwrite a stored value with nothing.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _positive(value: float | None) -> float | None:
@@ -570,7 +601,7 @@ def compare_block(
     # rule compute_activity_load applies to duration.
     actual_power = _positive(lap.get("avg_power"))
     actual_seconds = _positive(lap.get("duration_s"))
-    actual_hr = lap.get("avg_hr")
+    actual_hr = _positive(lap.get("avg_hr"))
     label = f"the {ordinal(index)} block"
 
     if planned_low_w is None:

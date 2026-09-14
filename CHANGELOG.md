@@ -7,6 +7,83 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`confirm_targets` refuses to file a summed exercise day it cannot resolve.** When the
+  recomputed suggestion's exercise sums an imported ride with a still-planned session
+  (`exercise_source: "imported_activity+planned_workout"`), `confirm_targets` now refuses unless
+  the caller passes `accept_summed_exercise=true` (top-level, or per date inside `days`) or links
+  the session first with `link_activity`. `suggest_targets` still shows the summed figure
+  unchanged — the sum itself is round 7's deliberate fix, and remains advisory there — but nothing
+  is filed on the strength of a guess that a planned session and an import are the same ride. An
+  explicit `exercise_kcal_override` bypasses the gate outright, since it replaces the sum rather
+  than confirming it.
+- **`edit_log_entry` gained `clear=["note"]`** — a frozen log row's one deliberate path to a real
+  NULL, now that a blank `note` is ignored rather than stored (see Fixed below). The same
+  value-plus-clear contradiction every other clear-bearing tool refuses is refused here too.
+
+### Changed
+
+- **Schema v6, and a `sqlite_sequence` guard in `migrate()` itself.** Migration 5's table rebuild
+  (`DROP TABLE food_log` + rename) discarded `food_log`'s AUTOINCREMENT high-water mark, so an id
+  deleted at the pre-migration tail could be handed out again — and a stale reference (a queued
+  `edit_log_entry`) would then silently edit a different, newer entry. `migrate()` now snapshots
+  `sqlite_sequence` before any pending migration runs and restores every mark a migration left
+  lower, covering all future rebuilds by construction; migration 6 re-establishes the floor for a
+  database that reached v5 before the guard existed. Migration 5 itself is unchanged
+  (append-only) and its exact statements are now pinned byte-for-byte by a test.
+- **Shared vocabulary moved to `training.py`**: `NON_STARTING_EVENT_STATUSES`, `_dict` and `_text`
+  now have one definition each, imported by `coach.py` and `nutrition.py` instead of duplicated;
+  `coach.NON_STARTING_EVENT_STATUSES` remains as a pinned re-export for existing importers.
+- **The three knobs `suggest_targets` and `confirm_targets` share their range checks against one
+  set of named constants** (`PROTEIN_G_PER_KG_LIMITS`, `BASELINE_FACTOR_LIMITS`,
+  `EXERCISE_KCAL_OVERRIDE_LIMITS`) instead of nine separate literals across the two functions — the
+  exact class of drift round 7 finding 1 was about, now pinned by a suggest/confirm parity test.
+- **CLAUDE.md's "not deficit days" rule corrected**: it read as though a big session, race or race
+  eve always withholds the goal's adjustment; since round 7's sign-aware fix that is true only of a
+  deficit — a gain goal's surplus is applied in full on those days, because under-fuelling is the
+  risk there, not over-fuelling.
+
+### Fixed
+
+- **A non-finite or unstorable number in a Garmin import rejects that row by name, never the
+  batch.** `1e999` in a pasted payload parses silently to `inf`, so `calories: inf` imported as
+  `ok: true` and turned every downstream kcal sum infinite; a 400-digit JSON integer, or a finite
+  `avg_hr`/`max_hr` that rounds past SQLite's signed-64-bit INTEGER range, raised a bare
+  `OverflowError` that killed every valid ride in the same call. All three now reject the one row,
+  naming the field and the value; lap values fold to None instead, because laps are never rejected.
+  A decimal-comma figure (`232,5`) still parses, and a large-but-finite value still imports.
+- **A placeholder zero from a no-strap or no-meter ride is no longer shown as a measurement.**
+  `compliance_report`'s `actual` normalized/average power and average HR, and `compare_block`'s
+  per-lap average HR, now route through `_positive` — `avg_hr: 0` used to sit beside a `reason`
+  saying the ride carried no heart rate at all. A `link_activity` candidate with a negative stored
+  duration no longer carries a confident nonsense `duration_delta_s`.
+- **Retracting a legacy zero finish time reverts the race's status.** The retraction gate read
+  truthiness, so a `finish_time_s = 0` stored by a pre-0.3.0 release counted as "nothing held" and
+  `completed` stood over no result; the gate is now `is not None`, and `status_reverted_note`
+  names only the fields the call actually cleared, not the fixed three.
+- **Unlinking a session that was pushed no longer claims it was never sent.**
+  `update_planned_workout(clear=["linked_activity_id"])` with no explicit status reverts
+  `completed` back to `pushed` when the row records a platform, instead of always to `planned` —
+  which read as "written, not sent anywhere" while the workout sat on the head unit, inviting a
+  duplicate re-push.
+- **A blank text field no longer erases what it touches in the nutrition layer.**
+  `update_ingredient(note="")` (and `portion_label`) and `edit_log_entry(note="")` used to write
+  NULL over the stored value with nothing in the response saying so; a blank is now skipped and
+  named in `ignored_blank_fields`, so `clear=[...]` stays the only path to a NULL. `save_meal` on
+  a brand-new name now refuses the value-plus-clear contradiction with the identical message the
+  existing-meal branch raises, instead of storing the value and ignoring the clear.
+- **`log_meal` override zeros: the contradiction is refused, the omission is simpler.**
+  `{"grams": 200, "portions": 0}` is refused as both-given rather than silently read as an
+  omission, and `portions: 0` omits an ingredient without requiring it to carry a stored default
+  portion — `_quantity` grew `allow_zero`, used by the override loop and nothing else, so a stray
+  `grams: 0` everywhere else still reads as "someone forgot the weight".
+- **`list_activities(limit=None)` is a refusal naming the field**, not a bare `TypeError` outside
+  `_coach`'s handler set.
+- **`import_activities`' `flags_note` now explains `no_utc_time`** (the ride has nothing to break
+  ties against same-date rides), and `get_form`'s unscored warning describes what is actually
+  counted — a ride capped out of the run-up is excluded, as the round-7 cap already made true.
+
 ## [0.3.0] - 2026-08-24
 
 ### Added

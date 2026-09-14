@@ -807,3 +807,169 @@ def test_one_day_before_the_floor_is_implausible():
     )
     assert row is None
     assert "before 1990-01-01" in reason
+
+
+# --------------------------------------------------------------------------
+# review round 8 — non-finite numeric fields (finding 2)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def db(tmp_path, monkeypatch):
+    """A coach DB in a temp directory, for the tests below that go through
+    `coach.import_activities` rather than `normalize_activity` directly — that
+    is the level at which "the batch survives" is actually observable."""
+    from cycling_mcp import store
+
+    monkeypatch.setenv(store.ENV_DB_PATH, str(tmp_path / "coach.db"))
+    return tmp_path / "coach.db"
+
+
+def test_an_infinite_calories_value_rejects_the_row_and_names_the_field(db):
+    """`json.loads('{"calories": 1e999}')` parses cleanly to `float('inf')` —
+    no exception at parse time, so `import_activities` used to report
+    `ok: true` and store `calories=inf`. Every downstream sum (nutrition's
+    measured kcal, suggest_targets' exercise figure) became inf from there.
+    The row must be rejected instead, by name, and the valid ride beside it
+    must still import."""
+    from cycling_mcp import coach
+
+    bad_json = json.dumps({**RIDE, "activityId": 6001, "calories": "__CALORIES__"}).replace(
+        '"__CALORIES__"', "1e999"
+    )
+    bad_ride = json.loads(bad_json)
+    assert bad_ride["calories"] == float("inf")
+
+    result = coach.import_activities([{**RIDE, "activityId": 6002}, bad_ride])
+    assert result["inserted"] == 1
+    assert result["rejected"] == 1
+    reason = result["rejections"][0]["reason"]
+    assert "calories" in reason
+    stored = coach.list_activities()["activities"]
+    assert [row["garmin_activity_id"] for row in stored] == ["6002"]
+
+
+def test_an_oversized_calories_integer_rejects_the_row_without_killing_the_batch(db):
+    """A 400-digit JSON integer parses as an arbitrary-precision Python int;
+    `float()` on it raises `OverflowError`. Unguarded, that escaped past the
+    per-row reject path and killed the whole import call with a field-less
+    "int too large to convert to float" — losing every valid ride beside it."""
+    from cycling_mcp import coach
+
+    bad_ride = {**RIDE, "activityId": 6003, "calories": 10**400}
+
+    result = coach.import_activities([{**RIDE, "activityId": 6004}, bad_ride])
+    assert result["inserted"] == 1
+    assert result["rejected"] == 1
+    reason = result["rejections"][0]["reason"]
+    assert "calories" in reason
+    stored = coach.list_activities()["activities"]
+    assert [row["garmin_activity_id"] for row in stored] == ["6004"]
+
+
+def test_a_nan_calories_value_rejects_the_row(db):
+    """NaN is not producible in strict JSON (`json.loads` refuses the bare
+    token unless the caller opts in), so this is passed in-process — the same
+    class of bug reaches `_number` however NaN arrives."""
+    from cycling_mcp import coach
+
+    bad_ride = {**RIDE, "activityId": 6005, "calories": float("nan")}
+
+    result = coach.import_activities([bad_ride])
+    assert result["inserted"] == 0
+    assert result["rejected"] == 1
+    assert "calories" in result["rejections"][0]["reason"]
+
+
+def test_a_decimal_comma_calories_value_still_imports(db):
+    """Regression: the finite-number guard must not touch the decimal-comma
+    parsing `_number` exists for — a European-locale Garmin export writes
+    232,5 for 232.5."""
+    from cycling_mcp import coach
+
+    result = coach.import_activities([{**RIDE, "activityId": 6006, "calories": "232,5"}])
+    assert result["inserted"] == 1
+    stored = coach.list_activities()["activities"][0]
+    assert stored["calories"] == 232.5
+
+
+def test_a_large_but_finite_calories_value_still_imports(db):
+    """Just outside the guard: a large finite float is a plausible-if-odd
+    value, not an unusable one, and `_normalize` applies no plausibility cap
+    to calories — it must import, not be rejected."""
+    from cycling_mcp import coach
+
+    result = coach.import_activities([{**RIDE, "activityId": 6007, "calories": 1e6}])
+    assert result["inserted"] == 1
+    stored = coach.list_activities()["activities"][0]
+    assert stored["calories"] == 1e6
+
+
+def test_a_non_finite_lap_value_is_thinned_not_raised():
+    """Laps are never rejected (see `normalize_lap`'s own docstring) — a
+    non-finite lap value must fold to None the same way a missing one does,
+    not raise `_NotFiniteNumber` past this call site."""
+    row = normalize_lap({"averagePower": float("inf"), "elapsedDuration": 60.0}, 1)
+    assert row["avg_power"] is None
+    assert row["duration_s"] == 60.0
+
+
+def test_number_is_called_from_exactly_the_two_guarded_sites():
+    """`_number` is called from exactly two places in this module — both
+    exercised above (and by the boundary tests below) without a raw
+    `_NotFiniteNumber` or `OverflowError` escaping either one."""
+    import inspect
+
+    from cycling_mcp import garmin_import
+
+    source = inspect.getsource(garmin_import)
+    assert source.count("_number(") == 3  # the def, plus its two call sites
+
+
+# --------------------------------------------------------------------------
+# review round 8 — finite-but-unstorable integer fields (finding 2 rework)
+# --------------------------------------------------------------------------
+
+
+def test_a_finite_but_oversized_avg_hr_rejects_the_row_without_killing_the_batch(db):
+    """9.2e18 is finite, sails past the `_NotFiniteNumber` guard, and `round()`
+    turns it into a Python int outside SQLite's signed-64-bit INTEGER range
+    (-2**63 .. 2**63-1). Unguarded, the sqlite3 binding raised its own
+    `OverflowError` at INSERT time — inside `import_activities`'s db loop,
+    with no per-item try/except — killing the whole batch with a field-less
+    message. The row must be rejected by name instead, and the valid ride
+    beside it must still import."""
+    from cycling_mcp import coach
+
+    bad_ride = {**RIDE, "activityId": 6008, "averageHR": 1e19}
+
+    result = coach.import_activities([{**RIDE, "activityId": 6009}, bad_ride])
+    assert result["inserted"] == 1
+    assert result["rejected"] == 1
+    reason = result["rejections"][0]["reason"]
+    assert "avg_hr" in reason or "averageHR" in reason
+    stored = coach.list_activities()["activities"]
+    assert [row["garmin_activity_id"] for row in stored] == ["6009"]
+
+
+def test_an_avg_hr_just_inside_sqlite_integer_range_still_imports(db):
+    """Just inside the boundary: 9.2e18 is below 2**63 (~9.223e18), so it is
+    a value SQLite genuinely can store. The bound must reject only what
+    SQLite cannot hold, not every large heart-rate figure."""
+    from cycling_mcp import coach
+
+    assert 9.2e18 < 2**63
+    result = coach.import_activities([{**RIDE, "activityId": 6010, "averageHR": 9.2e18}])
+    assert result["inserted"] == 1
+    stored = coach.list_activities()["activities"][0]
+    assert stored["avg_hr"] == round(9.2e18)
+
+
+def test_an_oversized_lap_avg_hr_is_thinned_not_raised():
+    """`normalize_lap` never rejects a row — the same out-of-range integer
+    must fold to None here, not raise past this call site the way the
+    unguarded `round()` used to (a Python-int-too-large `OverflowError` at
+    lap INSERT time)."""
+    row = normalize_lap({"averageHR": 1e19, "elapsedDuration": 60.0}, 1)
+    assert row["avg_hr"] is None
+    assert row["duration_s"] == 60.0

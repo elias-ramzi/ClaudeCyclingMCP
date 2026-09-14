@@ -306,6 +306,35 @@ def test_ordinals_stop_pretending_past_ten():
 
 
 # --------------------------------------------------------------------------
+# review round 8
+# --------------------------------------------------------------------------
+
+
+def test_zero_avg_hr_on_a_lap_is_not_a_measurement():
+    """A no-strap lap reports `avg_hr: 0`, the same placeholder avg_power and
+    duration already route through `_positive` — read raw, it was a fabricated
+    wild deviation against a session's hr_note check figure."""
+    comparison = compare_block(
+        2, "interval", 600, 250, 250, {"duration_s": 600, "avg_power": 228, "avg_hr": 0}
+    )
+    assert comparison.actual_avg_hr is None
+
+
+def test_one_bpm_is_compared_normally_not_treated_as_a_placeholder():
+    comparison = compare_block(
+        2, "interval", 600, 250, 250, {"duration_s": 600, "avg_power": 228, "avg_hr": 1}
+    )
+    assert comparison.actual_avg_hr == 1
+
+
+def test_negative_avg_hr_is_not_a_measurement():
+    comparison = compare_block(
+        2, "interval", 600, 250, 250, {"duration_s": 600, "avg_power": 228, "avg_hr": -5}
+    )
+    assert comparison.actual_avg_hr is None
+
+
+# --------------------------------------------------------------------------
 # the compliance partition
 # --------------------------------------------------------------------------
 
