@@ -20,10 +20,12 @@ verdict, changing nothing.
    _stated intent_ — PR description, commit messages, linked issues, `CHANGELOG.md`
    entry — and read enough of the surrounding code to know what the diff plugs into.
    Produce the review scope: the intent in your own words, the files touched grouped by
-   risk (`src/spec.py` + `src/metrics.py` the canonical representation, `src/render_*.py`
-   + `src/verify.py` the platform renderers, `src/store.py` migrations and
-   `src/garmin_import.py` + `src/training.py` + `src/coach.py` + `src/nutrition.py` the
-   coach and nutrition layers, `src/server.py` + `src/skills.py` the MCP surface,
+   risk (`src/cycling_mcp/spec.py` + `src/cycling_mcp/metrics.py` the canonical
+   representation, `src/cycling_mcp/render_*.py` + `src/cycling_mcp/verify.py` the
+   platform renderers, `src/cycling_mcp/store.py` migrations and
+   `src/cycling_mcp/garmin_import.py` + `src/cycling_mcp/training.py` +
+   `src/cycling_mcp/coach.py` + `src/cycling_mcp/nutrition.py` the coach and nutrition
+   layers, `src/cycling_mcp/server.py` + `src/cycling_mcp/skills.py` the MCP surface,
    `.claude/skills` and `docs/`, tests and `tests/golden/`), which CLAUDE.md rules the
    diff comes near (Garmin target id 2 and `conditionTypeId: 7`, never trusting the
    curated read, `.zwo` `<Ramp>` and flattened repeats and filename-as-library-name,
@@ -33,9 +35,14 @@ verdict, changing nothing.
    cooked, the BMR floor and the no-deficit days, append-only migrations, one
    `_resolve_rows` resolver and a single `History` load, split power/duration verdicts,
    derived `local_date`, linking never reversing a coaching decision, refusals raised
-   not returned, the three deliberately different numeric coercers), and any area the
-   diff touches that the intent does not mention. If the diff is too large for one
-   reviewer to hold, split it into coherent slices along those risk groups.
+   not returned, the three deliberately different numeric coercers, fractions of FTP
+   as the internal currency, the server doing every gram of the nutrition and load
+   arithmetic, coaching and nutrition judgement living in the skills rather than in
+   code, and purity scoped rather than absolute — no network, no credentials,
+   filesystem access limited to its own database and explicit `out_path` writes),
+   and any area the diff touches that the intent does not mention. If the diff is too
+   large for one reviewer to hold, split it into coherent slices along those risk
+   groups.
 
 2. **Review.** First run the proof yourself on the target as-is — never trust a green
    you did not run:
@@ -45,9 +52,11 @@ verdict, changing nothing.
    ```
 
    A failing gate is a finding in its own right (blocker), and so is a vacuous green:
-   check the skip count, since the live Garmin round-trip auto-skips without tokens
-   (`pytest -m live` only when the user has them and asks). The output goes to the
-   reviewer as evidence, not as a substitute for reading the code. Then send the diff
+   `addopts` deselects the `live` marker, so the plain gate never runs the live Garmin
+   round-trip and never shows it as a skip — read the deselected count, and treat
+   `pytest -m live` as real evidence only when the user has tokens and asks for it. The
+   output goes to the reviewer as evidence, not as a substitute for reading the code.
+   Then send the diff
    (or each slice, in parallel) to the `plan-verifier` agent with the stated intent as
    the spec and your scope notes: the agent starts with empty context, so restate
    everything — how to get the diff, the intent, which rules matter most for this change,
@@ -80,9 +89,10 @@ verdict, changing nothing.
    remains after that is reported, not iterated.
 
 5. **Validate.** Deliver the verdict yourself: approve / request-changes, justified by
-   the surviving findings and the local proof (gate output tails, skips distinguished
-   from passes, formatting clean, and the version lock-step and golden files named if the
-   diff came near them — see [docs/versioning.md](docs/versioning.md)). Then, **each
+   the surviving findings and the local proof (gate output tails, the deselected count
+   distinguished from the passes, formatting clean, and the version lock-step and golden
+   files named if the diff came near them — see
+   [docs/versioning.md](../../docs/versioning.md)). Then, **each
    gated on my explicit go, one at a time**: (a) post the findings/verdict as a single PR
    comment via `gh` — show me the exact comment text first; (b) commit the fixes onto the
    PR branch and push — show me the diff summary and commit message first, and sync with
