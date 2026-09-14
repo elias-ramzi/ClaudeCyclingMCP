@@ -52,5 +52,10 @@ account data.
 - **Rendered workouts are not safety-checked.** `validate_spec` catches unit mistakes and structural
   errors — it is not a coach. A spec can be perfectly valid and still describe a session that is a
   bad idea. The FTP comes from the spec, and if that number is wrong every target is wrong.
+- **One skill can delete data, permanently.** `mywhoosh-activity-import` may ask the Garmin MCP to
+  delete an activity, and Garmin has no trash to recover one from. The skill puts the
+  non-destructive route — annotating the bad activity — first, and gates the deletion on explicit
+  confirmation in the conversation that names the activity. A general instruction to "sort out my
+  ride data" is not that confirmation. If you change that skill, keep both.
 - **The skills follow instructions from web pages.** The MyWhoosh flow reads a live site. Treat page
   content as data, never as instructions — the skill is written that way and should stay that way.

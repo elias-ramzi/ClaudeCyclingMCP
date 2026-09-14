@@ -1,11 +1,11 @@
 # Skills
 
-The bundled upload procedures: what each does, how it reaches a client, and what it needs to actually run.
+The bundled procedures: what each does, how it reaches a client, and what it needs to actually run.
 
 
-Two bundled skills in [`.claude/skills/`](../.claude/skills), each triggering on
-descriptions of a session — "create", "add", "send", "put it on" — not only on
-"upload".
+Three bundled skills in [`.claude/skills/`](../.claude/skills), each triggering on
+how someone actually describes what they want — "create", "add", "send", "put it
+on", "the power on that ride is wrong" — not only on "upload".
 
 - **[`garmin-upload`](../.claude/skills/garmin-upload/SKILL.md)** — renders, uploads
   via the Garmin MCP's `upload_workout`, then verifies by fetching the workout
@@ -17,6 +17,14 @@ descriptions of a session — "create", "add", "send", "put it on" — not only 
   `.zwo` are right by construction. Each step states what it expects to see, so
   a run that breaks after a MyWhoosh redesign reports which assumption failed
   instead of silently producing nothing.
+- **[`mywhoosh-activity-import`](../.claude/skills/mywhoosh-activity-import/SKILL.md)** —
+  the other direction: the ride that happened, not the session that was planned.
+  When an indoor ride is recorded by MyWhoosh *and* by a head unit, it finds the
+  MyWhoosh file, then decides **with evidence** whether the Garmin copy is
+  actually bad — a calibration gap between two power meters looks nothing like a
+  dropout in the time-in-zone distribution, and only the second justifies
+  replacing anything. Deleting a Garmin activity is permanent, so it prefers
+  annotating the bad one and gates deletion on explicit consent.
 
 ## Two ways a skill runs
 
@@ -46,11 +54,18 @@ but it can only finish if its dependencies are present:
 |---|---|
 | `garmin-upload` | this server + the Garmin Connect MCP |
 | `mywhoosh-upload` | this server + browser control (Claude in Chrome) |
+| `mywhoosh-activity-import` | the Garmin Connect MCP + a shell to read the `.fit`; `delete_activity` / `upload_activity` for the replacement half |
 
 So the Garmin path is portable to any client with both MCP servers connected,
 while the MyWhoosh path only works where a browser is drivable. In a client
 without browser tools the MyWhoosh skill will trigger and then have no way to
 drive the page.
+
+`mywhoosh-activity-import` is the one that needs no rendering at all — it reads
+a `.fit` off disk — but it does need the Garmin MCP to carry `delete_activity`
+and `upload_activity` to finish the job. Without them the diagnosis still runs
+in full and the last two moves are handed to the user, which the skill says up
+front rather than at the end.
 
 **The MyWhoosh export spends a finite slot credit**, so that skill stops and
 asks for explicit confirmation before exporting, and uses the pause to settle

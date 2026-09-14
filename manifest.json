@@ -69,7 +69,7 @@
     },
     {
       "name": "get_skill",
-      "description": "Fetch a bundled upload procedure by name"
+      "description": "Fetch a bundled procedure by name"
     },
     {
       "name": "spec_schema",
@@ -88,6 +88,12 @@
       "description": "Build a cycling workout and import it into MyWhoosh through the browser",
       "arguments": ["session"],
       "text": "Follow the \"mywhoosh-upload\" procedure, using this server's tools. The full instructions are served by the server at run time; the session to build is ${arguments.session}."
+    },
+    {
+      "name": "mywhoosh-activity-import",
+      "description": "Diagnose a double-recorded indoor ride and replace the bad Garmin activity with the MyWhoosh one",
+      "arguments": ["session"],
+      "text": "Follow the \"mywhoosh-activity-import\" procedure, using this server's tools. The full instructions are served by the server at run time; the ride to work from is ${arguments.session}."
     }
   ],
   "compatibility": {

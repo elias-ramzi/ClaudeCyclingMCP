@@ -39,7 +39,7 @@ rather than trusting a success response.
 - 🚴 **Two renderers, one source** — `.zwo` for MyWhoosh and a Garmin `upload_workout` payload, each pinned to a platform quirk that was expensive to learn ([format notes](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/docs/tools.md#format-notes)).
 - 🔍 **Verification, not optimism** — compare a Garmin upload against what was actually stored, and a MyWhoosh import against the scraped builder header, including a pre-import snapshot that catches a silent no-op.
 - 🔐 **No credentials, ever** — the server never uploads and holds no tokens. Writing a rendered file when you pass `out_path` is its only side effect.
-- 🧩 **Bundled skills** — Garmin upload-and-verify, and a browser-driven MyWhoosh import that reads MyWhoosh's own FTP before rendering.
+- 🧩 **Bundled skills** — Garmin upload-and-verify, a browser-driven MyWhoosh import that reads MyWhoosh's own FTP before rendering, and a MyWhoosh-to-Garmin activity replacement that diagnoses which of two recordings is the real one before anything is deleted.
 
 ## Install
 
@@ -91,11 +91,12 @@ two platforms consume FTP at different times, and getting it wrong on the MyWhoo
 
 ## Skills
 
-Two bundled procedures in [`.claude/skills/`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills), triggering on descriptions of a
-session — "create", "add", "send", "put it on" — not only on "upload":
+Three bundled procedures in [`.claude/skills/`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills), triggering on descriptions of a
+session, or of a ride that has already happened — "create", "add", "send", "put it on", "the power on that ride is wrong" — not only on "upload":
 
 - **[`garmin-upload`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/garmin-upload/SKILL.md)** — renders, uploads via the Garmin MCP, then fetches the workout back and compares it against what was sent. Offers to schedule it.
 - **[`mywhoosh-upload`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/mywhoosh-upload/SKILL.md)** — drives the MyWhoosh builder through Claude in Chrome, since there is no API. It reads MyWhoosh's FTP out of the builder *before* rendering, so the fractions are right by construction, and stops for explicit confirmation before the export — which spends a finite slot credit.
+- **[`mywhoosh-activity-import`](https://github.com/elias-ramzi/ClaudeCyclingMCP/blob/main/.claude/skills/mywhoosh-activity-import/SKILL.md)** — the ride that happened rather than the session that was planned. When an indoor ride is recorded twice, it finds the MyWhoosh `.fit` and works out *from the time-in-zone distribution* whether the Garmin copy is genuinely corrupt or the two power meters simply disagree — only the first justifies a replacement. Deletion is permanent, so it prefers annotating and asks before removing anything.
 
 Each step states what it expects to see, so a run that breaks after a platform redesign reports
 which assumption failed instead of quietly producing nothing.

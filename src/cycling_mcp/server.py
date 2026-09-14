@@ -746,12 +746,19 @@ def server_info() -> str:
 
 @app.tool()
 def get_skill(name: str | None = None) -> str:
-    """Fetch a bundled procedure for uploading a workout to a platform.
+    """Fetch a bundled procedure for moving a workout or a ride between platforms.
 
     Read this before uploading, scheduling, or exporting a rendered cycling
     workout — a .zwo to MyWhoosh, or a Garmin Connect payload to a watch or
     head unit. The procedures cover FTP sourcing, the upload call, verifying
     the stored result, and the traps that fail silently.
+
+    Also read it in the other direction: when an indoor ride was recorded by
+    both MyWhoosh and a head unit and the two disagree — power that looks
+    wrong, dropouts, a structured session flattened to one lap —
+    `mywhoosh-activity-import` finds the MyWhoosh file, diagnoses which
+    recording is the real one, and replaces the Garmin activity only if the
+    evidence supports it.
 
     Call this whenever you are asked to follow, use, or run one of this
     server's skills by name — for example "use the mywhoosh-upload skill" — or
@@ -767,8 +774,9 @@ def get_skill(name: str | None = None) -> str:
     Neither route lets a model retrieve a procedure it has just been asked for,
     which is what this tool is for.
 
-    Both skills stop and ask before doing anything irreversible — a MyWhoosh
-    export spends a finite slot credit — so follow them as written rather than
+    Every skill stops and asks before doing anything irreversible — a MyWhoosh
+    export spends a finite slot credit, and a deleted Garmin activity has no
+    trash to come back from — so follow them as written rather than
     summarising them.
     """
     skills = load_skills()

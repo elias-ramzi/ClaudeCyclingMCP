@@ -23,6 +23,23 @@ _KEY_LINE = re.compile(r"^([A-Za-z_][\w-]*):[ \t]*(.*)$")
 _BLOCK_SCALARS = {">", ">-", ">+", "|", "|-", "|+"}
 
 
+# What a skill's optional `prompt_input` frontmatter key may say, and what the
+# prompt asks for when the argument is left empty. A procedure about a ride that
+# already happened must not be introduced by "ask what session to build".
+_PROMPT_INPUTS = {
+    "session": (
+        "The session to build is: {value}",
+        "Ask what session to build if that is not already clear from the "
+        "conversation, and confirm the FTP before rendering.",
+    ),
+    "activity": (
+        "The ride to work from is: {value}",
+        "Ask which ride this is about if that is not already clear from the "
+        "conversation, and identify the activity before changing anything.",
+    ),
+}
+
+
 @dataclass(frozen=True)
 class Skill:
     """One bundled skill: its frontmatter identity plus the instruction body."""
@@ -30,6 +47,7 @@ class Skill:
     name: str
     description: str
     body: str
+    prompt_input: str = "session"
 
 
 def _skills_dir() -> Path:
@@ -109,7 +127,12 @@ def parse_skill(text: str) -> Skill | None:
     name, description = fields.get("name"), fields.get("description")
     if not name or not description or not body:
         return None
-    return Skill(name=name, description=description, body=body)
+    # An unknown value falls back rather than failing: a typo should cost a
+    # slightly wrong prompt preamble, not a skill that disappears.
+    prompt_input = fields.get("prompt_input", "session")
+    if prompt_input not in _PROMPT_INPUTS:
+        prompt_input = "session"
+    return Skill(name=name, description=description, body=body, prompt_input=prompt_input)
 
 
 def load_skills(directory: Path | None = None) -> list[Skill]:
@@ -150,13 +173,8 @@ def build_skill_message(skill: Skill, session: str | None = None) -> str:
     model can mistake a procedure for reference material and summarise it
     instead of following it.
     """
-    if session and session.strip():
-        scope = f"The session to build is: {session.strip()}"
-    else:
-        scope = (
-            "Ask what session to build if that is not already clear from the "
-            "conversation, and confirm the FTP before rendering."
-        )
+    given, absent = _PROMPT_INPUTS[skill.prompt_input]
+    scope = given.format(value=session.strip()) if session and session.strip() else absent
     return (
         f'Follow the "{skill.name}" procedure below, using this server\'s tools.\n'
         f"{scope}\n\n---\n\n{skill.body}"

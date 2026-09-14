@@ -88,4 +88,4 @@ def test_plugin_skills_path_resolves():
     skills = (ROOT / plugin["skills"]).resolve()
     assert skills.is_dir(), skills
     found = sorted(p.name for p in skills.iterdir() if p.is_dir())
-    assert found == ["garmin-upload", "mywhoosh-upload"]
+    assert found == ["garmin-upload", "mywhoosh-activity-import", "mywhoosh-upload"]

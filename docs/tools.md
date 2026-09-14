@@ -14,7 +14,7 @@ What the server exposes, and the format details each renderer is pinned to.
 | `verify_mywhoosh_import` | Compares a scraped MyWhoosh builder header against the rendered session, including the pre-import snapshot that catches a silent no-op. Pure. |
 | `verify_mywhoosh_library_entry` | Checks a MyWhoosh library card against the exported session, in the card's own formats. The credit is already spent, so this says what it bought. Pure. |
 | `server_info` | Version, package path, skills served. A tool surface dates a session; this makes the build sayable in one call. Pure. |
-| `get_skill` | Fetch a bundled upload procedure by name, so a model asked to "use the mywhoosh-upload skill" can retrieve it. |
+| `get_skill` | Fetch a bundled procedure by name, so a model asked to "use the mywhoosh-upload skill" can retrieve it. |
 | `spec_schema` | The spec's JSON schema and authoring notes. |
 
 `validate_spec` catches the mistakes that actually bite: empty workouts, zero or
