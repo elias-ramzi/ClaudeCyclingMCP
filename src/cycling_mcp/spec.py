@@ -24,6 +24,30 @@ SANE_POWER_FRACTION = (0.3, 1.6)
 
 CADENCE_RANGE = (30, 150)
 
+# No rideable workout is longer than a day. Without this bound, a repeat's
+# `count` and a block's `duration` combine multiplicatively — count=2_000_000_000
+# over a 600s block validates and stores, and every downstream reader that
+# expands it (metrics.compute_metrics builds a 1 Hz series; render_zwo and
+# render_garmin walk every step) hangs on the very first spec that reaches it.
+# One check on the product, at validation, covers count, duration and nesting
+# at once rather than bounding each input separately and hoping their product
+# stays sane.
+MAX_WORKOUT_SECONDS = 24 * 3600
+
+# What an FTP in watts can plausibly be, and the narrower band inside which it
+# needs no second look. Shared with the coach layer so one athlete number is not
+# "unusual" in one module and fine in another — they were 50-600 here and
+# 80-500 there, which meant a 550 W FTP was queried when stored and accepted
+# when rendered.
+#
+# The two layers still act differently on the same numbers, and that is the
+# point of having both: the renderer renders what it is given and warns, because
+# refusing to build a session is not its call. The store *refuses* a figure
+# outside FTP_PLAUSIBLE_W, because persisting one silently rescales every zone
+# and every training-load number computed from it afterwards.
+FTP_PLAUSIBLE_W = (40, 700)
+FTP_USUAL_W = (80, 500)
+
 BLOCK_TYPES = ("steady", "ramp", "free", "repeat")
 ROLES = ("warmup", "interval", "recovery", "cooldown")
 
@@ -473,6 +497,24 @@ def _infer_roles(nodes: list[Node]) -> None:
         last.role = "cooldown"
 
 
+def _expanded_seconds(nodes: list[Node]) -> int:
+    """Total ridden duration with every repeat multiplied out, not walked.
+
+    `Workout.total_seconds` gets the same number by iterating `steps()`, which
+    actually loops `count` times per repeat — fine for a real workout, a hang
+    for a spec whose count is itself the attack. Nesting is at most one level
+    deep (a repeat cannot contain a repeat, enforced in `_resolve_repeat`), so
+    a single multiplication per top-level repeat is exact.
+    """
+    total = 0
+    for node in nodes:
+        if isinstance(node, Repeat):
+            total += node.count * sum(b.duration_s for b in node.blocks)
+        else:
+            total += node.duration_s
+    return total
+
+
 def validate_spec(spec: Any) -> tuple[Workout | None, list[str], list[str]]:
     """Validate a spec.
 
@@ -504,7 +546,7 @@ def validate_spec(spec: Any) -> tuple[Workout | None, list[str], list[str]]:
         out.error("spec", f"ftp must be a number, got {type(ftp_raw).__name__}")
     elif ftp_raw <= 0:
         out.error("spec", f"ftp is {ftp_raw} — must be greater than zero")
-    elif not (50 <= ftp_raw <= 600):
+    elif not (FTP_USUAL_W[0] <= ftp_raw <= FTP_USUAL_W[1]):
         out.warn("spec", f"ftp of {ftp_raw:g} W is unusual — check it is watts, not a percentage")
         ftp = float(ftp_raw)
     else:
@@ -547,6 +589,16 @@ def validate_spec(spec: Any) -> tuple[Workout | None, list[str], list[str]]:
                 nodes.append(node)
 
     if out.errors:
+        return None, out.errors, out.warnings
+
+    total_seconds = _expanded_seconds(nodes)
+    if total_seconds > MAX_WORKOUT_SECONDS:
+        out.error(
+            "spec",
+            f"expands to {total_seconds}s of riding once every repeat is multiplied out — "
+            f"more than the {MAX_WORKOUT_SECONDS}s ({MAX_WORKOUT_SECONDS // 3600}h) any "
+            "rideable workout could take",
+        )
         return None, out.errors, out.warnings
 
     _infer_roles(nodes)

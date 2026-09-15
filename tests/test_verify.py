@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from cycling_mcp.verify import compare_upload, total_step_seconds
+from cycling_mcp.verify import compare_upload, total_step_seconds, ui_checklist
 
 GOLDEN = Path(__file__).parent / "golden"
 
@@ -148,6 +148,77 @@ def test_no_target_steps_compare_clean():
 def test_the_renderer_output_compares_clean_against_its_own_echo(recorded):
     """A sanity check on the harness itself: identical data must not diff."""
     assert compare_upload(recorded["sent"], copy.deepcopy(recorded["fetched"])) == []
+
+
+# --- nulls are unknown, not zero -----------------------------------------
+#
+# The conditionTypeId-7 corruption strips a repeat's iteration count. Folding
+# the null (to 1, or a step's null duration to 0) sums to a plausible smaller
+# total — and when both sides of a round-trip fold the same null, a corrupted
+# workout verifies as matching. Unknown has to stay unknown.
+
+
+def _payload_with(steps):
+    return {
+        "workoutName": "T",
+        "sportType": {"sportTypeId": 2, "sportTypeKey": "cycling"},
+        "workoutSegments": [{"segmentOrder": 1, "workoutSteps": steps}],
+    }
+
+
+def _step(order=1, seconds=300):
+    return {
+        "type": "ExecutableStepDTO",
+        "stepOrder": order,
+        "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+        "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+        "endConditionValue": seconds,
+        "targetType": {"workoutTargetTypeId": 2, "workoutTargetTypeKey": "power.zone"},
+        "targetValueOne": 227,
+        "targetValueTwo": 237,
+    }
+
+
+def test_a_null_repeat_count_makes_the_total_unknown(recorded):
+    sent = copy.deepcopy(recorded["sent"])
+    sent["workoutSegments"][0]["workoutSteps"][1]["numberOfIterations"] = None
+    assert total_step_seconds(sent) is None
+
+
+def test_a_missing_repeat_count_makes_the_total_unknown():
+    repeat = {"type": "RepeatGroupDTO", "stepOrder": 2, "workoutSteps": [_step(order=3)]}
+    assert total_step_seconds(_payload_with([_step(), repeat])) is None
+
+
+def test_a_null_step_duration_makes_the_total_unknown():
+    step = _step(order=2, seconds=None)
+    assert total_step_seconds(_payload_with([_step(), step])) is None
+
+
+def test_a_null_duration_inside_a_repeat_makes_the_total_unknown():
+    repeat = {
+        "type": "RepeatGroupDTO",
+        "stepOrder": 2,
+        "numberOfIterations": 3,
+        "workoutSteps": [_step(order=3, seconds=None)],
+    }
+    assert total_step_seconds(_payload_with([_step(), repeat])) is None
+
+
+def test_a_real_zero_duration_still_sums():
+    """Zero is a value, and folding null to it is what made them look alike."""
+    assert total_step_seconds(_payload_with([_step(seconds=0), _step(order=2)])) == 300.0
+
+
+def test_the_checklist_reads_unknown_for_a_null_duration():
+    lines = ui_checklist(_payload_with([_step(seconds=None)]))
+    assert any("unknown" in line for line in lines)
+    assert not any("0:00" in line for line in lines)
+
+
+def test_the_checklist_still_reads_a_real_zero_as_a_clock():
+    lines = ui_checklist(_payload_with([_step(seconds=0)]))
+    assert any("0:00" in line for line in lines)
 
 
 # --- MyWhoosh header checks ---------------------------------------------

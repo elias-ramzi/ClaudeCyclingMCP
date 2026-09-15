@@ -48,6 +48,9 @@ body:
         - describe_spec / metrics (IF, TSS)
         - garmin-upload skill
         - mywhoosh-upload skill (browser flow)
+        - coaching skill
+        - Coach layer — profile, FTP/weight/HR history, activities, planning
+        - Coach layer — training load, form, compliance
         - Install / packaging
         - Something else
     validations:

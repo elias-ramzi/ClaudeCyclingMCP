@@ -4,12 +4,20 @@ Architecture and conventions for anyone — human or agent — working in this r
 
 ## The shape of it
 
-One canonical spec in, two renderers out:
+One canonical spec in, two renderers out — and above that, a coach layer that stores the athlete
+and computes from what they actually rode, and a nutrition layer over the same file:
 
 ```
 spec (JSON) → validate → resolved Workout tree ──┬── render_zwo    → .zwo   (MyWhoosh)
                        (power as fractions of FTP)└── render_garmin → JSON   (Garmin)
+
+Garmin MCP ──(the model pastes the JSON)──> coach.py ──> coach.db ──> load · form · compliance
+                                                            ↕
+                                       nutrition.py ──> food log · targets · the week
 ```
+
+The two arrows meet on purpose: a calorie target is computed from the athlete's profile **and** from
+what the training tables say about that date.
 
 | Module | Holds |
 |---|---|
@@ -18,6 +26,11 @@ spec (JSON) → validate → resolved Workout tree ──┬── render_zwo   
 | `render_zwo.py` | MyWhoosh XML. Hand-built strings, not ElementTree, to control the exact format. |
 | `render_garmin.py` | Garmin `upload_workout` payload. |
 | `verify.py` | compare what a platform stored against what was sent: Garmin's returned payload, and MyWhoosh's scraped builder header. |
+| `store.py` | the SQLite database: where it lives, and the ordered migrations. The only module that touches state. |
+| `garmin_import.py` | normalise raw Garmin MCP payloads into stored rows. Pure — it reads what was pasted in. |
+| `training.py` | zones, TSS (power and HR), CTL/ATL/TSB, block-vs-lap comparison. Pure arithmetic over stored numbers. Also hosts the vocabulary and coercion helpers `coach.py` and `nutrition.py` both import — `NON_STARTING_EVENT_STATUSES`, `_dict`, `_text`, `_positive`, `whole_number`, `agree`, `one_of`, `plural`, `format_duration_or` — so a new one of these belongs here, not redefined in the module that first needs it. |
+| `coach.py` | the coaching operations: read and write the athlete's file, compute from it. |
+| `nutrition.py` | the food base, the log over it, and the target arithmetic. Every gram of it — the model never adds food up. |
 | `skills.py` | load `.claude/skills/*/SKILL.md` and serve them as MCP prompts. |
 | `server.py` | the MCP tool surface. Thin — logic lives in the modules above. |
 
@@ -56,6 +69,85 @@ description is a check figure. It is carried as message text on both sides.
 **The server never uploads.** No network, no credentials. Uploading lives in the skills, in front of
 a human — a MyWhoosh export spends a finite slot credit.
 
+**Purity is scoped, not absolute.** Renderers, metrics and verification are pure. The coach layer
+writes one SQLite file, at `~/.claude-cycling/coach.db` or `CLAUDE_CYCLING_DB`. Say it that way —
+"no network, no credentials; filesystem access limited to its own database and explicit `out_path`
+writes" — rather than calling the server pure, which stopped being true.
+
+**FTP is dated, and load is resolved per ride.** Every training-load number uses the FTP entry in
+effect on that ride's own date. A "current FTP" column would silently rewrite the athlete's history:
+the same watts against a bigger FTP is a smaller IF, so a block of training shrinks the moment they
+test better. The same holds for weight and HR thresholds.
+
+**Power TSS and hrTSS are different quantities.** Never merge them into one number without saying
+so. Each computed row carries the method that produced it; a ride with neither power nor HR gets a
+null and a reason, never a zero — a zero is indistinguishable from a rest day.
+
+**Import tools take Garmin's own shapes.** Never design a coach tool that requires the model to
+retype numeric fields into a clean schema. Every retyped digit is a corruption opportunity, and a
+mistyped average power is a load that is wrong and looks reasonable. Tolerate the shapes, keep
+unknown keys, and never overwrite a stored value with a null.
+
+**Coaching judgement lives in the `coaching` skill, not in code.** The server stores, computes and
+refuses. What to do about a missed Tuesday is the skill's business. The same split holds for
+`nutrition`: the server sums, the skill decides what to eat.
+
+**The server does every gram of the nutrition arithmetic.** Macro sums, running totals, BMR, the
+day's remainder, the weekly average. Never design a nutrition tool that hands a model numbers to add
+up — a plausible calorie total is worse than none, because nobody checks it.
+
+**A log entry freezes; a meal does not.** `food_log` stores the macros and cost computed at log
+time, so correcting an ingredient never rewrites a day already eaten. `meals` stores only
+ingredients and grams, so its macros follow every correction. A log entry is a measurement; a meal
+is a recipe. Do not "fix" either to match the other.
+
+**An ingredient name resolves exactly or not at all.** Exact match on the folded name or on any
+alias, else a refusal carrying near-matches — including when two rows share an alias. A fuzzy hit
+taken as exact logs the wrong food, and the day's total looks entirely reasonable afterwards.
+
+**Raw and cooked are different ingredients.** ~350 kcal/100 g against ~130 for the same rice. The
+`state` column records which, and storing a `raw` one warns.
+
+**A big session, a race and a race eve are not deficit days.** A deficit is withheld on them, and
+the response reports how much. A gain goal's surplus is applied in full on those days instead —
+withholding it would shrink the target on the day that costs the athlete most — and the response
+says which direction, withheld or applied in full, happened. And no target this server produces or
+files is below computed BMR — `suggest_targets` clamps, `confirm_targets` refuses.
+
+**Personal facts live in data, never in a bundled skill.** Specific foods, habitual portions,
+preparation quirks are ingredient and meal rows and their notes. A skill ships to everyone.
+
+**Migrations are append-only.** Never edit a migration that has run anywhere — only a version that
+has not been applied ever runs again. Add the next one.
+
+**One resolver for every dated figure, and load the history once.** FTP, weight and each HR field
+go through `_resolve_rows`; a tool that scores more than one activity builds a `History` and
+resolves in memory. Resolving per ride turned a season into ~1000 queries for the same forty rows.
+
+**Compliance judges power and duration separately.** Each block carries a `verdict` and a
+`duration_verdict`. A lap with no watts says nothing about whether a target was held, but its
+duration is still knowable — folding the two together lost every duration deviation on an HR-only
+ride. And *any* unverifiable block stops a session being `as_prescribed`: one clean warmup is not
+evidence about the intervals behind it.
+
+**A ride's `local_date` is derived, never carried.** It comes from the merged row's start times, and
+`row_flags` reads the same two fields, so the stored date and the flag cannot disagree. Merging it
+as an ordinary import field let a payload with no local start time move an evening ride to the next
+day, silently.
+
+**Linking a ride never reverses a coaching decision.** `link_activity` and `record_race_result`
+auto-complete only from a status that still means "expected"; `skipped`, `missed`, `abandoned` and
+`dns` are outcomes somebody chose, and the response says when one was kept.
+
+**A refusal is raised, never returned as `{"ok": False}`.** The tool layer renders every one of them
+in a single place. A function returning its own `ok` flag works only until someone reorders the
+spread in `_coach` — `_coach` now raises if a result carries one.
+
+**The three numeric coercers are deliberately different.** `verify._number` rejects strings (a
+string in a DTO is a shape error), `verify._as_number` parses them but must not touch commas (it
+reads a web page, where "1,234" is one thousand), and `garmin_import._number` reads a decimal comma
+(a European-locale export writes 232,5). Merging them picks one behaviour for all three.
+
 ## The reference workout
 
 Garmin workout id **`1662651131`** was hand-built in the Garmin UI with known inputs, and is what the
@@ -82,6 +174,9 @@ in the API — only upload (creates new), delete, and schedule.
 pytest              # offline, hermetic, no credentials
 pytest -m live      # real Garmin round-trip; needs tokens, cleans up after itself
 ```
+
+Every test that touches the database points `CLAUDE_CYCLING_DB` at a `tmp_path`. A test that writes
+to the real `~/.claude-cycling/coach.db` is a bug: it would mutate the author's own training log.
 
 The live suite uploads a workout, fetches it back, compares against what was sent, checks no target
 was stored as a percentage, and deletes it — including on failure.
