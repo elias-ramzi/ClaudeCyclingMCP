@@ -39,6 +39,7 @@ from .training import NON_STARTING_EVENT_STATUSES, _dict, _positive, _text, pars
 from .training import agree as _agree
 from .training import one_of as _training_one_of
 from .training import plural as _plural
+from .training import whole_number as _training_whole_number
 
 GENDERS = ("male", "female", "other")
 GOAL_TYPES = ("lose", "maintain", "gain")
@@ -192,6 +193,7 @@ CLEARABLE_LOG_ENTRY_FIELDS = ("note",)
 #: simply not have (no default portion, no note, no package price) and must be
 #: able to say so about again after correcting it to the wrong thing.
 CLEARABLE_INGREDIENT_FIELDS = (
+    "aliases",
     "carbs_100g",
     "fat_100g",
     "sat_fat_100g",
@@ -260,6 +262,25 @@ def _optional_number(
     value: Any, what: str, limits: tuple[float, float] | None = None
 ) -> float | None:
     return None if value is None else _number(value, what, limits)
+
+
+def _coerce_limit(value: Any, what: str = "limit") -> int:
+    """A whole number, refused rather than silently mangled — see
+    `training.whole_number`, which this wraps as a `NutritionError` the same
+    way `coach._whole_number` wraps it as a `CoachError`. Kept as its own
+    function (rather than every caller reaching for `training.whole_number`
+    directly) because every caller here also wants the same "at least 1"
+    floor, which is this function's own business, not the shared coercer's —
+    a `search_ingredients` `limit` and a `coach.list_activities` `limit` agree
+    on a floor of 1 by coincidence, not because whole numbers in general do.
+    """
+    try:
+        number = _training_whole_number(value, what)
+    except ValueError as exc:
+        raise NutritionError(str(exc)) from exc
+    if number < 1:
+        raise NutritionError(f"{what} must be at least 1, got {value!r}")
+    return number
 
 
 def _one_of(value: Any, allowed: tuple[str, ...], what: str) -> str | None:
@@ -477,17 +498,19 @@ def _ingredient_fields(item: dict, existing: dict | None = None) -> tuple[dict, 
     what it did not mention — and so the required macros can stay required on
     an insert without forcing them to be repeated on every edit.
 
-    Returns the fields to write, and — for `portion_label`/`note` — the names
-    given as blank text on an update. `_text("")` folds to None, and `item.get
-    (column) is not None` admits `""`, so writing that None straight into
-    `fields` would UPDATE the column to NULL: a blank form field erasing a
-    "weigh it cooked" note with no `cleared_fields` to say so. On an update a
-    blank is skipped and named instead, the same as `coach._stage_text`; on an
-    insert (no `existing`) there is nothing stored yet to protect, so a blank
-    is simply absent from the row, silently.
+    Returns the fields to write, and — for `portion_label`/`note`/`aliases` —
+    the names given as blank text (or, for `aliases`, an empty list) on an
+    update. `_text("")` folds to None, and `item.get(column) is not None`
+    admits `""`, so writing that None straight into `fields` would UPDATE the
+    column to NULL: a blank form field erasing a "weigh it cooked" note with
+    no `cleared_fields` to say so. On an update a blank is skipped and named
+    instead, the same as `coach._stage_text`; on an insert (no `existing`)
+    there is nothing stored yet to protect, so a blank is simply absent from
+    the row, silently.
     """
     base = existing or {}
     fields: dict[str, Any] = {}
+    blanked: list[str] = []
 
     name = _text(item.get("name")) or (base.get("name") if base else None)
     if not name:
@@ -498,7 +521,18 @@ def _ingredient_fields(item: dict, existing: dict | None = None) -> tuple[dict, 
         raise NutritionError(f"{name!r} folds to an empty name — give it letters or digits")
 
     if "aliases" in item or not base:
-        fields["aliases_json"] = json.dumps(_aliases(item.get("aliases")), ensure_ascii=False)
+        cleaned = _aliases(item.get("aliases"))
+        if base and "aliases" in item and not cleaned:
+            # Blank means "leave it alone", the same rule as portion_label/note
+            # below: `aliases=""` (or `[]`, or a list of only blank strings)
+            # used to silently erase every stored alias — every future
+            # log_food/search_ingredients lookup by it then refused with
+            # near-matches, and nothing in the response said why (round-9
+            # finding 4). On an insert there is nothing stored to protect, so
+            # a blank there is still just the default empty list.
+            blanked.append("aliases")
+        else:
+            fields["aliases_json"] = json.dumps(cleaned, ensure_ascii=False)
 
     for column, key, limits in (
         ("kcal_100g", "kcal_100g", KCAL_100G_LIMITS),
@@ -528,7 +562,6 @@ def _ingredient_fields(item: dict, existing: dict | None = None) -> tuple[dict, 
         fields["default_portion_g"] = _number(
             item["default_portion_g"], "default_portion_g", GRAMS_LIMITS
         )
-    blanked: list[str] = []
     for column in ("portion_label", "note"):
         if item.get(column) is not None:
             text = _text(item[column])
@@ -677,13 +710,14 @@ def update_ingredient(
     `name` is the lookup and never the new value, because one argument doing
     both would make every rename indistinguishable from a mistyped lookup.
 
-    `clear=[...]` erases an optional field back to unknown — `package_price`,
-    `package_weight_g`, `default_portion_g`, `portion_label`, `note`, or any of
-    the optional macros. There was previously no way back to "unknown" once a
-    wrong price or portion had been stored over the right one; a bare
-    `portion_label`/`note` given as blank text is ignored rather than
-    stored — the response names it in `ignored_blank_fields` — so `clear` is
-    the only path to a null here, the same as everywhere else in this server.
+    `clear=[...]` erases an optional field back to unknown — `aliases`,
+    `package_price`, `package_weight_g`, `default_portion_g`, `portion_label`,
+    `note`, or any of the optional macros. There was previously no way back to
+    "unknown" once a wrong price or portion had been stored over the right
+    one; a bare `portion_label`/`note`/`aliases` given as blank text (or, for
+    `aliases`, an empty list) is ignored rather than stored — the response
+    names it in `ignored_blank_fields` — so `clear` is the only path to a null
+    here, the same as everywhere else in this server.
     """
     with open_db() as conn:
         _ensure_athlete(conn, athlete_id)
@@ -695,6 +729,27 @@ def update_ingredient(
             # name here, so nothing about it should move.
             fields.pop("name", None)
             fields.pop("name_key", None)
+        elif _text(new_name) is None:
+            # `new_name` given but blank folds away inside `_ingredient_fields`,
+            # which then falls back to the *existing* name — so `fields["name"]`
+            # and `["name_key"]` came back set, unchanged, and the response
+            # reported a rename that never happened, rewriting the row to
+            # itself (round-9 finding 7). Same rule as every other blank text
+            # field here: ignored, not stored, and named so the caller can
+            # tell a no-op from a successful rename.
+            fields.pop("name", None)
+            fields.pop("name_key", None)
+            blanked.append("new_name")
+        # `CLEARABLE_INGREDIENT_FIELDS` names the field "aliases", matching what
+        # `add_ingredients`/`update_ingredient` callers pass in — `aliases_json`
+        # is the storage column, an implementation detail of this table. Staged
+        # under "aliases" here so `_clear_fields`'s both-given conflict check
+        # (`updates.get(key) is not None`) and its NULL assignment land on the
+        # same key the caller and `clearable` both use; translated back to the
+        # real column right after, since that is what the UPDATE/INSERT below
+        # actually builds its assignment list from.
+        if "aliases_json" in fields:
+            fields["aliases"] = json.loads(fields.pop("aliases_json"))
         if fields.get("name_key") and fields["name_key"] != row["name_key"]:
             clash = conn.execute(
                 "SELECT id, name FROM ingredients WHERE athlete_id = ? AND name_key = ? "
@@ -710,6 +765,11 @@ def update_ingredient(
         # so `not fields` below still means "no assignment at all" once a
         # clear is folded in.
         cleared = _clear_fields(fields, clear, CLEARABLE_INGREDIENT_FIELDS, blanked)
+        if "aliases" in fields:
+            value = fields.pop("aliases")
+            fields["aliases_json"] = (
+                None if value is None else json.dumps(value, ensure_ascii=False)
+            )
         if not fields:
             if not blanked:
                 raise NutritionError("nothing to update — pass at least one field, or clear=[...]")
@@ -906,11 +966,12 @@ def search_ingredients(
     write. Omit `query` to list the whole base, which is what onboarding wants
     after a bulk paste.
     """
+    limit = _coerce_limit(limit)
     with open_db() as conn:
         rows = _load_ingredients(conn, athlete_id)
 
     if not _text(query):
-        listed = rows[: max(1, int(limit))]
+        listed = rows[:limit]
         return {
             "query": None,
             "stored": len(rows),
@@ -929,7 +990,7 @@ def search_ingredients(
     fuzzy = [
         row for row in rows if row["id"] in fuzzy_ids and row not in exact and row not in partial
     ]
-    ordered = [*exact, *partial, *fuzzy][: max(1, int(limit))]
+    ordered = [*exact, *partial, *fuzzy][:limit]
     return {
         "query": query,
         "stored": len(rows),
@@ -987,16 +1048,33 @@ def _quantity(entry: dict, ingredient: dict, allow_zero: bool = False) -> float:
     today" — and it has to be recognised without ever reaching a bare `<= 0`
     refusal. The both-given contradiction is checked first regardless, so
     `{"grams": 200, "portions": 0}` is still refused rather than read as an
-    override of zero; only a single coerced-to-zero field returns `0.0`, and
-    on the portions path it returns before the no-default-portion refusal —
-    omitting an ingredient must not require it to carry a stored portion
-    size. Every caller that is not that loop leaves `allow_zero` at its
-    default, so a stray `grams: 0` elsewhere still reads as "someone forgot
-    the weight", not as an instruction.
+    override of zero — except `{"grams": 0, "portions": 0}` itself, which is
+    not a contradiction to begin with: both spellings already mean the same
+    "leave it out" under `allow_zero`, so two agreeing zeros return `0.0`
+    rather than being told they disagree. Otherwise, only a single
+    coerced-to-zero field returns `0.0`, and on the portions path it returns
+    before the no-default-portion refusal — omitting an ingredient must not
+    require it to carry a stored portion size. Every caller that is not that
+    loop leaves `allow_zero` at its default, so a stray `grams: 0` elsewhere
+    still reads as "someone forgot the weight", not as an instruction.
     """
     grams = entry.get("grams")
     portions = entry.get("portions")
     if grams is not None and portions is not None:
+        if (
+            allow_zero
+            and not isinstance(grams, bool)
+            and not isinstance(portions, bool)
+            and grams == 0
+            and portions == 0
+        ):
+            # Two agreeing zeros are not a conflict: `{"grams": 0, "portions":
+            # 0}` is the old spelling of "leave this ingredient out today"
+            # from before `portions` existed, and both already mean exactly
+            # that under `allow_zero` — "they disagree by definition" below
+            # is simply false when the two numbers are equal (round-9, below
+            # the cap).
+            return 0.0
         raise NutritionError(
             f"{ingredient['name']}: give grams or portions, not both — they disagree by "
             f"definition when the portion is not exactly that many grams."
@@ -3004,13 +3082,29 @@ def confirm_targets(
                     for key in ("kcal", "protein_g", "fiber_g")
                     if item.get(key) is not None
                 }
-                if "suggested" not in suggestion and not (
+                # All three filed values explicit: the row this call would
+                # store touches none of the suggestion's own figures, summed
+                # exercise included, so there is nothing left for either gate
+                # below to protect.
+                all_explicit = (
                     "kcal" in overrides and "protein_g" in overrides and "fiber_g" in overrides
-                ):
+                )
+                if "suggested" not in suggestion and not all_explicit:
                     raise NutritionError(
                         f"{day}: {suggestion['missing_note']} Or pass kcal, protein_g and "
                         f"fiber_g explicitly to file a target anyway."
                     )
+                # Hoisted out of the gate branch below (round-9 finding 5,
+                # bullet c): a malformed `accept_summed_exercise` used to be
+                # read and validated only on a day the gate actually fired on,
+                # so `{"accept_summed_exercise": "ture"}` on a clean day was
+                # silently swallowed instead of refusing like every other
+                # malformed flag.
+                item_accept = _bool(
+                    item.get("accept_summed_exercise"),
+                    "accept_summed_exercise",
+                    default_accept_summed_exercise,
+                )
                 # See the comment above `outstanding` in
                 # `_day_type_and_training_from_rows`: this sum is advisory in
                 # `suggest_targets`, but never filed blind — an import summed
@@ -3018,15 +3112,19 @@ def confirm_targets(
                 # two names, and confirming that without a human resolving it
                 # would file a doubled figure that looks entirely reasonable
                 # afterwards. `exercise_kcal_override` (source "override")
-                # replaces the sum outright, so it never reaches here.
+                # replaces the sum outright, so it never reaches here — and
+                # neither does a day whose `kcal` is itself explicit (round-9
+                # finding 5, bullet a; corrected in the round after: the gate
+                # used to key off `all_explicit`, but `protein_g` and
+                # `fiber_g` never embed the summed figure — protein depends
+                # only on weight x protein_g_per_kg, fiber only on day_type —
+                # so a call giving `kcal` explicitly and leaving one of the
+                # other two to the suggestion was refused over a summed
+                # figure the row being filed does not contain).
                 exercise_source = (suggestion.get("working") or {}).get("exercise_source")
                 accepted_summed_exercise = False
-                if exercise_source == "imported_activity+planned_workout":
-                    item_accept = _bool(
-                        item.get("accept_summed_exercise"),
-                        "accept_summed_exercise",
-                        default_accept_summed_exercise,
-                    )
+                summed_exercise = exercise_source == "imported_activity+planned_workout"
+                if summed_exercise and "kcal" not in overrides:
                     if not item_accept:
                         names = ", ".join(
                             (suggestion.get("training") or {}).get("outstanding_planned_names")
@@ -3040,6 +3138,11 @@ def confirm_targets(
                             f"accept_summed_exercise=true if there genuinely were two sessions; "
                             f"or pass exercise_kcal_override with the intended figure."
                         )
+                    # The note built from this further down only makes sense
+                    # when the summed figure is actually what gets filed —
+                    # the gate above now only fires when `kcal` is NOT
+                    # explicit, so reaching here always means the sum is what
+                    # gets stored (round-9 finding 5, bullet b).
                     accepted_summed_exercise = True
                 base = suggestion.get(
                     "suggested",
@@ -3105,8 +3208,20 @@ def confirm_targets(
                 row = _stored_targets(conn, athlete_id, day)
                 assert row is not None
                 entry = dict(row)
-                if overrides:
+                if overrides and "suggested" in suggestion:
                     entry["overrode"] = {key: base[key] for key in overrides if key in base}
+                elif overrides:
+                    # No suggestion existed to override — `base` above is the
+                    # placeholder {"kcal": 0, "protein_g": 0, "fiber_g": 0}
+                    # used only so the fallback lookups below have something
+                    # to read, not a real figure. Reporting it under
+                    # "overrode" claimed a 0/0/0 suggestion that was never
+                    # computed (round-9, below the cap).
+                    entry["overrode_note"] = (
+                        f"No suggestion existed for {day} to compare against "
+                        f"({suggestion['missing_note']}) — every value filed was given "
+                        f"explicitly."
+                    )
                 if accepted_summed_exercise:
                     names = ", ".join(
                         (suggestion.get("training") or {}).get("outstanding_planned_names") or []

@@ -27,6 +27,8 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, NamedTuple
 
+from .training import _positive
+
 # Garmin reports a bike ride under whichever child type the device chose:
 # "virtual_ride" for a trainer app, "indoor_cycling" for a smart trainer with no
 # app, "road_biking"/"gravel_cycling" outdoors. Filtering on typeKey == "cycling"
@@ -708,7 +710,15 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
             # every valid ride in the same call.
             return None, f"activity {activity_id}: {field} is not a finite number ({exc.value!r})"
         if number is not None and field in _INT_FIELDS:
-            value = round(number)
+            # A payload int is range-checked as itself, not through the
+            # float round-trip `_number` did to test it for finiteness:
+            # `float(2**63 - 1)` rounds up to `2**63`, one float-ulp outside
+            # SQLite's own signed-64-bit range, so the largest value SQLite
+            # can actually store was rejected by the very guard meant to
+            # admit everything storable. A non-int (already a float, or a
+            # numeric string) has no better source than the round-trip.
+            raw = values[field]
+            value = raw if isinstance(raw, int) and not isinstance(raw, bool) else round(number)
             if not (_SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX):
                 # `number` is finite — it passed the guard above — but still
                 # too big for SQLite's signed-64-bit INTEGER column. Unguarded,
@@ -717,10 +727,14 @@ def normalize_activity(item: dict) -> tuple[dict | None, str | None]:
                 # per-row reject path, killing the whole batch the same way
                 # the unbounded `float()` used to. Kept as a distinct message
                 # from the finite-number one so a reader can tell "inf" from
-                # "too big to store".
+                # "too big to store". Reports the value as the payload sent
+                # it (`values[field]`), not `number`'s rounded float — the
+                # rounding is an internal conversion step, and showing it
+                # back made the boundary look one float-ulp narrower than it
+                # actually is.
                 return None, (
                     f"activity {activity_id}: {field} is outside the range this database "
-                    f"stores ({number!r})"
+                    f"stores ({values[field]!r})"
                 )
             row[field] = value
         else:
@@ -757,11 +771,15 @@ def row_flags(row: dict) -> list[str]:
         flags.append("no_utc_time")
     if not row.get("sub_sport"):
         flags.append("no_sport_type")
-    if row.get("duration_s") is None:
+    # Read through the same placeholder rule every read surface applies
+    # (`_positive`): a stored 0 or negative here is no measurement, and a flag
+    # computed from the raw column would sit in the same response dict as the
+    # nulled projection, each telling a different story about the same row.
+    if _positive(row.get("duration_s")) is None:
         flags.append("no_duration")
-    if row.get("avg_power") is None and row.get("normalized_power") is None:
+    if _positive(row.get("avg_power")) is None and _positive(row.get("normalized_power")) is None:
         flags.append("no_power")
-    elif row.get("normalized_power") is None:
+    elif _positive(row.get("normalized_power")) is None:
         # Common on a ride recorded without a power meter connected to the head
         # unit's NP field, and on some third-party uploads. TSS falls back to
         # average power, which understates a variable ride.
@@ -777,8 +795,9 @@ def normalize_lap(item: dict, index: int) -> dict:
     """
     row: dict[str, Any] = {"lap_index": index}
     for field, keys in _LAP_ALIASES.items():
+        raw = _pick(item, keys)
         try:
-            number = _number(_pick(item, keys))
+            number = _number(raw)
         except _NotFiniteNumber:
             # Laps are never rejected (see this function's own docstring) — an
             # inf/NaN lap value is unusable the same way a missing one is, so
@@ -789,7 +808,11 @@ def normalize_lap(item: dict, index: int) -> dict:
             # case is caught after rounding, just below.
             number = None
         if number is not None and field in _INT_FIELDS:
-            value = round(number)
+            # Same payload-int-vs-float-round-trip split as
+            # `normalize_activity` — see the comment there. Without it,
+            # `float(2**63 - 1)` rounds up to `2**63` and the largest value
+            # SQLite can store thins to None on the lap path alone.
+            value = raw if isinstance(raw, int) and not isinstance(raw, bool) else round(number)
             row[field] = value if _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX else None
         else:
             row[field] = number

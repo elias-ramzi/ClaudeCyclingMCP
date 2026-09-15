@@ -24,6 +24,7 @@ from cycling_mcp.training import (
     ordinal,
     power_tss,
     power_zones,
+    whole_number,
 )
 
 # --------------------------------------------------------------------------
@@ -143,6 +144,45 @@ def test_a_negative_stored_duration_is_the_same_refusal_too():
 def test_a_duration_of_one_second_is_a_real_ride_not_a_placeholder():
     load = compute_activity_load({"duration_s": 1, "normalized_power": 250}, 250, None)
     assert load.tss is not None
+
+
+# --------------------------------------------------------------------------
+# review round 9 — a stored negative power/HR is not a measurement either
+# --------------------------------------------------------------------------
+
+
+def test_a_negative_stored_avg_hr_falls_through_to_null_tss_not_a_confident_one():
+    """`avg_hr: -150` squared into a confident positive TSS under a truthiness
+    gate — `-150` is truthy — with a negative IF next to it. Routed through
+    `_positive`, a non-positive HR makes the hr method unavailable and there
+    is no power to fall back to, so this reaches the null-with-reason path."""
+    load = compute_activity_load({"duration_s": 3600, "avg_hr": -150}, None, 170)
+    assert load.tss is None
+    assert load.method == "none"
+    assert "neither power nor heart rate" in load.reason
+
+
+def test_a_negative_stored_avg_power_does_not_produce_a_negative_if_tss():
+    """`avg_power: -50` against an FTP used to compute a confident TSS with
+    IF -0.2. Non-positive power makes the power_avg method unavailable, and
+    with no HR on the row this falls through to the null-with-reason path."""
+    load = compute_activity_load({"duration_s": 3600, "avg_power": -50}, 250, None)
+    assert load.tss is None
+    assert load.method == "none"
+
+
+def test_avg_power_of_one_watt_is_a_real_measurement_not_eaten_by_the_guard():
+    """Just outside the guard: 1 W is nonsense physiologically, but it is not
+    the placeholder zero or a bad negative, so it must still compute a load."""
+    load = compute_activity_load({"duration_s": 3600, "avg_power": 1}, 250, None)
+    assert load.tss is not None
+    assert load.method == "power_avg"
+
+
+def test_avg_hr_of_thirty_is_a_real_measurement_not_eaten_by_the_guard():
+    load = compute_activity_load({"duration_s": 3600, "avg_hr": 30}, None, 170)
+    assert load.tss is not None
+    assert load.method == "hr"
 
 
 # --------------------------------------------------------------------------
@@ -408,3 +448,50 @@ def test_a_verdict_nothing_knows_about_raises_rather_than_passing():
         classify_block({"verdict": "sandbagged", "duration_verdict": "on_time"})
     with pytest.raises(ValueError, match="unrecognised block duration_verdict"):
         classify_block({"verdict": "on_target", "duration_verdict": "eventually"})
+
+
+# --------------------------------------------------------------------------
+# whole_number — the coercer shared by coach._whole_number (limit, rpe,
+# birth_year, linked_activity_id) and nutrition._coerce_limit
+# --------------------------------------------------------------------------
+
+
+def test_whole_number_refuses_a_bool_naming_the_value_given():
+    """bool is an int subclass, so True would otherwise sail through int() as
+    a quiet 1 rather than a refusal."""
+    with pytest.raises(ValueError, match="rpe") as exc:
+        whole_number(True, "rpe")
+    assert "True" in str(exc.value)
+
+
+def test_whole_number_refuses_a_non_integral_float_reporting_the_original():
+    with pytest.raises(ValueError) as exc:
+        whole_number(9.7, "rpe")
+    assert "got 9.7" in str(exc.value)
+
+
+def test_whole_number_refuses_a_list_without_a_bare_type_error():
+    with pytest.raises(ValueError, match="rpe"):
+        whole_number([1], "rpe")
+
+
+def test_whole_number_refuses_infinity_without_a_bare_overflow_error():
+    with pytest.raises(ValueError, match="rpe"):
+        whole_number(float("inf"), "rpe")
+
+
+def test_whole_number_refuses_none_without_a_bare_type_error():
+    with pytest.raises(ValueError, match="rpe"):
+        whole_number(None, "rpe")
+
+
+def test_whole_number_accepts_an_int_an_integral_float_and_a_numeral_string():
+    assert whole_number(7, "rpe") == 7
+    assert whole_number(10.0, "rpe") == 10
+    assert whole_number("10", "rpe") == 10
+
+
+def test_whole_number_accepts_a_negative_int_leaving_range_checks_to_callers():
+    """Whole-number-ness only — the minimum (limit >= 1) and range (rpe
+    1-10) are each caller's own business, not this function's."""
+    assert whole_number(-5, "linked_activity_id") == -5

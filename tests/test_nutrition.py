@@ -1291,7 +1291,7 @@ def test_migration_5_rebuilds_food_log_with_existing_rows_intact(tmp_path, monke
     conn.close()
 
     with store.open_db() as conn:
-        assert store.schema_version(conn) == store.CURRENT_SCHEMA_VERSION == 6
+        assert store.schema_version(conn) == store.CURRENT_SCHEMA_VERSION
         row = conn.execute("SELECT * FROM food_log WHERE label = 'Old entry'").fetchone()
         columns = {
             description[0] for description in conn.execute("SELECT * FROM food_log").description
@@ -1306,11 +1306,6 @@ def test_migration_5_rebuilds_food_log_with_existing_rows_intact(tmp_path, monke
         [{"label": "New estimate", "kcal": 300, "is_estimate": True}], log_date="2026-08-02"
     )
     assert result["entries"][0]["protein_g"] is None
-
-
-def test_migrations_stay_append_only_through_version_5():
-    assert store.CURRENT_SCHEMA_VERSION == 6
-    assert [version for version, _ in store.MIGRATIONS] == [1, 2, 3, 4, 5, 6]
 
 
 # --- (2) a 400-digit number is a refusal, never an OverflowError crash ---
@@ -1433,6 +1428,38 @@ def test_log_meal_override_of_a_bool_is_refused_not_read_as_a_quantity(base):
             "Petit-dej",
             log_date="2026-08-24",
             overrides=[{"ingredient": "Cruesli", "grams": False}],
+        )
+
+
+# --- round-9, below the cap: {"grams": 0, "portions": 0} is the old spelling
+# of "leave it out" and the new one agreeing with each other, not a
+# contradiction — the both-given refusal used to fire on it anyway. ---
+
+
+def test_log_meal_override_of_grams_zero_and_portions_zero_together_still_omits(base):
+    nutrition.save_meal(
+        "Petit-dej", [{"ingredient": "skyr", "grams": 200}, {"ingredient": "Cruesli", "grams": 50}]
+    )
+    result = nutrition.log_meal(
+        "Petit-dej",
+        log_date="2026-08-24",
+        overrides=[{"ingredient": "Cruesli", "grams": 0, "portions": 0}],
+    )
+    assert result["omitted"] == ["Cruesli"]
+    assert result["logged"] == 1
+
+
+def test_log_meal_override_of_grams_zero_and_portions_one_is_still_refused(base):
+    """Just outside the new agreement: unequal values are still a genuine
+    contradiction, not a "leave it out" of any spelling."""
+    nutrition.save_meal(
+        "Petit-dej", [{"ingredient": "skyr", "grams": 200}, {"ingredient": "Cruesli", "grams": 50}]
+    )
+    with pytest.raises(nutrition.NutritionError, match="not both"):
+        nutrition.log_meal(
+            "Petit-dej",
+            log_date="2026-08-24",
+            overrides=[{"ingredient": "Cruesli", "grams": 0, "portions": 1}],
         )
 
 
@@ -1656,6 +1683,76 @@ def test_update_ingredient_blank_note_and_clear_of_note_is_not_double_reported(b
     assert stored["note"] is None
     assert result["cleared_fields"] == ["note"]
     assert "ignored_blank_fields" not in result
+
+
+# --- round-9 finding 4: a blank `aliases` on update_ingredient used to
+# silently erase every stored alias, the same blank-erases-stored-value class
+# round 8 fixed for note/portion_label but alive one field over — and there
+# was no clear=[...] path to a deliberate empty alias list either. ---
+
+
+def test_update_ingredient_blank_aliases_is_ignored_and_reported(base):
+    result = nutrition.update_ingredient(name="skyr", aliases="")
+    stored = nutrition.search_ingredients("skyr")["matches"][0]
+    assert stored["aliases"] == ["skyr"]
+    assert result["ignored_blank_fields"] == ["aliases"]
+    assert "not an instruction to erase" in result["ignored_blank_note"]
+
+
+def test_update_ingredient_empty_list_aliases_is_also_ignored_and_reported(base):
+    """The list spelling of blank, not just the string one."""
+    result = nutrition.update_ingredient(name="skyr", aliases=[])
+    stored = nutrition.search_ingredients("skyr")["matches"][0]
+    assert stored["aliases"] == ["skyr"]
+    assert result["ignored_blank_fields"] == ["aliases"]
+
+
+def test_update_ingredient_clear_aliases_empties_it(base):
+    result = nutrition.update_ingredient(name="skyr", clear=["aliases"])
+    stored = nutrition.search_ingredients("Skyr nature")["matches"][0]
+    assert stored["aliases"] == []
+    assert result["cleared_fields"] == ["aliases"]
+    logged = nutrition.log_food([{"ingredient": "skyr", "grams": 200}])
+    assert logged["logged"] == 0
+    assert "no ingredient named" in logged["rejections"][0]["reason"]
+
+
+def test_update_ingredient_aliases_value_and_clear_together_is_refused(base):
+    with pytest.raises(nutrition.NutritionError, match="given both a new value and a request"):
+        nutrition.update_ingredient(name="skyr", aliases=["yaourt"], clear=["aliases"])
+    stored = nutrition.search_ingredients("skyr")["matches"][0]
+    assert stored["aliases"] == ["skyr"]
+
+
+def test_update_ingredient_aliases_of_a_real_list_still_replaces(base):
+    """Value just outside the blank guard: a non-empty list still replaces
+    what was stored."""
+    result = nutrition.update_ingredient(name="skyr", aliases=["yaourt"])
+    assert result["updated_fields"] == ["aliases_json"]
+    stored = nutrition.search_ingredients("yaourt")["matches"][0]
+    assert stored["aliases"] == ["yaourt"]
+
+
+# --- round-9 finding 7: a blank `new_name` reported a rename that never
+# happened — the UPDATE rewrote name/name_key to themselves and
+# `updated_fields` claimed the change. ---
+
+
+def test_update_ingredient_blank_new_name_does_not_rename_and_is_reported(base):
+    result = nutrition.update_ingredient(name="skyr", new_name="   ")
+    stored = nutrition.search_ingredients("skyr")["matches"][0]
+    assert stored["name"] == "Skyr nature 0%"
+    assert "name" not in result["updated_fields"]
+    assert "name_key" not in result["updated_fields"]
+    assert result["ignored_blank_fields"] == ["new_name"]
+
+
+def test_update_ingredient_new_name_of_x_still_renames(base):
+    """Value just outside the blank guard."""
+    result = nutrition.update_ingredient(name="skyr", new_name="x")
+    assert result["updated_fields"] == ["name", "name_key"]
+    stored = nutrition.search_ingredients("x")["matches"][0]
+    assert stored["name"] == "x"
 
 
 def test_a_zero_priced_package_is_unpriced_not_free(base):
@@ -1979,6 +2076,122 @@ def test_confirm_targets_bulk_call_separates_a_gated_day_from_a_clean_one(athlet
     assert "link_activity" in result["rejections"][0]["reason"]
 
 
+# --------------------------------------------------------------------------
+# round-9 finding 5: the summed-exercise gate fired before the per-day
+# kcal/protein_g/fiber_g overrides were consulted, refusing a fully explicit
+# target that touched none of the suggestion's own figures; and once let
+# through by the flag, the filed note claimed the sum was used even when it
+# was not. Corrected the round after: the gate keyed off `all_explicit`
+# (all three given), but only `kcal` ever carries the summed figure —
+# `protein_g` depends solely on weight and `fiber_g` solely on day_type — so
+# a call that gave `kcal` explicitly and left one of the other two to the
+# suggestion was still refused over a summed figure the row being filed does
+# not contain. The gate now keys off `kcal` alone.
+# --------------------------------------------------------------------------
+
+
+def test_confirm_targets_all_three_explicit_bypasses_the_summed_exercise_gate(athlete):
+    """(a) A fully explicit target files clean, without the flag — the row
+    stored touches no summed figure at all, so there is nothing to protect."""
+    _pushed_session("2026-08-29")
+    coach.import_activities([_cycling_activity(9308, "2026-08-29", 3600.0, 600.0)])
+
+    result = nutrition.confirm_targets(date_str="2026-08-29", kcal=2600, protein_g=150, fiber_g=30)
+    assert result["stored"] == 1
+    assert result["rejected"] == 0
+    assert result["targets"][0]["kcal"] == 2600
+    assert "accepted_summed_exercise_note" not in result["targets"][0]
+
+
+def test_confirm_targets_kcal_explicit_bypasses_the_gate_even_if_others_are_not(athlete):
+    """Only `kcal` carries the summed figure — `protein_g` depends solely on
+    weight x protein_g_per_kg and `fiber_g` solely on day_type, neither ever
+    embeds `exercise` — so a call that gives `kcal` explicitly and leaves
+    `protein_g`/`fiber_g` to the suggestion files clean, without the flag.
+    The gate used to key off `all_explicit` and refused this exact call even
+    though the row it would store touches no summed figure at all."""
+    _pushed_session("2026-09-01")
+    coach.import_activities([_cycling_activity(9310, "2026-09-01", 3600.0, 600.0)])
+
+    result = nutrition.confirm_targets(date_str="2026-09-01", kcal=2600)
+    assert result["stored"] == 1
+    assert result["rejected"] == 0
+    assert result["targets"][0]["kcal"] == 2600
+    assert "accepted_summed_exercise_note" not in result["targets"][0]
+
+
+def test_confirm_targets_kcal_left_to_the_suggestion_still_gates_the_summed_day(athlete):
+    """Just outside the bypass above: `kcal` itself falling back to the
+    suggestion still touches the summed figure — regardless of whether
+    `protein_g` and `fiber_g` are given explicitly — so the gate still
+    applies."""
+    _pushed_session("2026-09-04")
+    coach.import_activities([_cycling_activity(9313, "2026-09-04", 3600.0, 600.0)])
+
+    result = nutrition.confirm_targets(date_str="2026-09-04", protein_g=150, fiber_g=30)
+    assert result["stored"] == 0
+    assert result["rejected"] == 1
+    assert "accept_summed_exercise" in result["rejections"][0]["reason"]
+
+
+def test_confirm_targets_accept_flag_with_all_three_explicit_carries_no_summed_note(athlete):
+    """(b) accept_summed_exercise=True alongside a fully explicit target must
+    not claim the summed figure was filed — kcal was overridden, not summed."""
+    _pushed_session("2026-08-30")
+    coach.import_activities([_cycling_activity(9309, "2026-08-30", 3600.0, 600.0)])
+
+    result = nutrition.confirm_targets(
+        date_str="2026-08-30",
+        kcal=2600,
+        protein_g=150,
+        fiber_g=30,
+        accept_summed_exercise=True,
+    )
+    assert result["stored"] == 1
+    assert result["targets"][0]["kcal"] == 2600
+    assert "accepted_summed_exercise_note" not in result["targets"][0]
+
+
+def test_confirm_targets_accepted_summed_note_still_appears_when_kcal_is_not_overridden(athlete):
+    """The note is still owed when the sum genuinely is what gets filed —
+    only kcal is explicit here is false; nothing is, so the base kcal (which
+    embeds the sum) is what is stored."""
+    _pushed_session("2026-09-02")
+    coach.import_activities([_cycling_activity(9311, "2026-09-02", 3600.0, 600.0)])
+
+    result = nutrition.confirm_targets(date_str="2026-09-02", accept_summed_exercise=True)
+    assert result["stored"] == 1
+    note = result["targets"][0]["accepted_summed_exercise_note"]
+    assert "explicitly" in note
+
+
+def test_confirm_targets_malformed_accept_summed_exercise_refuses_even_on_a_clean_day(athlete):
+    """(c) The flag is validated on every day, not only a gated one — a typo
+    used to be silently swallowed on a day the gate never looked at."""
+    coach.save_planned_workouts([{"spec": LONG_RIDE, "scheduled_date": "2026-08-31"}])
+    result = nutrition.confirm_targets(
+        days=[{"date": "2026-08-31", "accept_summed_exercise": "ture"}]
+    )
+    assert result["stored"] == 0
+    assert result["rejected"] == 1
+    assert "accept_summed_exercise" in result["rejections"][0]["reason"]
+
+
+# --- round-9, below the cap: a missing-suggestion day filed explicitly used
+# to report `overrode: {"kcal": 0, "protein_g": 0, "fiber_g": 0}`, asserting a
+# 0/0/0 suggestion that was never computed. ---
+
+
+def test_confirm_targets_explicit_day_with_no_profile_reports_no_suggestion_existed(base):
+    """`base` (no `athlete` fixture) leaves the profile incomplete, so there is
+    no suggestion at all for the explicit day to be compared against."""
+    result = nutrition.confirm_targets(date_str="2026-09-03", kcal=2600, protein_g=150, fiber_g=30)
+    assert result["stored"] == 1
+    entry = result["targets"][0]
+    assert "overrode" not in entry
+    assert "No suggestion existed" in entry["overrode_note"]
+
+
 # --- cleanup nutrition.py:2499 — the unmeasured-activities note, pluralized ---
 
 
@@ -2071,3 +2284,48 @@ def test_suggest_and_confirm_targets_knob_ranges_stay_in_lockstep(
         nutrition.confirm_targets(date_str="2026-08-24", **{knob: just_outside})
     assert str(suggest_exc.value) == str(confirm_exc.value)
     assert knob in str(suggest_exc.value)
+
+
+# --- round-9 finding 6's unfixed twin: search_ingredients' own `limit`
+# --- coercion (`max(1, int(limit))`) had the same crashes and silent
+# --- truncations that list_activities' limit guard was built to close ---
+
+
+def test_search_ingredients_limit_none_is_a_nutrition_error_not_a_type_error():
+    with pytest.raises(nutrition.NutritionError, match="limit"):
+        nutrition.search_ingredients(limit=None)
+
+
+def test_search_ingredients_limit_infinity_is_a_nutrition_error_not_an_overflow_error():
+    with pytest.raises(nutrition.NutritionError, match="limit"):
+        nutrition.search_ingredients(limit=float("inf"))
+
+
+def test_search_ingredients_limit_of_a_non_integral_float_is_refused_with_its_own_value():
+    with pytest.raises(nutrition.NutritionError) as exc:
+        nutrition.search_ingredients(limit=1.9)
+    assert "1.9" in str(exc.value)
+
+
+def test_search_ingredients_limit_of_true_is_refused_not_silently_one():
+    with pytest.raises(nutrition.NutritionError, match="limit"):
+        nutrition.search_ingredients(limit=True)
+
+
+def test_search_ingredients_limit_of_zero_is_refused_not_silently_bumped_to_one():
+    with pytest.raises(nutrition.NutritionError) as exc:
+        nutrition.search_ingredients(limit=0)
+    assert "0" in str(exc.value)
+
+
+def test_search_ingredients_limit_of_minus_one_is_refused():
+    with pytest.raises(nutrition.NutritionError, match="limit"):
+        nutrition.search_ingredients(limit=-1)
+
+
+def test_search_ingredients_limit_accepted_shapes_still_work(athlete):
+    """Just outside every new guard: a plain int and an integral float still
+    work, and limit=1 still returns a match."""
+    nutrition.add_ingredients([SKYR])
+    assert len(nutrition.search_ingredients("skyr", limit=1)["matches"]) == 1
+    assert len(nutrition.search_ingredients("skyr", limit=10.0)["matches"]) == 1

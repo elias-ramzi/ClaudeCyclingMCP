@@ -386,6 +386,76 @@ def one_of(value: Any, allowed: tuple[str, ...], what: str) -> str | None:
     raise ValueError(f"{what} must be one of {list(allowed)}, got {value!r}")
 
 
+def whole_number(value: Any, what: str) -> int:
+    """A genuine whole number, refused rather than silently mangled.
+
+    Shared by `coach._whole_number` (wrapping `CoachError`) and
+    `nutrition._coerce_limit` (wrapping `NutritionError`), which each grew an
+    identical inline block — `list_activities`' `limit`, then
+    `search_ingredients`' `limit` copied to fix its unfixed twin — before this
+    was pulled out. Refuses, naming `what` and the value exactly as given
+    (never the coerced result, which would hide what was wrong with the call):
+
+    - a `bool` (`isinstance(True, int)` is `True`, so `True`/`False` would
+      otherwise sail through `int()` as a quiet `1`/`0`)
+    - anything `int()` cannot parse, or that overflows in the attempt —
+      `None`, a list, `float("inf")` — as a bare
+      `TypeError`/`ValueError`/`OverflowError` would escape past whichever
+      caller is not ready to catch it. (A JSON integer with hundreds of
+      digits is already an `int` and passes through untouched — refusing it
+      is the caller's range check's job, like any other out-of-range value.)
+    - a non-integral float (`9.7` must not silently become `9`)
+
+    Range checks (a minimum, an upper bound for a value bound into SQL) are
+    each caller's own business — the same whole number is fine for one
+    caller's range and nonsense for another's — so this only guarantees the
+    result is a genuine `int` equal to the value given. Raises a plain
+    `ValueError`, exactly like `one_of` above; each caller re-raises it as its
+    own refusal type.
+
+    `Decimal("1.5")` is not caught here: it is not a `float`, so the
+    non-integral check does not see it, and `int(Decimal("1.5"))` truncates to
+    `1` the same way `int()` truncates any non-integral input it is not
+    specifically guarded against. Unreachable through the MCP tool schema
+    (which types every whole-number argument as `int`), so left as a known gap
+    rather than a guard against a shape that cannot arrive.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{what} must be a whole number, got {value!r}")
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{what} must be a whole number, got {value!r}") from None
+    if isinstance(value, float) and number != value:
+        raise ValueError(f"{what} must be a whole number, got {value!r}")
+    return number
+
+
+def real_number(value: Any, what: str) -> float:
+    """The float twin of `whole_number`, shared for the same reason.
+
+    `float([1])` is a bare `TypeError`, which is not in `server._coach`'s
+    catch tuple, so every tool that called `float()` directly on its own
+    argument crashed across the MCP boundary instead of refusing — height,
+    both FTP spellings, the three HR fields, an event's distance and
+    elevation, some of them one line from a call site that had already been
+    fixed. `OverflowError` is in the tuple, but a pasted 400-digit JSON
+    integer reaching `float()` deserves the same named refusal a list gets,
+    not the backstop. Booleans are refused for `whole_number`'s reason:
+    `float(True)` is a quiet `1.0`, and not every caller has a range check
+    tight enough to notice (an event's distance has none at all).
+
+    Range checks stay each caller's business. Raises a plain `ValueError`;
+    each caller re-raises it as its own refusal type.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{what} must be a number, got {value!r}")
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{what} must be a number, got {value!r}") from None
+
+
 def compute_activity_load(
     activity: dict,
     ftp: int | None,
@@ -408,8 +478,13 @@ def compute_activity_load(
     if duration is None:
         return Load(None, "none", reason="the activity has no duration")
 
-    np_watts = activity.get("normalized_power")
-    avg_watts = activity.get("avg_power")
+    # Through `_positive`, same as duration above: a stored `avg_power: -50` or
+    # `avg_hr: -150` is a bad datum, not a real reading, and read raw it squared
+    # into a confident positive TSS with a plausible-looking negative IF next to
+    # it. Falling through to the next method (or to the null-with-reason path
+    # below) tolerates the row rather than rejecting it at import.
+    np_watts = _positive(activity.get("normalized_power"))
+    avg_watts = _positive(activity.get("avg_power"))
 
     if ftp and (np_watts or avg_watts):
         if np_watts:
@@ -431,7 +506,7 @@ def compute_activity_load(
             ),
         )
 
-    avg_hr = activity.get("avg_hr")
+    avg_hr = _positive(activity.get("avg_hr"))
     if threshold_hr and avg_hr:
         flags = ["hr_based"]
         if threshold_hr_estimated:

@@ -70,6 +70,8 @@ from .training import one_of as _training_one_of
 from .training import (
     plural as _plural,
 )
+from .training import real_number as _training_real_number
+from .training import whole_number as _training_whole_number
 from .verify import payload_digest
 
 PLANNED_STATUSES = ("planned", "pushed", "completed", "missed", "skipped")
@@ -249,6 +251,58 @@ def _project(row: sqlite3.Row | dict, fields: tuple[str, ...]) -> dict:
     return projected
 
 
+#: The measured physiological fields on an activity row — as opposed to
+#: `duration_s`/`distance_m`/`elevation_gain_m`/`calories`, where 0 can be a
+#: real trainer datum and stays raw.
+_ACTIVITY_MEASURED_FIELDS = ("avg_hr", "max_hr", "avg_power", "max_power", "normalized_power")
+
+
+def _activity_out(row: sqlite3.Row | dict) -> dict:
+    """An activity row projected through `_ACTIVITY_OUT_FIELDS`, with every
+    measured physiological field routed through `_positive` first.
+
+    `_project` alone hands back whatever is stored, including a placeholder
+    `avg_hr: 0` or `avg_power: -50` from a payload with no meter or strap on
+    that channel — read raw at a display surface, those sit next to a null
+    TSS as if they were real numbers, or print as "-50 W" in a summary
+    sentence. Every `_project(row, _ACTIVITY_OUT_FIELDS)` call site uses this
+    instead, so the guard cannot be applied at some and missed at others.
+    """
+    out = _project(row, _ACTIVITY_OUT_FIELDS)
+    for field in _ACTIVITY_MEASURED_FIELDS:
+        out[field] = _positive(out.get(field))
+    return out
+
+
+#: The measured physiological fields on a lap row — the same reasoning as
+#: `_ACTIVITY_MEASURED_FIELDS`. `duration_s`/`moving_duration_s`/`distance_m`/
+#: `elevation_gain_m` stay raw: a stored 0 there can be a real trainer datum,
+#: and `laps_missing_duration`/the overshoot-shortfall check already guard
+#: `duration_s` at their own call sites via `_positive`, on the stored value —
+#: guarding it again here would not change that, since `_positive` is
+#: idempotent, but the duration readers rely on seeing the stored number, not
+#: a pre-nulled one, to keep their own comments honest about what they guard.
+#: `avg_cadence` is left raw on purpose: a 0 there is the same kind of
+#: placeholder as the others, but cadence is not part of compliance scoring
+#: or any TSS method, so nothing downstream reads it as a measurement — there
+#: is no confident-wrong-number surface for it to sit next to.
+_LAP_MEASURED_FIELDS = ("avg_power", "max_power", "normalized_power", "avg_hr", "max_hr")
+
+
+def _lap_out(row: sqlite3.Row | dict) -> dict:
+    """A lap row projected through `_LAP_OUT_FIELDS`, with every measured
+    physiological field routed through `_positive` first — the lap-level twin
+    of `_activity_out`. A lap carrying `avg_power: 0` or `avg_hr: -150` from a
+    payload with no meter or strap on that channel would otherwise be echoed
+    verbatim at a display surface, next to a null TSS or a compliance verdict,
+    as if it were a real number.
+    """
+    out = _project(row, _LAP_OUT_FIELDS)
+    for field in _LAP_MEASURED_FIELDS:
+        out[field] = _positive(out.get(field))
+    return out
+
+
 def _stage_text(updates: dict[str, Any], fields: dict[str, Any]) -> list[str]:
     """Stage free-text fields for an UPDATE. Blank means "leave it alone".
 
@@ -425,6 +479,25 @@ def _one_of(value: str | None, allowed: tuple[str, ...], what: str) -> str | Non
     """See `training.one_of`: case-insensitive, returns the stored spelling."""
     try:
         return _training_one_of(value, allowed, what)
+    except ValueError as exc:
+        raise CoachError(str(exc)) from exc
+
+
+def _whole_number(value: Any, what: str) -> int:
+    """See `training.whole_number`: a genuine whole number, or a `CoachError`
+    naming the field and the value exactly as given."""
+    try:
+        return _training_whole_number(value, what)
+    except ValueError as exc:
+        raise CoachError(str(exc)) from exc
+
+
+def _real_number(value: Any, what: str) -> float:
+    """See `training.real_number`: a genuine number, or a `CoachError` naming
+    the field — never the bare `TypeError` that `float()` raises on a list,
+    which is the one exception `_coach`'s catch tuple does not hold."""
+    try:
+        return _training_real_number(value, what)
     except ValueError as exc:
         raise CoachError(str(exc)) from exc
 
@@ -1044,10 +1117,13 @@ def update_profile(
     """
     updates: dict[str, Any] = {}
     if height_cm is not None:
-        _check_range(float(height_cm), (100.0, 250.0), "height", "cm")
-        updates["height_cm"] = float(height_cm)
+        height = _real_number(height_cm, "height_cm")
+        _check_range(height, (100.0, 250.0), "height", "cm")
+        updates["height_cm"] = height
     if birth_year is not None:
-        year = int(birth_year)
+        # birth_year=[1] was a bare TypeError escaping _coach; a non-integral
+        # float truncated silently onto a plausible year. Same shared guard.
+        year = _whole_number(birth_year, "birth_year")
         if not (1900 <= year <= date.today().year):
             raise CoachError(f"birth_year of {year} is not a year an athlete was born in")
         updates["birth_year"] = year
@@ -1102,14 +1178,14 @@ def log_ftp(
 
     derived_note = _text(note)
     if twenty_min_watts is not None:
-        raw = float(twenty_min_watts)
+        raw = _real_number(twenty_min_watts, "twenty_min_watts")
         _check_range(raw, (50, 800), "20-minute power", "W")
         value = round(raw * TWENTY_MINUTE_FACTOR)
         method = method or "20min_test"
         detail = f"{raw:g} W for 20 min x {TWENTY_MINUTE_FACTOR} = {value} W"
         derived_note = f"{derived_note} ({detail})" if derived_note else detail
     else:
-        value = round(float(value_watts))
+        value = round(_real_number(value_watts, "value_watts"))
         method = method or "stated"
 
     _check_range(value, FTP_PLAUSIBLE_W, "FTP", "W")
@@ -1189,15 +1265,9 @@ def log_weight(
     the question rather than refusing — but every W/kg computed from a pounds
     figure is wrong by a factor of 2.2, so the question is worth asking.
     """
-    try:
-        value = float(value_kg)
-    except (TypeError, ValueError, OverflowError) as exc:
-        # OverflowError: a JSON integer has no size limit, so a pasted
-        # 400-digit value_kg reaches float() directly, with no earlier point
-        # where a too-large int could have been refused. `_coach`'s own
-        # OverflowError clause is the backstop, not the fix — this is the
-        # named refusal a caller can act on.
-        raise CoachError(f"value_kg must be a number, got {value_kg!r}") from exc
+    # The original of what became `training.real_number` — refactored onto
+    # the shared coercer so the eighth call site is not an eighth copy.
+    value = _real_number(value_kg, "value_kg")
     _check_range(value, WEIGHT_LIMITS_KG, "weight", "kg")
     when = parse_date(effective_date, "effective_date") if effective_date else date.today()
 
@@ -1257,7 +1327,7 @@ def log_hr(
         if raw is None:
             values[key] = None
             continue
-        number = round(float(raw))
+        number = round(_real_number(raw, key))
         _check_range(number, HR_LIMITS, key, "bpm")
         values[key] = number
 
@@ -1460,8 +1530,8 @@ def add_event(
                 athlete_id,
                 label,
                 when.isoformat(),
-                None if distance_km is None else float(distance_km),
-                None if elevation_m is None else float(elevation_m),
+                None if distance_km is None else _real_number(distance_km, "distance_km"),
+                None if elevation_m is None else _real_number(elevation_m, "elevation_m"),
                 priority,
                 status,
                 _text(note),
@@ -1495,9 +1565,9 @@ def update_event(
     if event_date is not None:
         updates["event_date"] = parse_date(event_date, "event_date").isoformat()
     if distance_km is not None:
-        updates["distance_km"] = float(distance_km)
+        updates["distance_km"] = _real_number(distance_km, "distance_km")
     if elevation_m is not None:
-        updates["elevation_m"] = float(elevation_m)
+        updates["elevation_m"] = _real_number(elevation_m, "elevation_m")
     if priority is not None:
         updates["priority"] = _one_of(priority.upper(), EVENT_PRIORITIES, "priority")
     if status is not None:
@@ -1693,9 +1763,7 @@ def record_race_result(
         def _final(field: str) -> Any:
             return updates[field] if field in updates else event.get(field)
 
-        no_result_left = not (
-            _final("finish_time_s") or _final("linked_activity_id") or _final("debrief")
-        )
+        no_result_left = all(_final(field) is None for field in CLEARABLE_RESULT_FIELDS)
         # Gated on an actual retraction, not just on "nothing survives": a
         # call that never removed anything (an existence probe, a clear on a
         # column that was already NULL) also satisfies no_result_left, and
@@ -1777,7 +1845,7 @@ def record_race_result(
             "status explicitly ('abandoned', 'dns') if that is what actually happened."
         )
     if activity is not None:
-        result["linked_activity"] = _project(activity, _ACTIVITY_OUT_FIELDS)
+        result["linked_activity"] = _activity_out(activity)
         result["linked_activity_load"] = load
     if not (stored or {}).get("debrief"):
         result["missing"] = (
@@ -1878,7 +1946,7 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
                 stored = conn.execute(
                     "SELECT * FROM activities WHERE id = ?", (cursor.lastrowid,)
                 ).fetchone()
-                inserted.append(_project(stored, _ACTIVITY_OUT_FIELDS))
+                inserted.append(_activity_out(stored))
                 continue
 
             current = _dict(existing) or {}
@@ -1905,7 +1973,7 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
                 if not _same(merged.get(field), current.get(field))
             }
             if not changes:
-                unchanged.append(_project(current, _ACTIVITY_OUT_FIELDS))
+                unchanged.append(_activity_out(current))
                 continue
             # Serialised here rather than above, so an unchanged ride — the
             # common case on a re-sync — never pays for a dump it discards.
@@ -1918,7 +1986,7 @@ def import_activities(payload: Any, athlete_id: int = DEFAULT_ATHLETE_ID) -> dic
             stored = conn.execute(
                 "SELECT * FROM activities WHERE id = ?", (current["id"],)
             ).fetchone()
-            entry = _project(stored, _ACTIVITY_OUT_FIELDS)
+            entry = _activity_out(stored)
             entry["changed_fields"] = sorted(changes)
             updated.append(entry)
 
@@ -1999,7 +2067,7 @@ def import_activity_laps(
                 values,
             )
         stored = [
-            _project(row, _LAP_OUT_FIELDS)
+            _lap_out(row)
             for row in conn.execute(
                 "SELECT * FROM activity_laps WHERE activity_id = ? ORDER BY lap_index",
                 (activity["id"],),
@@ -2092,7 +2160,12 @@ def annotate_activity(
     """
     updates: dict[str, Any] = {}
     if rpe is not None:
-        value = int(rpe)
+        # RPE is a stored measurement that feeds coaching judgement — the same
+        # `training.whole_number` guard list_activities' `limit` uses, so
+        # rpe=True doesn't store as 1, rpe=9.7 doesn't silently truncate to 9,
+        # and rpe=[1] / rpe=inf raise a named refusal instead of a bare
+        # TypeError/OverflowError escaping _coach's catch tuple.
+        value = _whole_number(rpe, "rpe")
         if not (1 <= value <= 10):
             raise CoachError(f"rpe must be 1-10, got {rpe!r}")
         updates["rpe"] = value
@@ -2111,7 +2184,7 @@ def annotate_activity(
         stored = conn.execute("SELECT * FROM activities WHERE id = ?", (activity["id"],)).fetchone()
     return {
         "updated_fields": sorted(updates),
-        "stored": _project(stored, _ACTIVITY_OUT_FIELDS),
+        "stored": _activity_out(stored),
         **_clear_notes(cleared, blanked, CLEARABLE_ACTIVITY_FIELDS),
     }
 
@@ -2139,20 +2212,30 @@ def list_activities(
     missed-session narrative.
     """
     sport = _one_of(sport, SPORTS, "sport")
+    given_limit = limit
     # None/non-numeric reaches this only from an in-process caller — the MCP
     # schema types `limit` as an int — but `int(None)` is a bare TypeError,
     # outside _coach's catch tuple, so it escaped as an ungraceful crash
-    # instead of a refusal naming the field.
-    try:
-        limit = int(limit)
-    except (TypeError, ValueError):
-        raise CoachError(f"limit must be a whole number, got {limit!r}") from None
+    # instead of a refusal naming the field. bool (isinstance(True, int) is
+    # True) and a non-integral float (1.9) are refused the same way, by the
+    # shared coercer — see `training.whole_number`.
+    limit = _whole_number(limit, "limit")
     if limit < 1:
         # limit=0 used to report count 0 with truncated=True — a caller reading
         # that as "no activities" instead of "the limit was nonsense" would
         # believe an empty log. Negative limits hit the same LIMIT clause with
         # the same silent misread.
         raise CoachError(f"limit must be at least 1, got {limit}")
+    # The query below binds `limit + 1` (one extra row, to tell "there is more"
+    # from "exactly limit matched" as a fact rather than a guess). SQLite's
+    # INTEGER column is a signed 64-bit value, so a `limit` at or above
+    # 2**63 - 1 makes `limit + 1` itself unrepresentable — sqlite3 raises a
+    # bare `OverflowError: Python int too large to convert to SQLite INTEGER`
+    # out of `conn.execute`, past this function's own guards and reported at
+    # the coerced int rather than naming `limit`. Refused here instead, at the
+    # value as given, before it reaches the query.
+    if limit > 2**63 - 2:
+        raise CoachError(f"limit is too large, got {given_limit!r}")
     clauses = ["athlete_id = ?"]
     params: list[Any] = [athlete_id]
     if start:
@@ -2180,7 +2263,7 @@ def list_activities(
         history = History(conn, athlete_id) if include_load else None
         activities = []
         for row in rows:
-            entry = _project(row, _ACTIVITY_OUT_FIELDS)
+            entry = _activity_out(row)
             if history is not None:
                 entry["load"] = _activity_load(history, _dict(row) or {}).as_dict()
             activities.append(entry)
@@ -2260,7 +2343,7 @@ def link_activity(
                 (athlete_id, planned["scheduled_date"], "cycling"),
             ).fetchall()
             for row in rows:
-                entry = _project(row, _ACTIVITY_OUT_FIELDS)
+                entry = _activity_out(row)
                 # A negative stored duration is a bad datum, not a fast ride —
                 # routed through _positive the same way compute_activity_load
                 # and compare_block treat every other stored duration, so a
@@ -2314,12 +2397,24 @@ def link_activity(
         # ride to it is evidence about the ride, not a reversal of the
         # decision, and silently flipping it lost the coaching information.
         completes = planned["status"] in AUTO_COMPLETABLE_STATUSES
-        conn.execute(
-            "UPDATE planned_workouts SET linked_activity_id = ?, "
-            + ("status = 'completed', " if completes else "")
-            + "updated_at = ? WHERE id = ?",
-            (chosen["id"], now_utc(), planned_workout_id),
-        )
+        if completes:
+            # `pre_link_status` records the status auto-completed FROM, so an
+            # unlink can revert to it directly rather than re-deriving a
+            # guess from `pushed_to` (see update_planned_workout). Only
+            # written on the branch that actually changes status: a re-link
+            # of an already-`completed` session is a mislink correction, not
+            # a fresh completion, and must not overwrite whatever the first
+            # link recorded.
+            conn.execute(
+                "UPDATE planned_workouts SET linked_activity_id = ?, "
+                "status = 'completed', pre_link_status = ?, updated_at = ? WHERE id = ?",
+                (chosen["id"], planned["status"], now_utc(), planned_workout_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE planned_workouts SET linked_activity_id = ?, updated_at = ? WHERE id = ?",
+                (chosen["id"], now_utc(), planned_workout_id),
+            )
         # Only for a status that is a coaching decision. Firing it on a
         # `completed` session — re-linking one to the correct ride, the routine
         # mislink correction — warned that completion had been withheld from a
@@ -2341,7 +2436,7 @@ def link_activity(
     result: dict[str, Any] = {
         "linked": True,
         "planned_workout": _planned_summary(stored or {}),
-        "activity": _project(chosen, _ACTIVITY_OUT_FIELDS),
+        "activity": _activity_out(chosen),
         "activity_load": load,
         "next_step": (
             "Call compliance_report to compare what was prescribed against what was ridden."
@@ -2505,7 +2600,8 @@ def update_planned_workout(
         updates["pushed_to"] = _one_of(pushed_to, PUSH_TARGETS, "pushed_to")
     blanked = _stage_text(updates, {"note": note})
     if linked_activity_id is not None:
-        updates["linked_activity_id"] = int(linked_activity_id)
+        # linked_activity_id=[1] was a bare TypeError escaping _coach.
+        updates["linked_activity_id"] = _whole_number(linked_activity_id, "linked_activity_id")
     # After every field is staged, so that asking to set and to clear the same
     # one is caught as the contradiction it is rather than silently resolved by
     # whichever line ran last.
@@ -2549,14 +2645,41 @@ def update_planned_workout(
             and "status" not in updates
             and row["status"] == "completed"
         )
+        status_recorded = False
         if status_reverted:
-            # `link_activity` auto-completes from `pushed` as well as `planned`
-            # (AUTO_COMPLETABLE_STATUSES) — reverting a session that was
-            # `pushed` always to `planned` claimed "written, not sent
-            # anywhere" while the workout still sat on the head unit, and a
-            # later push flow re-uploaded a duplicate.
-            reverted_status = "pushed" if row["pushed_to"] else "planned"
+            if row["pre_link_status"] is not None:
+                # `link_activity` recorded the exact status it auto-completed
+                # FROM. Reading it back beats re-deriving a guess from
+                # `pushed_to`, which cannot tell "never pushed" apart from
+                # "pushed, then walked back to planned" (pushed_to lingers —
+                # it is not clearable), and cannot see a status the coach
+                # changed by hand after the link. Cleared in the same UPDATE:
+                # it is only ever evidence about the link that is now undone.
+                reverted_status = row["pre_link_status"]
+                updates["pre_link_status"] = None
+                status_recorded = True
+            else:
+                # Legacy row, linked before this column existed: fall back to
+                # the old inference. Read the value THIS call is staging, not
+                # the pre-update row — `update_planned_workout(pushed_to=...,
+                # clear=["linked_activity_id"])` in one call must see the
+                # pushed_to it is itself writing, not the NULL it replaces.
+                staged_pushed_to = updates.get("pushed_to", row["pushed_to"])
+                reverted_status = "pushed" if staged_pushed_to else "planned"
             updates["status"] = reverted_status
+
+        # `pre_link_status` is only ever evidence about the link this call just
+        # cleared, so it goes stale the moment `linked_activity_id` does —
+        # whether or not this same call also reverted `status`. Left behind on
+        # an explicit-`status` unlink (or on clearing a link that never
+        # auto-completed), a later link-then-unlink cycle with no explicit
+        # status could read it back as if it described the wrong link, under
+        # the stronger "the same way link_activity set it" wording that record
+        # cannot stand behind. Cleared here unconditionally instead, once per
+        # clear; the `status_reverted` branch above may have already staged
+        # this same None, which is harmless.
+        if "linked_activity_id" in cleared and row["pre_link_status"] is not None:
+            updates["pre_link_status"] = None
 
         assignments = ", ".join(f"{key} = ?" for key in updates)
         conn.execute(
@@ -2571,7 +2694,10 @@ def update_planned_workout(
 
     result: dict[str, Any] = {
         "updated": True,
-        "updated_fields": sorted(updates),
+        # `pre_link_status` excluded: it is bookkeeping for the next unlink,
+        # not a field any read surface exposes, so naming it here would tell a
+        # caller nothing they could look up or act on.
+        "updated_fields": sorted(key for key in updates if key != "pre_link_status"),
         "planned_workout": _planned_summary(stored or {}),
         **_clear_notes(cleared, blanked, CLEARABLE_PLANNED_FIELDS),
     }
@@ -2583,12 +2709,16 @@ def update_planned_workout(
             "otherwise nothing distinguishes a session on the head unit from one in MyWhoosh."
         )
     if status_reverted:
+        tail = (
+            "— the same way link_activity set it, undone."
+            if status_recorded
+            else "(inferred from pushed_to; the pre-link status was not recorded)."
+        )
         result["status_reverted_note"] = (
             f"linked_activity_id was cleared with no explicit status, so status reverted from "
-            f"completed to {reverted_status} — the same way link_activity set it, undone. A "
-            "completed session with no ride at all would otherwise be invisible to both "
-            "deviation lists in get_week. Pass status explicitly ('missed', 'skipped') if that "
-            "is what actually happened."
+            f"completed to {reverted_status} {tail} A completed session with no ride at all "
+            "would otherwise be invisible to both deviation lists in get_week. Pass status "
+            "explicitly ('missed', 'skipped') if that is what actually happened."
         )
     return result
 
@@ -2654,7 +2784,7 @@ def get_week(
         activities = []
         for row in activity_rows:
             assert row is not None
-            entry = _project(row, _ACTIVITY_OUT_FIELDS)
+            entry = _activity_out(row)
             entry["load"] = _activity_load(history, row).as_dict()
             activities.append(entry)
 
@@ -2892,9 +3022,12 @@ def compute_load(
                     "name": activity["name"],
                     "sport": activity["sport"],
                     "duration": format_duration_or(activity["duration_s"], "unknown"),
-                    "normalized_power": activity["normalized_power"],
-                    "avg_power": activity["avg_power"],
-                    "avg_hr": activity["avg_hr"],
+                    # Through `_positive`, same as every other display surface —
+                    # a placeholder 0 or a bad negative datum must not sit next
+                    # to a null TSS as if it were a real reading.
+                    "normalized_power": _positive(activity["normalized_power"]),
+                    "avg_power": _positive(activity["avg_power"]),
+                    "avg_hr": _positive(activity["avg_hr"]),
                     **load.as_dict(),
                 }
             )
@@ -3227,7 +3360,7 @@ def compliance_report(
             )
         activity = _find_activity(conn, athlete_id, target_id, None)
         laps = [
-            _project(row, _LAP_OUT_FIELDS)
+            _lap_out(row)
             for row in conn.execute(
                 "SELECT * FROM activity_laps WHERE activity_id = ? ORDER BY lap_index",
                 (activity["id"],),
@@ -3275,7 +3408,7 @@ def compliance_report(
     # whole planned session shorter than planned. A deviation nobody rode is
     # worse than no answer.
     actual_seconds = _positive(activity.get("duration_s"))
-    actual_np = activity.get("normalized_power") or activity.get("avg_power")
+    actual_np = _positive(activity.get("normalized_power")) or _positive(activity.get("avg_power"))
     summary_sentences: list[str] = [
         f"Planned {format_duration(planned_seconds)} at IF "
         f"{metrics.intensity_factor:.2f} (NP {metrics.normalised_power} W, "

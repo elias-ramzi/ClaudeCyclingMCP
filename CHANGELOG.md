@@ -24,14 +24,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Schema v7**: `planned_workouts.pre_link_status` records the status `link_activity` auto-completed
+  a session FROM, so unlinking it can revert to a recorded fact — see Fixed, below.
 - **Schema v6, and a `sqlite_sequence` guard in `migrate()` itself.** Migration 5's table rebuild
   (`DROP TABLE food_log` + rename) discarded `food_log`'s AUTOINCREMENT high-water mark, so an id
   deleted at the pre-migration tail could be handed out again — and a stale reference (a queued
   `edit_log_entry`) would then silently edit a different, newer entry. `migrate()` now snapshots
   `sqlite_sequence` before any pending migration runs and restores every mark a migration left
-  lower, covering all future rebuilds by construction; migration 6 re-establishes the floor for a
-  database that reached v5 before the guard existed. Migration 5 itself is unchanged
-  (append-only) and its exact statements are now pinned byte-for-byte by a test.
+  lower, covering all future rebuilds by construction; this is what protects a database migrating
+  from v4 or earlier, because it captures the sequence before migration 5's DROP ever runs.
+  Migration 6 itself turns out to be a no-op on every real v5 database — migration 5's own copy
+  already leaves the mark where it needs to be — and is kept only as a tombstone for the loss
+  window that predates the guard, plus cover for a hypothetical future rebuild that drops a
+  table's sequence row outright. Migration 5 itself is unchanged (append-only) and its exact
+  statements are now pinned byte-for-byte by a test.
 - **Shared vocabulary moved to `training.py`**: `NON_STARTING_EVENT_STATUSES`, `_dict` and `_text`
   now have one definition each, imported by `coach.py` and `nutrition.py` instead of duplicated;
   `coach.NON_STARTING_EVENT_STATUSES` remains as a pinned re-export for existing importers.
@@ -53,20 +59,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `OverflowError` that killed every valid ride in the same call. All three now reject the one row,
   naming the field and the value; lap values fold to None instead, because laps are never rejected.
   A decimal-comma figure (`232,5`) still parses, and a large-but-finite value still imports.
+- **`normalize_lap`'s `avg_hr`/`max_hr` no longer lose SQLite's own largest storable integer.** The
+  activity path already range-checks an int payload value as itself rather than through
+  `round(_number(value))` (see the 0.3.0 entry above); the lap path had the identical float
+  round-trip — `float(2**63 - 1)` rounds up to `2**63`, one float-ulp over SQLite's signed-64-bit
+  `INTEGER` max — silently thinning the largest storable `avg_hr`/`max_hr` to `None` instead of
+  storing it. Both call sites now agree.
 - **A placeholder zero from a no-strap or no-meter ride is no longer shown as a measurement.**
   `compliance_report`'s `actual` normalized/average power and average HR, and `compare_block`'s
   per-lap average HR, now route through `_positive` — `avg_hr: 0` used to sit beside a `reason`
   saying the ride carried no heart rate at all. A `link_activity` candidate with a negative stored
   duration no longer carries a confident nonsense `duration_delta_s`.
-- **Retracting a legacy zero finish time reverts the race's status.** The retraction gate read
-  truthiness, so a `finish_time_s = 0` stored by a pre-0.3.0 release counted as "nothing held" and
-  `completed` stood over no result; the gate is now `is not None`, and `status_reverted_note`
-  names only the fields the call actually cleared, not the fixed three.
-- **Unlinking a session that was pushed no longer claims it was never sent.**
-  `update_planned_workout(clear=["linked_activity_id"])` with no explicit status reverts
-  `completed` back to `pushed` when the row records a platform, instead of always to `planned` —
-  which read as "written, not sent anywhere" while the workout sat on the head unit, inviting a
-  duplicate re-push.
+- **A negative stored power or HR reading is no longer a confident load figure.**
+  `compute_activity_load` now routes normalized power, average power and average HR through
+  `_positive` before choosing a method, so `avg_hr: -150` or `avg_power: -50` makes that method
+  unavailable and the ride falls through to the next one, or to the existing null-TSS-with-reason
+  path — a stored `avg_power: -50` against a real FTP used to score a confident TSS with intensity
+  factor -0.2. Every display surface that projects an activity row now agrees with this: a new
+  `_activity_out` wrapper routes `avg_hr`/`max_hr`/`avg_power`/`max_power`/`normalized_power`
+  through `_positive` at every `_project(row, _ACTIVITY_OUT_FIELDS)` call site (`list_activities`,
+  `link_activity`, `import_activities`, `annotate_activity`, and the rest), `compute_load`'s
+  hand-built rows do the same, and `compliance_report`'s summary sentence now agrees with its own
+  `actual` dict instead of printing a raw negative wattage ("rode ... at -50 W"). The same defect
+  existed one level down, at the two surfaces that echo a stored *lap* rather than an activity: a
+  new `_lap_out` wrapper routes a lap's `avg_power`/`max_power`/`normalized_power`/`avg_hr`/`max_hr`
+  through `_positive` at both `import_activity_laps` and `compliance_report`'s `laps`, leaving
+  `duration_s` (and the rest of the non-measured fields) raw so `laps_missing_duration` and the
+  overshoot/shortfall check keep seeing the stored value.
+- **Retracting a legacy zero finish time reverts the race's status, from every angle now.**
+  Round 8 fixed the `retracted_fields` gate's truthiness bug; `no_result_left` right beside it still
+  read truthiness, so `record_race_result(id, clear=["debrief"])` against a legacy row carrying
+  `finish_time_s = 0` (storable before the `<= 0` refusal existed) miscounted the surviving zero as
+  "nothing held" and reverted `completed` to `upcoming` while leaving that zero stored. Both gates
+  now share one `is not None` predicate over `CLEARABLE_RESULT_FIELDS`. Corollary: a legacy
+  empty-string `debrief` (this server never writes one — blank text is skipped) now counts as a
+  surviving result too, so clearing the other fields off such a row keeps its status; the
+  conservative direction, matching the retracted-fields convention.
+- **Unlinking a session that was pushed no longer claims it was never sent — and now says so from a
+  recorded fact, not a guess.** `link_activity` records `pre_link_status` (schema v7) — the exact
+  status it auto-completed a session FROM — and `update_planned_workout`'s unlink revert reads it
+  back directly instead of re-deriving a guess from `pushed_to`, which could not tell "never pushed"
+  apart from "pushed, then walked back to `planned`" (`pushed_to` lingers; it is not clearable), and
+  could not see a status changed by hand after the link. A row linked before v7 has no recorded
+  value and falls back to the old `pushed_to` inference — reading the value the *current* call is
+  itself staging, not the pre-update row, so `update_planned_workout(pushed_to="garmin",
+  clear=["linked_activity_id"])` in one call sees its own new `pushed_to` — and
+  `status_reverted_note` is softened to say the status was inferred rather than recorded.
+  `pre_link_status` is now cleared whenever `linked_activity_id` is cleared, not only on the
+  auto-revert branch — an unlink that passed `status` explicitly used to leave the recorded value
+  behind, stale evidence a later link-then-unlink cycle with no explicit status could read back
+  under the stronger "recorded" wording it no longer supported. It is also left out of
+  `updated_fields`: no read surface exposes the column, so naming it there told a caller nothing
+  they could act on.
 - **A blank text field no longer erases what it touches in the nutrition layer.**
   `update_ingredient(note="")` (and `portion_label`) and `edit_log_entry(note="")` used to write
   NULL over the stored value with nothing in the response saying so; a blank is now skipped and
@@ -78,11 +122,104 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   omission, and `portions: 0` omits an ingredient without requiring it to carry a stored default
   portion — `_quantity` grew `allow_zero`, used by the override loop and nothing else, so a stray
   `grams: 0` everywhere else still reads as "someone forgot the weight".
-- **`list_activities(limit=None)` is a refusal naming the field**, not a bare `TypeError` outside
-  `_coach`'s handler set.
+- **`list_activities`' `limit` coercion is refused, not crashed or silently truncated.**
+  `limit=None` was already a refusal naming the field rather than a bare `TypeError` outside
+  `_coach`'s handler set; `limit=float("inf")` raised an `OverflowError` — inside `_coach`'s catch
+  tuple, but surfacing as its backstop message naming no field — a
+  non-integral float (`limit=1.9`) silently truncated to `1` row with `truncated=True` instead of
+  being refused, and `limit=True` (bool is an `int` subclass) was silently accepted as `1`. All
+  four are now refusals, and every refusal reports the value as given — `limit=0.5` used to say
+  "got 0" (the value after truncation); it now says "got 0.5". Plain ints, integral floats
+  (`10.0`), and integer strings (`"10"`) keep working. The overflow guard has moved rather than
+  closed once already: the query binds `limit + 1` (the extra row that makes `truncated` a fact
+  instead of a guess), so any `limit` at or above SQLite's signed-64-bit bound
+  (`2**63 - 1`) still raised a bare `OverflowError` out of `conn.execute` one line past the new
+  guard. `list_activities` now refuses above `2**63 - 2` directly, naming the value given.
+  `nutrition.search_ingredients`' own `limit` had the identical unfixed defect
+  (`max(1, int(limit))`: `None` escaped as a bare `TypeError`, `float("inf")` fell to `_coach`'s
+  `OverflowError` backstop with no field named, `1.9`/`True`/`0`/`-1` coerced silently) and is now
+  refused the same way, as a `NutritionError`.
+- **The same unfixed whole-number defect survived one function over, twice, in `coach.py`:
+  `annotate_activity`'s `rpe`, `update_profile`'s `birth_year`, and `update_planned_workout`'s
+  `linked_activity_id` each did a bare `int(value)`.** `rpe=True` stored as `1` (the exact
+  bool-as-int defect `list_activities`' own fix refused), `rpe=9.7` silently truncated to `9` — a
+  wrong RPE that looks entirely reasonable and feeds straight into coaching judgement — and
+  `rpe=[1]` escaped as a bare `TypeError` outside `_coach`'s catch tuple while `rpe=float("inf")`
+  fell to its `OverflowError` backstop with no field named. `birth_year=[1]` and
+  `linked_activity_id=[1]` had the same bare-`TypeError` escape.
+  All four now refuse through one extracted coercer, `training.whole_number` (wrapped as
+  `coach._whole_number` / already-existing `nutrition._coerce_limit`), rather than each caller
+  growing its own copy — `list_activities`' `limit` and `search_ingredients`' `limit` route through
+  it too. The coercer only guarantees a genuine whole number; the minimum-of-1 and
+  SQLite-int64-upper-bound checks stay with `list_activities`/`search_ingredients`, since a minimum
+  or an upper bound is each caller's own business, not a property of "whole number" in general.
+- **The same bare-coercion class survived in `float()` form, eight call sites over.** `TypeError`
+  is not in `_coach`'s catch tuple, so `update_profile(height_cm=[1])` — two lines above the
+  `birth_year` fix — `log_ftp(twenty_min_watts=[1])` / `(value_watts=[1])`,
+  `log_hr(threshold_hr=[1])`, and `add_event`/`update_event`'s `distance_km`/`elevation_m` each
+  escaped as a bare `TypeError: float() argument…` instead of a refusal naming the field. All
+  eight now route through one extracted coercer, `training.real_number` (wrapped as
+  `coach._real_number`), the float twin of `whole_number`; `log_weight` — whose inline guard was
+  the original of the shape — is refactored onto it rather than surviving as a ninth copy.
+  Booleans are refused too: `distance_km=True` used to store a silent 1 km, since distance has no
+  range check to catch `float(True)`.
+- **`row_flags` reads through the placeholder rule the read surfaces apply.** After this round
+  routed the `_activity_out` projection through `_positive`, a ride imported with `avgPower: -50`
+  showed `avg_power: null` beside `flags: []` in the same response dict — and with average power
+  but placeholder NP, `no_normalized_power` claimed "average power is usable" while the projection
+  denied it. `duration_s`, `avg_power` and `normalized_power` now pass through `_positive` before
+  the flag tests, so the flags and the nulled fields tell one story about one row.
 - **`import_activities`' `flags_note` now explains `no_utc_time`** (the ride has nothing to break
   ties against same-date rides), and `get_form`'s unscored warning describes what is actually
   counted — a ride capped out of the run-up is excluded, as the round-7 cap already made true.
+- **A blank or empty `aliases` on `update_ingredient` no longer erases every stored alias.**
+  `update_ingredient(aliases="")` (or `aliases=[]`) used to re-serialise straight to `[]` with
+  nothing in the response saying so — the same blank-erases-stored-value defect round 8 fixed for
+  `note`/`portion_label`, alive one field over, and every future `log_food`/`search_ingredients`
+  lookup by that alias then refused with near-matches. A blank is now skipped and reported in
+  `ignored_blank_fields`, and `aliases` is added to `CLEARABLE_INGREDIENT_FIELDS` —
+  `clear=["aliases"]` is now the one deliberate path to an empty alias list, the same as every
+  other clearable field.
+- **A blank `new_name` on `update_ingredient` no longer reports a rename that never happened.**
+  `new_name="  "` folds away inside the shared field validator, which then falls back to the
+  ingredient's existing name — so `name`/`name_key` came back in `updated_fields` unchanged, and
+  the row was rewritten to itself. A blank `new_name` is now skipped and named in
+  `ignored_blank_fields`, the same as every other blank text field here.
+- **`confirm_targets`' summed-exercise gate is checked against what is actually being filed, not
+  against the suggestion alone.** The gate used to fire on `exercise_source ==
+  "imported_activity+planned_workout"` before consulting the day's own `kcal`/`protein_g`/`fiber_g`
+  overrides, so a fully explicit target — one that touches none of the suggestion's figures, summed
+  exercise included — was refused anyway, and `exercise_kcal_override`'s "pass kcal, protein_g and
+  fiber_g explicitly to file a target anyway" advice ten lines up did not actually work.
+  `accepted_summed_exercise_note` is now conditional on the summed figure actually being filed (only
+  when `kcal` itself was *not* given explicitly) — it used to appear whenever
+  `accept_summed_exercise=true` was passed, even alongside a fully explicit `kcal` that the sum
+  played no part in. And the per-day `accept_summed_exercise` coercion is now read on every day, not
+  only inside the gated branch, so a malformed value (e.g. a typo'd string) refuses instead of being
+  silently swallowed on a day the gate never looked at. The gate itself now keys off `kcal` alone
+  rather than requiring all three filed values explicit: `protein_g` depends only on weight x
+  protein_g_per_kg and `fiber_g` only on day_type, neither ever carries the summed exercise figure,
+  so a call giving `kcal` explicitly and leaving one of the other two to the suggestion used to be
+  refused over a summed figure the row being filed did not contain.
+- **A missing-suggestion day filed with explicit values no longer claims a suggestion it never
+  computed.** When no target could be suggested (an incomplete profile) and the caller filed
+  `kcal`/`protein_g`/`fiber_g` explicitly anyway, `confirm_targets` reported `overrode: {"kcal": 0,
+  "protein_g": 0, "fiber_g": 0}` — the placeholder used internally so the fallback lookups have
+  something to read, not a real figure. That entry is now `overrode_note`, explaining that no
+  suggestion existed to compare against, whenever there is nothing real to report an override
+  against.
+- **`{"grams": 0, "portions": 0}` on a `log_meal` override no longer refuses as a contradiction.**
+  Both are the same "leave this ingredient out today" instruction under `allow_zero` — two
+  agreeing zeros, not a disagreement — so the both-given refusal's own "they disagree by
+  definition" was false for this one case. Unequal values (`{"grams": 0, "portions": 1}`) are still
+  refused as a genuine conflict, and every caller outside `log_meal`'s override loop is unaffected.
+- **A Garmin import's out-of-range `avg_hr`/`max_hr` refusal now names the value the payload
+  actually sent, and no longer rejects SQLite's own largest storable integer.** The message used
+  to report `round(_number(value))` — a float round-trip that rounds `2**63 - 1` (exactly SQLite's
+  signed-64-bit `INTEGER` max) up to `2**63`, one float-ulp over the line, rejecting the very value
+  the guard exists to admit. An int payload value is now range-checked as itself; the reason string
+  now names `values[field]` as given, not the rounded float, since the two can differ by more than
+  rounding once a value is this large.
 
 ## [0.3.0] - 2026-08-24
 

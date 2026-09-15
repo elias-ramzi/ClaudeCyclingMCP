@@ -451,27 +451,42 @@ def _migrate_5_food_log_nullable_macros() -> list[str]:
 
 
 def _migrate_6_food_log_sequence() -> list[str]:
-    """Best-effort floor for a database that reached v5 before `migrate()`
-    grew its own `sqlite_sequence` snapshot/restore guard.
+    """Tombstone for the pre-guard loss window. Changes no id assignment on
+    any database this migration actually runs against.
 
     Migration 5's rebuild (see its own docstring — it is append-only and
-    stays exactly as it ran) does not carry `food_log`'s AUTOINCREMENT
-    high-water mark forward: `DROP TABLE food_log` deletes that mark, and the
-    rename hands the rebuilt table only `MAX(id)` of whatever survived the
-    copy. For a database that ran migration 5 *before this version existed*,
-    the mark lost at that moment cannot be recovered here — an id deleted at
-    the pre-migration tail may already have been handed out again to
-    something newer by the time this runs. This migration only re-establishes
-    the floor going forward, so nothing has an id *lower* than what is
-    already on disk; it is `migrate()`'s snapshot/restore guard that actually
-    protects a database migrating from v4 or earlier, where the pre-DROP mark
-    is still visible to catch.
+    stays exactly as it ran) leaves `sqlite_sequence` exactly where it needs
+    to be on every real v5 database: `INSERT ... SELECT` into `food_log_v5`
+    writes that table's own `sqlite_sequence` row as it runs (even when it
+    copies zero rows), so after the copy `seq == MAX(id)` of `food_log_v5`
+    *by construction* — whether or not the pre-DROP mark on the old
+    `food_log` was higher, which is exactly the loss the next paragraph
+    covers. `ALTER TABLE ... RENAME` then carries that row across untouched
+    — only `DROP TABLE` deletes a `sqlite_sequence` row, and the DROP here
+    targets the old `food_log`, not the renamed `food_log_v5`. `seq ==
+    MAX(id)` is precisely the condition both statements below test for
+    (`NOT EXISTS` a row, or `seq < MAX(id)`), so on any database that
+    reaches this migration, neither one fires.
 
-    Pure SQL and idempotent, since a migration only ever runs once per
-    database anyway: insert the row if `food_log` has never had one (a table
-    that autoincrement-numbered rows once but the row was itself lost some
-    other way), else raise it to the table's own current `MAX(id)` if that
-    reads higher than what is stored.
+    They would still change no id assignment even in a database where the
+    row somehow read absent or low, because SQLite's own AUTOINCREMENT
+    allocation is `max(sqlite_sequence.seq, MAX(rowid)) + 1` regardless of
+    what the table says — the next id handed out is identical whether or not
+    this migration runs. What this migration cannot do, and could never have
+    done, is recover an id from the actual loss window: a row deleted from
+    `food_log` before `migrate()` grew its own snapshot/restore guard had its
+    id handed out again the moment migration 5's rebuild ran, and that
+    reassignment is long since committed by the time any later migration
+    could look. It is `migrate()`'s snapshot/restore guard — which captures
+    `sqlite_sequence` *before* migration 5's DROP — that protects a database
+    migrating from v4 or earlier; this migration runs after the fact and has
+    nothing left to catch.
+
+    Pure SQL and idempotent regardless (a migration only ever runs once per
+    database anyway). Its INSERT arm is dead code against every state above —
+    kept only as a guard for a hypothetical future rebuild that drops a
+    table's `sqlite_sequence` row entirely outside `migrate()`'s own
+    bracketing guard.
     """
     return [
         "INSERT INTO sqlite_sequence (name, seq) "
@@ -483,6 +498,23 @@ def _migrate_6_food_log_sequence() -> list[str]:
     ]
 
 
+def _migrate_7_pre_link_status() -> list[str]:
+    """`planned_workouts.pre_link_status`: the status `link_activity` auto-
+    completed FROM, so unlinking can revert to it directly instead of
+    re-deriving a guess from `pushed_to`.
+
+    `pushed_to` lingering after a session is walked back to `planned`, or
+    left NULL on a session that was genuinely `pushed`, made the old
+    inference wrong in both directions — and a session pushed *after* being
+    linked read the pre-update NULL and reverted to `planned` under a note
+    claiming the workout was never sent anywhere. Recording the real value at
+    link time removes the guess entirely; a row linked before this migration
+    has NULL here and the caller falls back to the old inference, softening
+    the claim it can no longer back up.
+    """
+    return ["ALTER TABLE planned_workouts ADD COLUMN pre_link_status TEXT"]
+
+
 MIGRATIONS: list[tuple[int, Callable[[], list[str]]]] = [
     (1, _migrate_1_training_log),
     (2, _migrate_2_plan_and_debrief),
@@ -490,6 +522,7 @@ MIGRATIONS: list[tuple[int, Callable[[], list[str]]]] = [
     (4, _migrate_4_nutrition),
     (5, _migrate_5_food_log_nullable_macros),
     (6, _migrate_6_food_log_sequence),
+    (7, _migrate_7_pre_link_status),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -238,11 +238,19 @@ def test_a_v4_database_without_deletions_does_not_inflate_the_next_id(db):
 
 
 def test_a_v4_database_with_every_food_log_row_deleted_still_restores_the_floor(db):
-    """The INSERT branch of `_restore_sqlite_sequence_floor`: when every
-    `food_log` row is deleted before migrating, migration 5's rebuild copies
-    zero rows, and the RENAME hands the rebuilt table no `sqlite_sequence` row
-    at all (not merely a low one) — the guard's `row is None` branch is what
-    reinstates it, rather than the `UPDATE` branch exercised above."""
+    """Not the guard's own INSERT branch: when every `food_log` row is
+    deleted before migrating, migration 5's rebuild copies zero rows — but
+    its `INSERT ... SELECT` still writes `food_log_v5`'s own
+    `sqlite_sequence` row as it runs, at seq 0, and the RENAME carries that
+    row across. So the row is present-but-zero, not absent, by the time
+    migration 6 looks, and migration 6 finds nothing to do: its INSERT's
+    `NOT EXISTS` is false (the row exists) and its UPDATE's `seq < MAX(id)`
+    is `0 < 0` (see its own docstring). What raises that seq-0 row back to
+    the pre-migration snapshot (3) is `migrate()`'s own guard, via its
+    `UPDATE` branch — the same branch exercised above, just reached through
+    a lower starting point. The guard's `row is None` branch is unreachable
+    through the registered migration list; it is pinned directly by
+    test_restore_sqlite_sequence_floor_inserts_a_missing_row."""
     _build_v4(db)
     conn = sqlite3.connect(db, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -259,6 +267,45 @@ def test_a_v4_database_with_every_food_log_row_deleted_still_restores_the_floor(
     with store.open_db() as conn:
         new_id = _insert_food_log(conn, "new item")
     assert new_id == 4
+
+
+def test_restore_sqlite_sequence_floor_inserts_a_missing_row(db):
+    """The guard's own `row is None` branch, direct and unforced: a table
+    that exists but carries no `sqlite_sequence` row at all gets one created
+    at exactly the snapshotted floor. Unreachable through the registered
+    migration list — migration 5's own zero-row `INSERT ... SELECT` already
+    leaves the row in place (at seq 0; see the test above), so nothing
+    downstream ever sees it absent — so the row is removed by hand before
+    calling `_restore_sqlite_sequence_floor` directly."""
+    with store.open_db() as conn:
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'food_log'")
+        assert (
+            conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'food_log'").fetchone()
+            is None
+        )
+        store._restore_sqlite_sequence_floor(conn, {"food_log": 5})
+        seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'food_log'").fetchone()[
+            "seq"
+        ]
+    assert seq == 5
+
+
+def test_restore_sqlite_sequence_floor_never_lowers_an_existing_row(db):
+    """Just outside the guard: the guard is `row["seq"] < seq`, so its
+    boundary is equality (pinned end-to-end by
+    test_a_v4_database_without_deletions_does_not_inflate_the_next_id). One
+    below that — a snapshotted floor (2) one less than what is already
+    stored (3) — must not move the stored seq down; the floor only ever
+    rises."""
+    with store.open_db() as conn:
+        _insert_food_log(conn, "item 1")
+        _insert_food_log(conn, "item 2")
+        _insert_food_log(conn, "item 3")
+        store._restore_sqlite_sequence_floor(conn, {"food_log": 2})
+        seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'food_log'").fetchone()[
+            "seq"
+        ]
+    assert seq == 3
 
 
 def test_the_sequence_guard_leaves_untouched_tables_alone(db):
@@ -334,9 +381,9 @@ def test_migration_5_statements_are_byte_identical():
     ]
 
 
-def test_migration_6_is_registered_and_current_version_follows():
-    assert store.MIGRATIONS[-1][0] == 6
-    assert store.CURRENT_SCHEMA_VERSION == 6
+def test_migration_7_is_registered_and_current_version_follows():
+    assert store.MIGRATIONS[-1][0] == 7
+    assert store.CURRENT_SCHEMA_VERSION == 7
 
 
 def test_migration_6_is_a_no_op_on_a_database_already_correct(db):
@@ -350,6 +397,42 @@ def test_migration_6_is_a_no_op_on_a_database_already_correct(db):
             "seq"
         ]
     assert seq == 1
+
+
+def _build_v6(path):
+    """A database as it stands after the first six migrations and nothing
+    else — the pinned starting point for the v6-to-v7 upgrade test below."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    store.schema_version(conn)
+    for version, statements in store.MIGRATIONS[:6]:
+        for statement in statements():
+            conn.execute(statement)
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, '2026-01-01T00:00:00Z')",
+            (version,),
+        )
+    conn.close()
+
+
+def test_a_v6_database_migrating_to_v7_gains_a_nullable_pre_link_status_column(db):
+    _build_v6(db)
+    conn = sqlite3.connect(db, isolation_level=None)
+    conn.execute(
+        "INSERT INTO planned_workouts (athlete_id, spec_json, scheduled_date, status, "
+        "created_at, updated_at) VALUES (1, '{}', '2026-06-01', 'planned', ?, ?)",
+        (_NOW, _NOW),
+    )
+    conn.commit()
+    conn.close()
+
+    with store.open_db() as conn:
+        assert store.schema_version(conn) == store.CURRENT_SCHEMA_VERSION
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(planned_workouts)")}
+        assert "pre_link_status" in columns
+        row = conn.execute("SELECT * FROM planned_workouts").fetchone()
+        assert row["pre_link_status"] is None
 
 
 def test_an_unreachable_location_is_refused_with_the_path_and_the_env_var(tmp_path, monkeypatch):

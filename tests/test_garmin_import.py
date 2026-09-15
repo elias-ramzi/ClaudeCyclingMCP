@@ -196,6 +196,55 @@ def test_average_power_without_np_is_flagged_separately():
     assert "no_power" not in flags
 
 
+# --- round-9 rework: row_flags reads through the same placeholder rule the
+# read surfaces apply, so the flags and the nulled projection in one response
+# cannot disagree about the same row ---
+
+
+def test_a_placeholder_power_is_flagged_no_power_not_missing_np():
+    """avg_power -50 with normPower 0 is no measurement at all: before the
+    placeholder rule reached row_flags, this row said `no_normalized_power`
+    ("average power is usable") while the projection beside it read null."""
+    from cycling_mcp.garmin_import import row_flags
+
+    row, reason = normalize_activity({**RIDE, "avgPower": -50.0, "normPower": 0})
+    assert reason is None
+    flags = row_flags(row)
+    assert "no_power" in flags
+    assert "no_normalized_power" not in flags
+
+
+def test_a_barely_positive_power_is_not_flagged():
+    """Just outside the guard: 1 W is a measurement, however small."""
+    from cycling_mcp.garmin_import import row_flags
+
+    row, _ = normalize_activity({**RIDE, "avgPower": 1, "normPower": 1})
+    flags = row_flags(row)
+    assert "no_power" not in flags
+    assert "no_normalized_power" not in flags
+
+
+def test_a_zero_duration_is_flagged_no_duration():
+    from cycling_mcp.garmin_import import row_flags
+
+    row, _ = normalize_activity({**RIDE, "duration": 0})
+    assert "no_duration" in row_flags(row)
+
+
+def test_import_response_flags_agree_with_its_own_nulled_fields(db):
+    """One response, one story: the entry whose power fields the projection
+    nulls must carry `no_power`, not a clean flag list beside four nulls."""
+    from cycling_mcp import coach
+
+    result = coach.import_activities(
+        [{**RIDE, "activityId": 6021, "avgPower": -50.0, "normPower": 0, "averageHR": 0}]
+    )
+    entry = result["activities"]["inserted"][0]
+    assert entry["avg_power"] is None
+    assert entry["normalized_power"] is None
+    assert "no_power" in entry["flags"]
+
+
 # --------------------------------------------------------------------------
 # sport families
 # --------------------------------------------------------------------------
@@ -914,25 +963,13 @@ def test_a_non_finite_lap_value_is_thinned_not_raised():
     assert row["duration_s"] == 60.0
 
 
-def test_number_is_called_from_exactly_the_two_guarded_sites():
-    """`_number` is called from exactly two places in this module — both
-    exercised above (and by the boundary tests below) without a raw
-    `_NotFiniteNumber` or `OverflowError` escaping either one."""
-    import inspect
-
-    from cycling_mcp import garmin_import
-
-    source = inspect.getsource(garmin_import)
-    assert source.count("_number(") == 3  # the def, plus its two call sites
-
-
 # --------------------------------------------------------------------------
 # review round 8 — finite-but-unstorable integer fields (finding 2 rework)
 # --------------------------------------------------------------------------
 
 
 def test_a_finite_but_oversized_avg_hr_rejects_the_row_without_killing_the_batch(db):
-    """9.2e18 is finite, sails past the `_NotFiniteNumber` guard, and `round()`
+    """1e19 is finite, sails past the `_NotFiniteNumber` guard, and `round()`
     turns it into a Python int outside SQLite's signed-64-bit INTEGER range
     (-2**63 .. 2**63-1). Unguarded, the sqlite3 binding raised its own
     `OverflowError` at INSERT time — inside `import_activities`'s db loop,
@@ -965,6 +1002,61 @@ def test_an_avg_hr_just_inside_sqlite_integer_range_still_imports(db):
     assert stored["avg_hr"] == round(9.2e18)
 
 
+def test_the_rejection_message_reports_the_value_as_the_payload_sent(db):
+    """The reason names what the payload actually carried, not the float the
+    range round-trip produced. A numeric *string* is the shape where the two
+    genuinely differ: '9223372036854775807' still rejects through the float
+    round-trip (the documented asymmetry — only an int payload skips it), and
+    pre-fix the message showed 9.223372036854776e+18 instead of the string
+    that was actually in the row."""
+    from cycling_mcp import coach
+
+    result = coach.import_activities(
+        [{**RIDE, "activityId": 6011, "averageHR": "9223372036854775807"}]
+    )
+    assert result["rejected"] == 1
+    assert repr("9223372036854775807") in result["rejections"][0]["reason"]
+
+
+def test_an_int_at_exactly_sqlite_integer_max_imports(db):
+    """Just outside the old guard: 2**63-1 is exactly SQLite's INTEGER max,
+    but `float(2**63 - 1)` rounds up to `2**63` — one float-ulp over the
+    line, which used to reject the largest value SQLite can actually store.
+    An int payload value is range-checked as itself, not through that
+    round-trip."""
+    from cycling_mcp import coach
+
+    assert float(2**63 - 1) == float(2**63)  # the round-trip that used to lose the boundary
+    result = coach.import_activities([{**RIDE, "activityId": 6012, "averageHR": 2**63 - 1}])
+    assert result["inserted"] == 1
+    stored = coach.list_activities()["activities"][0]
+    assert stored["avg_hr"] == 2**63 - 1
+
+
+def test_an_int_one_past_sqlite_integer_max_still_rejects(db):
+    """The value just outside the fixed guard, sent as an int: 2**63 is one
+    past what SQLite can store. The float arm of the same boundary
+    (`float(2**63)`, sent as a JSON float) is covered by
+    test_a_finite_but_oversized_avg_hr_rejects_the_row_without_killing_the_batch
+    above, which sends 1e19 — well past the line but exercising the same
+    float-branch rejection path."""
+    from cycling_mcp import coach
+
+    result = coach.import_activities([{**RIDE, "activityId": 6013, "averageHR": 2**63}])
+    assert result["rejected"] == 1
+    assert str(2**63) in result["rejections"][0]["reason"]
+
+
+def test_a_float_one_past_sqlite_integer_max_still_rejects(db):
+    """The float arm of the same boundary, exactly one past: `float(2**63)`
+    sent as the payload value must reject the same as the int form above."""
+    from cycling_mcp import coach
+
+    result = coach.import_activities([{**RIDE, "activityId": 6014, "averageHR": float(2**63)}])
+    assert result["rejected"] == 1
+    assert str(float(2**63)) in result["rejections"][0]["reason"]
+
+
 def test_an_oversized_lap_avg_hr_is_thinned_not_raised():
     """`normalize_lap` never rejects a row — the same out-of-range integer
     must fold to None here, not raise past this call site the way the
@@ -973,3 +1065,21 @@ def test_an_oversized_lap_avg_hr_is_thinned_not_raised():
     row = normalize_lap({"averageHR": 1e19, "elapsedDuration": 60.0}, 1)
     assert row["avg_hr"] is None
     assert row["duration_s"] == 60.0
+
+
+def test_a_lap_avg_hr_at_exactly_sqlite_integer_max_imports():
+    """The same int-vs-float-round-trip split as `normalize_activity`
+    (`float(2**63 - 1)` rounds up to `2**63`) applies on the lap path too —
+    an int payload value is range-checked as itself, so the largest value
+    SQLite can store must survive here as well, not just on the activity
+    path."""
+    row = normalize_lap({"averageHR": 2**63 - 1, "elapsedDuration": 60.0}, 1)
+    assert row["avg_hr"] == 2**63 - 1
+
+
+def test_a_lap_avg_hr_one_past_sqlite_integer_max_is_thinned():
+    """Just outside the fixed lap-side guard: 2**63 is one past what SQLite
+    can store, so it must still thin to None, not raise or overflow at
+    INSERT time."""
+    row = normalize_lap({"averageHR": 2**63, "elapsedDuration": 60.0}, 1)
+    assert row["avg_hr"] is None

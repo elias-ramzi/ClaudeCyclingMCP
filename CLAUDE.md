@@ -28,7 +28,7 @@ what the training tables say about that date.
 | `verify.py` | compare what a platform stored against what was sent: Garmin's returned payload, and MyWhoosh's scraped builder header. |
 | `store.py` | the SQLite database: where it lives, and the ordered migrations. The only module that touches state. |
 | `garmin_import.py` | normalise raw Garmin MCP payloads into stored rows. Pure — it reads what was pasted in. |
-| `training.py` | zones, TSS (power and HR), CTL/ATL/TSB, block-vs-lap comparison. Pure arithmetic over stored numbers. |
+| `training.py` | zones, TSS (power and HR), CTL/ATL/TSB, block-vs-lap comparison. Pure arithmetic over stored numbers. Also hosts the vocabulary and coercion helpers `coach.py` and `nutrition.py` both import — `NON_STARTING_EVENT_STATUSES`, `_dict`, `_text`, `_positive`, `whole_number`, `agree`, `one_of`, `plural`, `format_duration_or` — so a new one of these belongs here, not redefined in the module that first needs it. |
 | `coach.py` | the coaching operations: read and write the athlete's file, compute from it. |
 | `nutrition.py` | the food base, the log over it, and the target arithmetic. Every gram of it — the model never adds food up. |
 | `skills.py` | load `.claude/skills/*/SKILL.md` and serve them as MCP prompts. |

@@ -257,6 +257,94 @@ def test_an_rpe_outside_the_scale_is_refused():
         coach.annotate_activity(garmin_activity_id="5001", rpe=12)
 
 
+# --- round-9 rework: annotate_activity's rpe had the unfixed triplet of
+# list_activities' limit defect, one function over in the same file ---
+
+
+def test_annotate_activity_rpe_of_true_is_refused_not_silently_stored_as_one():
+    coach.import_activities([RIDE])
+    with pytest.raises(coach.CoachError, match="rpe"):
+        coach.annotate_activity(garmin_activity_id="5001", rpe=True)
+
+
+def test_annotate_activity_rpe_of_a_non_integral_float_is_refused_with_its_own_value():
+    coach.import_activities([RIDE])
+    with pytest.raises(coach.CoachError) as exc:
+        coach.annotate_activity(garmin_activity_id="5001", rpe=9.7)
+    assert "got 9.7" in str(exc.value)
+
+
+def test_annotate_activity_rpe_of_a_list_is_a_coach_error_not_a_bare_type_error():
+    coach.import_activities([RIDE])
+    with pytest.raises(coach.CoachError, match="rpe"):
+        coach.annotate_activity(garmin_activity_id="5001", rpe=[1])
+
+
+def test_annotate_activity_rpe_of_infinity_is_a_coach_error_not_a_bare_overflow_error():
+    coach.import_activities([RIDE])
+    with pytest.raises(coach.CoachError, match="rpe"):
+        coach.annotate_activity(garmin_activity_id="5001", rpe=float("inf"))
+
+
+def test_annotate_activity_rpe_boundaries_one_and_ten_are_still_accepted():
+    """Just outside the new whole-number guard: the ends of the 1-10 scale,
+    still accepted after routing rpe through the shared coercer."""
+    coach.import_activities([RIDE])
+    result = coach.annotate_activity(garmin_activity_id="5001", rpe=1)
+    assert result["stored"]["rpe"] == 1
+    result = coach.annotate_activity(garmin_activity_id="5001", rpe=10)
+    assert result["stored"]["rpe"] == 10
+
+
+# --- round-9 rework: the same bare-coercion class in float() form. TypeError
+# is not in _coach's catch tuple, so every tool that called float() on its own
+# argument crashed across the MCP boundary on a list instead of refusing ---
+
+
+@pytest.mark.parametrize(
+    ("call", "field"),
+    [
+        (lambda: coach.update_profile(height_cm=[1]), "height_cm"),
+        (lambda: coach.log_ftp(twenty_min_watts=[1]), "twenty_min_watts"),
+        (lambda: coach.log_ftp(value_watts=[1]), "value_watts"),
+        (lambda: coach.log_hr(threshold_hr=[1]), "threshold_hr"),
+        (lambda: coach.log_weight([1]), "value_kg"),
+        (lambda: coach.add_event("Race", FUTURE_EVENT_DATE, distance_km=[1]), "distance_km"),
+        (lambda: coach.add_event("Race", FUTURE_EVENT_DATE, elevation_m=[1]), "elevation_m"),
+    ],
+)
+def test_a_list_in_a_float_field_is_a_coach_error_naming_the_field(call, field):
+    with pytest.raises(coach.CoachError, match=field):
+        call()
+
+
+def test_update_event_float_fields_refuse_a_list_the_same_way():
+    event = coach.add_event("Race", FUTURE_EVENT_DATE)["stored"]
+    with pytest.raises(coach.CoachError, match="distance_km"):
+        coach.update_event(event["id"], distance_km=[1])
+    with pytest.raises(coach.CoachError, match="elevation_m"):
+        coach.update_event(event["id"], elevation_m=[1])
+
+
+def test_a_bool_distance_is_refused_not_stored_as_one_kilometre():
+    """`float(True)` is 1.0, and distance has no range check to catch it — a
+    bool used to become a silent 1 km ride profile."""
+    with pytest.raises(coach.CoachError, match="distance_km"):
+        coach.add_event("Race", FUTURE_EVENT_DATE, distance_km=True)
+
+
+def test_ordinary_floats_still_store_through_the_shared_coercer():
+    """Just outside the guard: real numbers in every routed field still land."""
+    assert coach.update_profile(height_cm=178.5)["athlete"]["height_cm"] == 178.5
+    assert coach.log_ftp(twenty_min_watts=280.0)["stored"]["value_watts"] == 266
+    assert coach.log_hr(threshold_hr=165.4)["stored"]["threshold_hr"] == 165
+    event = coach.add_event("La Bisou", FUTURE_EVENT_DATE, distance_km=148.0, elevation_m=2412.5)[
+        "stored"
+    ]
+    assert event["distance_km"] == 148.0
+    assert event["elevation_m"] == 2412.5
+
+
 # --------------------------------------------------------------------------
 # planning
 # --------------------------------------------------------------------------
@@ -439,19 +527,35 @@ def test_linking_a_ride_from_another_day_warns():
 
 
 def test_the_next_a_event_is_the_anchor_and_the_bs_are_not():
-    coach.add_event("Local crit", "2026-09-01", priority="B")
-    coach.add_event("La Grande", "2026-09-27", priority="A", distance_km=148, elevation_m=2412)
-    coach.add_event("Next year", "2027-06-01", priority="A")
-    listing = coach.list_events(today="2026-08-22")
+    """Dates are offsets from today, not hardcoded — a fixed date rots the
+    moment wall-clock 'today' passes it, and the event under test is then
+    born `completed` instead of `upcoming` (see `FUTURE_EVENT_DATE`,
+    above), which breaks these assertions for a reason that has nothing to
+    do with the code under test."""
+    today = date.today()
+    b_days = 10
+    a_days = 36
+    later_a_days = 400
+    coach.add_event("Local crit", (today + timedelta(days=b_days)).isoformat(), priority="B")
+    coach.add_event(
+        "La Grande",
+        (today + timedelta(days=a_days)).isoformat(),
+        priority="A",
+        distance_km=148,
+        elevation_m=2412,
+    )
+    coach.add_event("Next year", (today + timedelta(days=later_a_days)).isoformat(), priority="A")
+    listing = coach.list_events(today=today.isoformat())
     assert listing["next_a_event"]["name"] == "La Grande"
-    assert listing["weeks_to_next_a_event"] == pytest.approx(5.1, abs=0.05)
+    assert listing["weeks_to_next_a_event"] == pytest.approx(a_days / 7, abs=0.05)
 
 
 def test_past_and_upcoming_can_be_asked_for_separately():
+    today = date.today()
     coach.add_event("Last year", "2025-09-27", priority="A", status="completed")
-    coach.add_event("This year", "2026-09-27", priority="A")
-    assert coach.list_events("past", today="2026-08-22")["count"] == 1
-    assert coach.list_events("upcoming", today="2026-08-22")["count"] == 1
+    coach.add_event("This year", FUTURE_EVENT_DATE, priority="A")
+    assert coach.list_events("past", today=today.isoformat())["count"] == 1
+    assert coach.list_events("upcoming", today=today.isoformat())["count"] == 1
 
 
 def test_a_result_refuses_a_ride_from_the_wrong_day():
@@ -1555,6 +1659,22 @@ def test_an_empty_profile_field_does_not_erase_the_stored_one():
     assert result["ignored_blank_fields"] == ["availability"]
 
 
+# --- round-9 rework: update_profile's birth_year had the same unfixed
+# whole-number defect as annotate_activity's rpe ---
+
+
+def test_update_profile_birth_year_of_a_list_is_a_coach_error_not_a_bare_type_error():
+    with pytest.raises(coach.CoachError, match="birth_year"):
+        coach.update_profile(birth_year=[1990])
+
+
+def test_update_profile_birth_year_just_inside_the_range_is_still_accepted():
+    """Just outside the new whole-number guard: an ordinary year keeps
+    working after birth_year is routed through the shared coercer."""
+    result = coach.update_profile(birth_year=1990)
+    assert result["athlete"]["birth_year"] == 1990
+
+
 def test_logging_a_max_hr_does_not_hide_a_measured_threshold():
     """The zones keyed off what *this* entry carried, so an athlete with a
     measured 165 on file who logged a max HR was handed zones estimated from
@@ -2167,6 +2287,27 @@ def test_unlinking_and_relinking_in_one_call_is_refused():
     )
 
 
+# --- round-9 rework: update_planned_workout's linked_activity_id had the
+# same unfixed whole-number defect ---
+
+
+def test_update_planned_workout_linked_activity_id_of_a_list_is_a_coach_error():
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    with pytest.raises(coach.CoachError, match="linked_activity_id"):
+        coach.update_planned_workout(planned_id, linked_activity_id=[1])
+
+
+def test_update_planned_workout_linked_activity_id_of_a_plain_int_still_works():
+    """Just outside the new whole-number guard: an ordinary id keeps working
+    after linked_activity_id is routed through the shared coercer."""
+    coach.import_activities([RIDE])
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    result = coach.update_planned_workout(planned_id, linked_activity_id=1, status="completed")
+    assert result["planned_workout"]["linked_activity_id"] == 1
+
+
 def test_a_whole_race_result_can_be_retracted():
     """A result is three things. Clearing the debrief alone left a finish time
     on an again-upcoming race and a ride get_week still read as that race's."""
@@ -2694,9 +2835,18 @@ def test_clearing_a_column_that_already_held_nothing_does_not_revert_status():
 
 def test_status_reverted_note_names_only_the_field_actually_cleared():
     """A debrief-only retraction must not claim a finish time and a linked
-    ride were cleared too."""
-    event = coach.add_event("Club 100", "2026-07-05", priority="B")["stored"]
-    coach.record_race_result(event["id"], debrief="wrong race")
+    ride were cleared too.
+
+    The event date stays `2026-07-05` — the second test below links a ride
+    dated `2026-07-05`, and `record_race_result` refuses a wrong-date link —
+    so `status="upcoming"` is passed explicitly at creation instead of
+    relying on `add_event`'s today-relative default, which would have born
+    this event `completed` outright (that date is now in the past) and let
+    the round trip this test claims to cover go unexercised. Both status
+    changes are asserted directly so the round trip is pinned, not assumed."""
+    event = coach.add_event("Club 100", "2026-07-05", priority="B", status="upcoming")["stored"]
+    recorded = coach.record_race_result(event["id"], debrief="wrong race")
+    assert recorded["stored"]["status"] == "completed"
     result = coach.record_race_result(event["id"], clear=["debrief"])
     assert result["stored"]["status"] == "upcoming"
     note = result["status_reverted_note"]
@@ -2706,14 +2856,20 @@ def test_status_reverted_note_names_only_the_field_actually_cleared():
 
 
 def test_status_reverted_note_names_every_field_that_was_cleared():
+    """See the docstring above: `status="upcoming"` is explicit so the
+    initial `record_race_result` call genuinely auto-completes the event
+    (rather than finding it already `completed` from `add_event`'s
+    today-relative default) and the clear genuinely reverts it."""
     coach.import_activities([RIDE])
-    event = coach.add_event("Club 100", "2026-07-05", priority="B")["stored"]
-    coach.record_race_result(
+    event = coach.add_event("Club 100", "2026-07-05", priority="B", status="upcoming")["stored"]
+    recorded = coach.record_race_result(
         event["id"], garmin_activity_id="5001", finish_time="4:32:10", debrief="wrong race"
     )
+    assert recorded["stored"]["status"] == "completed"
     result = coach.record_race_result(
         event["id"], clear=["debrief", "finish_time_s", "linked_activity_id"]
     )
+    assert result["stored"]["status"] == "upcoming"
     note = result["status_reverted_note"]
     assert "debrief" in note
     assert "finish time" in note
@@ -2823,3 +2979,390 @@ def test_list_activities_limit_none_is_refused_as_a_coach_error():
     # Value just outside the guard: a real integer still works.
     coach.import_activities([RIDE])
     assert coach.list_activities(limit=1)["count"] == 1
+
+
+# --------------------------------------------------------------------------
+# review round 9
+# --------------------------------------------------------------------------
+
+# --- finding 1: negative/zero power and HR are not measurements, on every
+# --- surface that reads a stored activity row, not only compliance_report ---
+
+
+def test_compute_load_negative_avg_hr_is_null_tss_with_a_reason_and_no_avg_hr():
+    coach.log_hr(threshold_hr=170, effective_date="2026-06-01")
+    coach.import_activities(
+        [
+            {
+                "activityId": 9801,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-05 08:00:00",
+                "duration": 3600.0,
+                "averageHR": -150,
+            }
+        ]
+    )
+    entry = coach.compute_load(start="2026-01-01")["activities"][0]
+    assert entry["tss"] is None
+    assert entry["reason"]
+    assert entry["avg_hr"] is None
+
+
+def test_compute_load_negative_avg_power_is_null_tss_not_a_negative_if():
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities(
+        [
+            {
+                "activityId": 9802,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-05 08:00:00",
+                "duration": 3600.0,
+                "avgPower": -50,
+            }
+        ]
+    )
+    entry = coach.compute_load(start="2026-01-01")["activities"][0]
+    assert entry["tss"] is None
+    assert entry["avg_power"] is None
+    assert "intensity_factor" not in entry
+
+
+def test_list_activities_stored_zero_avg_hr_is_emitted_as_none():
+    coach.import_activities(
+        [
+            {
+                "activityId": 9803,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-05 08:00:00",
+                "duration": 3600.0,
+                "averageHR": 0,
+            }
+        ]
+    )
+    entry = coach.list_activities(start="2026-01-01")["activities"][0]
+    assert entry["avg_hr"] is None
+
+
+def test_compliance_report_summary_sentence_drops_a_negative_wattage_claim():
+    """The summary sentence must agree with the `actual` dict beside it —
+    both already went through `_positive` there, but the sentence read the
+    raw column and printed 'rode ... at -50 W'."""
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities(
+        [
+            {
+                "activityId": 9804,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-05 08:00:00",
+                "duration": 3600.0,
+                "avgPower": -50,
+            }
+        ]
+    )
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.link_activity(planned_id, auto=True)
+    report = coach.compliance_report(planned_id)
+    summary = report["sentences"][0]
+    # The clause covering the *ride* — "at N W" — must be absent; the
+    # planned-side clause ("NP 206 W") is unrelated and stays.
+    assert "-50" not in summary
+    assert "rode 1:00:00." in summary
+
+
+def test_import_activity_laps_emits_placeholder_power_and_hr_as_none():
+    """The lap-level twin of the activity-level guard above: a stored
+    `averagePower: 0` / `averageHR: -150` must not be echoed verbatim at the
+    `import_activity_laps` display surface, even though `duration_s` — not a
+    measured field — stays the stored number."""
+    coach.import_activities([RIDE])
+    result = coach.import_activity_laps(
+        {
+            "lapDTOs": [
+                {"duration": 600.0, "averagePower": 0, "averageHR": -150},
+            ]
+        },
+        garmin_activity_id="5001",
+    )
+    lap = result["laps"][0]
+    assert lap["avg_power"] is None
+    assert lap["avg_hr"] is None
+    assert lap["duration_s"] == 600.0
+
+
+def test_import_activity_laps_still_emits_a_small_positive_power():
+    """Just outside the guard: a real (if implausible) small measurement must
+    not be eaten by the new `_lap_out` wrapper."""
+    coach.import_activities([RIDE])
+    result = coach.import_activity_laps(
+        {"lapDTOs": [{"duration": 600.0, "averagePower": 1}]},
+        garmin_activity_id="5001",
+    )
+    assert result["laps"][0]["avg_power"] == 1
+
+
+def test_compliance_report_laps_also_null_out_placeholder_power_and_hr():
+    """The same defect, at the `compliance_report` lap surface (coach.py:3297)
+    rather than the `import_activity_laps` one."""
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities([RIDE])
+    coach.import_activity_laps(
+        {
+            "lapDTOs": [
+                {"duration": 600.0, "averagePower": 0, "averageHR": -150},
+            ]
+        },
+        garmin_activity_id="5001",
+    )
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.link_activity(planned_id, auto=True)
+    report = coach.compliance_report(planned_id)
+    lap = report["laps"][0]
+    assert lap["avg_power"] is None
+    assert lap["avg_hr"] is None
+    assert lap["duration_s"] == 600.0
+
+
+def test_avg_power_of_one_and_avg_hr_of_thirty_survive_every_surface():
+    """Value just outside the guard, checked at the two surfaces above: a
+    small positive value is a real (if implausible) measurement and must not
+    be eaten by `_positive` anywhere it is emitted."""
+    coach.log_ftp(value_watts=266, effective_date="2026-06-01")
+    coach.import_activities(
+        [
+            {
+                "activityId": 9805,
+                "activityType": {"typeKey": "road_biking"},
+                "startTimeLocal": "2026-07-05 08:00:00",
+                "duration": 3600.0,
+                "avgPower": 1,
+            }
+        ]
+    )
+    load_entry = coach.compute_load(start="2026-01-01")["activities"][0]
+    assert load_entry["avg_power"] == 1
+    assert load_entry["tss"] is not None
+    list_entry = coach.list_activities(start="2026-01-01")["activities"][0]
+    assert list_entry["avg_power"] == 1
+
+
+# --- finding 2: the unlink revert records the pre-link status instead of
+# --- re-deriving it from pushed_to ---
+
+
+def _pre_link_status(planned_id):
+    import sqlite3
+
+    conn = sqlite3.connect(store.db_path())
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT pre_link_status FROM planned_workouts WHERE id = ?", (planned_id,)
+    ).fetchone()
+    conn.close()
+    return row["pre_link_status"]
+
+
+def test_pushed_with_no_pushed_to_reverts_to_pushed_not_planned():
+    """Probe (a): pushed_to left NULL on a session that really is `pushed`
+    used to read as 'never pushed' and revert to `planned`, duplicating the
+    re-push risk. Recording the pre-link status at link time removes the
+    guess: the column read back is `pre_link_status`, not `pushed_to`."""
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.update_planned_workout(planned_id, status="pushed")
+    coach.import_activities([RIDE])
+    coach.link_activity(planned_id, auto=True)
+    assert _pre_link_status(planned_id) == "pushed"
+
+    result = coach.update_planned_workout(planned_id, clear=["linked_activity_id"])
+    assert result["planned_workout"]["status"] == "pushed"
+    assert _pre_link_status(planned_id) is None
+
+
+def test_walked_back_to_planned_after_a_push_reverts_to_planned_not_pushed():
+    """Probe (c): pushed_to lingers after a session is deliberately walked
+    back to `planned` (it is not clearable) — inferring from pushed_to alone
+    would claim the session was still on the platform. `pre_link_status`
+    records the status at the moment of THIS link, which is `planned`."""
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.update_planned_workout(planned_id, status="pushed", pushed_to="garmin")
+    coach.update_planned_workout(planned_id, status="planned")
+    coach.import_activities([RIDE])
+    coach.link_activity(planned_id, auto=True)
+    assert _pre_link_status(planned_id) == "planned"
+
+    result = coach.update_planned_workout(planned_id, clear=["linked_activity_id"])
+    assert result["planned_workout"]["status"] == "planned"
+
+
+def test_legacy_row_with_no_pre_link_status_falls_back_and_reads_the_staged_value():
+    """Probe (a)'s legacy variant: a row linked before this column existed
+    (simulated here with a raw UPDATE) falls back to the old pushed_to
+    inference — but must read the value THIS call is staging, not the
+    pre-update NULL, and the note must not claim a recorded status it does
+    not have."""
+    import sqlite3
+
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.import_activities([RIDE])
+    coach.link_activity(planned_id, auto=True)
+    assert _pre_link_status(planned_id) == "planned"
+
+    conn = sqlite3.connect(store.db_path())
+    conn.execute("UPDATE planned_workouts SET pre_link_status = NULL WHERE id = ?", (planned_id,))
+    conn.commit()
+    conn.close()
+
+    result = coach.update_planned_workout(
+        planned_id, pushed_to="garmin", clear=["linked_activity_id"]
+    )
+    assert result["planned_workout"]["status"] == "pushed"
+    note = result["status_reverted_note"]
+    assert "inferred from pushed_to" in note
+    assert "the same way link_activity set it" not in note
+
+
+def test_an_explicit_status_unlink_still_clears_pre_link_status():
+    """Verifier NOTE 4: `pre_link_status` used to be cleared only on the
+    auto-revert branch, so an unlink that passes `status` explicitly left it
+    behind — stale evidence about a link that no longer exists. It must be
+    cleared whenever `linked_activity_id` is cleared, explicit status or not."""
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.import_activities([RIDE])
+    coach.link_activity(planned_id, auto=True)
+    assert _pre_link_status(planned_id) == "planned"
+
+    result = coach.update_planned_workout(planned_id, status="missed", clear=["linked_activity_id"])
+    assert result["planned_workout"]["status"] == "missed"
+    assert _pre_link_status(planned_id) is None
+
+
+def test_pre_link_status_is_not_named_in_updated_fields():
+    """No read surface exposes `pre_link_status` — it is bookkeeping for the
+    next unlink, not a field a caller can look up elsewhere, so it should not
+    appear in `updated_fields` even though it is one of the staged columns."""
+    saved = coach.save_planned_workouts([{"spec": SPEC, "scheduled_date": "2026-07-05"}])
+    planned_id = saved["planned_workouts"][0]["id"]
+    coach.import_activities([RIDE])
+    coach.link_activity(planned_id, auto=True)
+
+    result = coach.update_planned_workout(planned_id, clear=["linked_activity_id"])
+    assert "pre_link_status" not in result["updated_fields"]
+    assert "status" in result["updated_fields"]
+
+
+# --- finding 3: record_race_result's no_result_left gate must match
+# --- retracted_fields' is-not-None test, not fall back to truthiness ---
+
+
+def test_a_legacy_zero_finish_time_survives_a_debrief_only_clear():
+    """A pre-0.3.0 row can carry `finish_time_s = 0` (the `<= 0` refusal did
+    not exist yet). Clearing only the debrief must not read the surviving 0
+    as 'nothing held' and revert a status that still has a result attached."""
+    import sqlite3
+
+    coach.get_profile()  # ensures the schema is migrated before the raw insert below
+    conn = sqlite3.connect(store.db_path())
+    cursor = conn.execute(
+        "INSERT INTO events (athlete_id, name, event_date, status, finish_time_s, debrief, "
+        "created_at, updated_at) VALUES (1, 'Legacy Race', '2026-06-01', 'completed', 0, "
+        "'wrong race', 'x', 'x')"
+    )
+    event_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    result = coach.record_race_result(event_id, clear=["debrief"])
+    assert result["stored"]["status"] == "completed"
+    assert result["stored"]["finish_time_s"] == 0
+    assert "status_reverted_note" not in result
+
+
+def test_clearing_every_field_off_the_same_legacy_zero_row_does_revert():
+    """Just outside the guard: clear every result field, including the zero
+    finish_time_s itself, and the revert must still fire."""
+    import sqlite3
+
+    coach.get_profile()
+    conn = sqlite3.connect(store.db_path())
+    cursor = conn.execute(
+        "INSERT INTO events (athlete_id, name, event_date, status, finish_time_s, debrief, "
+        "created_at, updated_at) VALUES (1, 'Legacy Race', '2026-06-01', 'completed', 0, "
+        "'wrong race', 'x', 'x')"
+    )
+    event_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    result = coach.record_race_result(
+        event_id, clear=["debrief", "finish_time_s", "linked_activity_id"]
+    )
+    assert result["stored"]["status"] == "upcoming"
+    assert "status_reverted_note" in result
+
+
+# --- finding 6: list_activities' limit coercion ---
+
+
+def test_list_activities_limit_infinity_is_a_coach_error_not_an_overflow_error():
+    with pytest.raises(coach.CoachError, match="limit"):
+        coach.list_activities(limit=float("inf"))
+
+
+def test_list_activities_limit_of_a_non_integral_float_is_refused_with_its_own_value():
+    with pytest.raises(coach.CoachError) as exc:
+        coach.list_activities(limit=1.9)
+    assert "1.9" in str(exc.value)
+
+
+def test_list_activities_limit_of_true_is_refused_not_silently_one():
+    with pytest.raises(coach.CoachError, match="limit"):
+        coach.list_activities(limit=True)
+
+
+def test_list_activities_limit_of_half_reports_the_value_given_not_a_truncated_zero():
+    with pytest.raises(coach.CoachError) as exc:
+        coach.list_activities(limit=0.5)
+    message = str(exc.value)
+    assert "0.5" in message
+    assert "at least 1, got 0" not in message
+
+
+def test_list_activities_limit_accepted_shapes_still_work():
+    """Just outside every new guard: a plain int, an integral float, and an
+    integer string all keep working, and limit=0 stays refused."""
+    coach.import_activities([RIDE])
+    assert coach.list_activities(limit=1)["count"] == 1
+    assert coach.list_activities(limit=10.0)["count"] == 1
+    assert coach.list_activities(limit="10")["count"] == 1
+    with pytest.raises(coach.CoachError, match="limit must be at least 1"):
+        coach.list_activities(limit=0)
+
+
+# --- round 9 rework: the overflow moved one line down, to `limit + 1` ---
+
+
+def test_list_activities_limit_just_below_the_sqlite_int64_bound_still_works():
+    """Just outside the new upper-bound guard: `limit + 1` must still bind as
+    a SQLite INTEGER, so the largest accepted `limit` is 2**63 - 2."""
+    coach.import_activities([RIDE])
+    assert coach.list_activities(limit=2**63 - 2)["count"] == 1
+
+
+def test_list_activities_limit_at_the_sqlite_int64_bound_is_a_coach_error():
+    with pytest.raises(coach.CoachError) as exc:
+        coach.list_activities(limit=2**63 - 1)
+    assert str(2**63 - 1) in str(exc.value)
+
+
+def test_list_activities_limit_far_past_the_sqlite_int64_bound_is_a_coach_error():
+    """Mirrors test_nutrition's 400-digit-number probe: an absurdly large int
+    is a refusal naming the value, never a bare OverflowError out of sqlite3."""
+    huge = 10**20
+    with pytest.raises(coach.CoachError) as exc:
+        coach.list_activities(limit=huge)
+    assert str(huge) in str(exc.value)
